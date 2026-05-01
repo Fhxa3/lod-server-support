@@ -1,6 +1,6 @@
 plugins {
     id 'java'
-    id 'io.papermc.paperweight.userdev' version '2.0.0-beta.19'
+    id 'io.papermc.paperweight.userdev' version '2.0.0-beta.21'
     id 'com.gradleup.shadow' version '9.0.0-beta12'
 }
 
@@ -13,7 +13,7 @@ repositories {
 
 dependencies {
     implementation project(':common')
-    paperweight.paperDevBundle('1.21.11-R0.1-SNAPSHOT')
+    paperweight.paperDevBundle('26.1.2.build.52-beta')
 }
 
 processResources {
@@ -37,7 +37,7 @@ shadowJar {
 }
 
 tasks.withType(JavaCompile).configureEach {
-    it.options.release = 21
+    it.options.release = 25
 
 }
 

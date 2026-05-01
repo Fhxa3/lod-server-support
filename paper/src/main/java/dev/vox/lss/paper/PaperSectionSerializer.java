@@ -61,7 +61,7 @@ final class PaperSectionSerializer {
                 var section = sections[info.index];
 
                 buf.writeByte(info.sectionY);
-                section.write(buf, null, 0);
+                section.write(buf);
 
                 // Block light (cached from pass 1)
                 buf.writeBoolean(info.hasBlockLight);
