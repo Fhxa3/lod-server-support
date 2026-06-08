@@ -33,12 +33,23 @@ public class PaperConfig {
     public int generationConcurrencyLimitPerPlayer = 16;
     public int perDimensionTimestampCacheSizeMB = 32;
     public int dirtyBroadcastIntervalSeconds = 10;
+    // Bukkit events that mark a chunk dirty for LOD re-send. Broadened to better match the
+    // Fabric chunk-save hook's coverage (decay, growth, ice/snow, fire, falling blocks).
+    // High-frequency fluid flow (BlockFromToEvent) is intentionally NOT a default — admins who
+    // want fluid-flow LOD accuracy can add it. Unrecognized events are skipped gracefully.
     public List<String> updateEvents = List.of(
             "org.bukkit.event.block.BlockPlaceEvent",
             "org.bukkit.event.block.BlockBreakEvent",
             "org.bukkit.event.block.BlockExplodeEvent",
+            "org.bukkit.event.block.BlockBurnEvent",
+            "org.bukkit.event.block.BlockFadeEvent",
+            "org.bukkit.event.block.BlockFormEvent",
+            "org.bukkit.event.block.BlockGrowEvent",
+            "org.bukkit.event.block.BlockSpreadEvent",
+            "org.bukkit.event.block.LeavesDecayEvent",
             "org.bukkit.event.block.BlockPistonExtendEvent",
             "org.bukkit.event.block.BlockPistonRetractEvent",
+            "org.bukkit.event.entity.EntityChangeBlockEvent",
             "org.bukkit.event.world.StructureGrowEvent",
             "org.bukkit.event.world.ChunkPopulateEvent"
     );

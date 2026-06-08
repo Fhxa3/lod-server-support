@@ -67,7 +67,9 @@ public final class LSSApi {
         for (var consumer : columnConsumers) {
             try {
                 consumer.onVoxelColumnReceived(level, dimension, chunkX, chunkZ, columnData);
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // Isolate per consumer: one consumer's failure (incl. Errors such as a
+                // LinkageError from an incompatible LOD mod) must not skip the others.
                 LSSLogger.error("Voxel column consumer threw exception", e);
             }
         }

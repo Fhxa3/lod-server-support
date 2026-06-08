@@ -137,16 +137,20 @@ public class ChunkGenerationService {
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
                     this.totalCompleted++;
-                } catch (Exception e) {
-                    LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), e);
+                } catch (Throwable t) {
+                    LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), t);
                     for (var cb : gen.callbacks) {
                         this.addResult(cb.playerUuid, ChunkDiskReader.emptyResult(
                                 cb.playerUuid, cb.requestId, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
+                } finally {
+                    // Always release the force-load ticket and drop the active entry — even on an
+                    // Error during serialization — or the chunk stays force-loaded forever and the
+                    // entry is retried (and re-throws) every server tick.
+                    gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
+                    iter.remove();
                 }
-                gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
-                iter.remove();
             }
         }
         return ready != null ? ready : List.of();

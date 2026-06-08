@@ -53,6 +53,10 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
 
     // Cross-player disk read deduplication (processing-thread-owned)
     private final DedupTracker dedupTracker = new DedupTracker();
+    // Main thread → processing thread: players removed on disconnect. A clean disconnect removes
+    // the player from `players` immediately, so the lifecycle scan never sees them; draining this
+    // in preparePlayers releases their dedup group + attached players' concurrency slots.
+    private final ConcurrentLinkedQueue<UUID> pendingRemovals = new ConcurrentLinkedQueue<>();
     private final Path dataDir;
     private int evictionCounter;
     private int saveCounter;
@@ -84,6 +88,8 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         this.processingThread = new Thread(this::processingLoop, "LSS Processing Thread");
         this.processingThread.setDaemon(true);
         this.processingThread.setPriority(Thread.NORM_PRIORITY - 1);
+        this.processingThread.setUncaughtExceptionHandler((th, ex) ->
+                LSSLogger.error("LSS processing thread died unexpectedly", ex));
     }
 
     public void start() {
@@ -118,6 +124,11 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
     /** Queue timestamp invalidation for dirty positions (called by main thread). */
     public void invalidateTimestamps(String dimension, long[] positions) {
         this.timestampInvalidations.add(new TimestampInvalidation(dimension, positions));
+    }
+
+    /** Notify the processing thread that a player was removed (called by main thread on disconnect). */
+    public void notifyPlayerRemoved(UUID uuid) {
+        this.pendingRemovals.add(uuid);
     }
 
     /** Drain disk reader results for a player. Returns ReadResult or null. */
@@ -181,8 +192,10 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
             try {
                 this.processCycle(snapshot);
                 this.consecutiveErrors = 0;
-            } catch (Exception e) {
-                LSSLogger.error("Error in processing cycle", e);
+            } catch (Throwable t) {
+                // Catch Throwable (not just Exception) so a transient Error doesn't silently
+                // kill the processing thread and stop the LOD pipeline for every player.
+                LSSLogger.error("Error in processing cycle", t);
                 if (++this.consecutiveErrors >= 10) {
                     LSSLogger.error("Processing thread hit " + this.consecutiveErrors + " consecutive errors, backing off");
                     try { Thread.sleep(1000); } catch (InterruptedException ie) { return; }
@@ -238,7 +251,15 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
             this.timestampCache.invalidate(inv.dimension(), inv.positions());
         }
 
-        // Clean up dedup groups for removed players
+        // Drain players removed on disconnect (main thread → processing thread). This is the
+        // primary cleanup path: a clean disconnect removes the player before the lifecycle scan
+        // runs, so without this their dedup group + attached players' slots would leak.
+        UUID removed;
+        while ((removed = this.pendingRemovals.poll()) != null) {
+            cleanupDedupGroups(this.dedupTracker.removePlayer(removed));
+        }
+
+        // Clean up dedup groups for removed players (lifecycle-detected removals)
         for (UUID removedUuid : snapshot.removedPlayers()) {
             cleanupDedupGroups(this.dedupTracker.removePlayer(removedUuid));
         }
@@ -317,7 +338,7 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
                 this.ctx.diagnostics().incrementDiskDrained();
 
                 // Dispatch to attached players in the dedup group
-                var group = this.dedupTracker.removeGroup(packed);
+                var group = this.dedupTracker.removeGroup(packed, entry.getValue().dimension());
                 if (group != null) {
                     dispatchDedupGroup(group, result, cx, cz);
                 }

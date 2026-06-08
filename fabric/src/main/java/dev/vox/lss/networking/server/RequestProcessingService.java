@@ -99,6 +99,7 @@ public class RequestProcessingService {
 
     public void removePlayer(UUID uuid) {
         this.players.remove(uuid);
+        this.offThreadProcessor.notifyPlayerRemoved(uuid);
         cleanupPlayerServices(uuid);
     }
 

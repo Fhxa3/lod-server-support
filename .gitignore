@@ -4,6 +4,11 @@ build/
 *.iml
 *.ipr
 *.iws
+
+# Eclipse / jdtls (Java language server) project metadata
+.project
+.classpath
+.settings/
 run/
 out/
 .fabric/

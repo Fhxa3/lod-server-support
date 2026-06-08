@@ -181,10 +181,12 @@ public class ColumnTimestampCache {
                 String dimension = in.readUTF();
                 int entryCount = in.readInt();
                 if (entryCount < 0 || entryCount > this.maxEntriesPerDimension) {
-                    LSSLogger.warn("Timestamp cache dimension " + dimension + " has invalid count " + entryCount + ", skipping");
-                    // Skip remaining bytes for this dimension
-                    in.skipBytes(entryCount * 16);
-                    continue;
+                    // A bad count means the file is corrupt; the byte stream can no longer be
+                    // reliably positioned (skip math could overflow / short-skip and desync),
+                    // so stop loading. The cache is only an optimization and rebuilds itself.
+                    LSSLogger.warn("Timestamp cache " + file + " has invalid entry count " + entryCount
+                            + " for dimension " + dimension + ", discarding rest");
+                    return;
                 }
                 var cache = caches.computeIfAbsent(dimension, k -> new DimensionCache());
                 cache.timestamps.ensureCapacity(entryCount);

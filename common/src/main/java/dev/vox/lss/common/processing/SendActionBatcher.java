@@ -1,5 +1,7 @@
 package dev.vox.lss.common.processing;
 
+import dev.vox.lss.common.LSSConstants;
+
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
@@ -26,8 +28,19 @@ public final class SendActionBatcher {
     public void forEach(BatchConsumer consumer) {
         for (var entry : batches.entrySet()) {
             var batch = entry.getValue();
-            if (batch.count > 0) {
-                consumer.accept(entry.getKey(), batch.types, batch.requestIds, batch.count);
+            int count = batch.count;
+            if (count <= 0) continue;
+            if (count <= LSSConstants.MAX_BATCH_RESPONSES) {
+                consumer.accept(entry.getKey(), batch.types, batch.requestIds, count);
+            } else {
+                // Split oversized batches so each emitted frame stays within the decoder's
+                // MAX_BATCH_RESPONSES cap (otherwise the client rejects the whole packet).
+                for (int off = 0; off < count; off += LSSConstants.MAX_BATCH_RESPONSES) {
+                    int len = Math.min(LSSConstants.MAX_BATCH_RESPONSES, count - off);
+                    consumer.accept(entry.getKey(),
+                            Arrays.copyOfRange(batch.types, off, off + len),
+                            Arrays.copyOfRange(batch.requestIds, off, off + len), len);
+                }
             }
         }
     }

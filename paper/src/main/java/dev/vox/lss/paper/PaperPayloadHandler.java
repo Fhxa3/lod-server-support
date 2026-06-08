@@ -84,7 +84,7 @@ public final class PaperPayloadHandler {
     public static byte[] encodeVoxelColumnPreEncoded(int requestId, int chunkX, int chunkZ,
                                                       String dimensionStr, long columnTimestamp,
                                                       byte[] sectionBytes) {
-        return encodeToBytes(buf -> {
+        return encodeToBytes(sectionBytes.length + 64, buf -> {
             buf.writeVarInt(requestId);
             buf.writeInt(chunkX);
             buf.writeInt(chunkZ);
@@ -192,7 +192,11 @@ public final class PaperPayloadHandler {
     }
 
     private static byte[] encodeToBytes(Consumer<FriendlyByteBuf> writer) {
-        var buf = new FriendlyByteBuf(Unpooled.buffer());
+        return encodeToBytes(256, writer);
+    }
+
+    private static byte[] encodeToBytes(int initialCapacity, Consumer<FriendlyByteBuf> writer) {
+        var buf = new FriendlyByteBuf(Unpooled.buffer(initialCapacity));
         try {
             writer.accept(buf);
             byte[] bytes = new byte[buf.readableBytes()];

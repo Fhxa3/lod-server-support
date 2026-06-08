@@ -11,6 +11,7 @@ import java.util.ArrayDeque;
 import java.util.PriorityQueue;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -29,9 +30,16 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     private volatile boolean hasHandshake = false;
     private volatile int capabilities = 0;
 
+    // Bound on the per-player incoming queues: a flooding client must not grow them without
+    // limit (heap OOM / main-thread DoS). Dropped entries are harmless — the client re-requests
+    // un-acked positions on its next scan. Counts are approximate (best-effort under races).
+    private static final int MAX_INCOMING_QUEUE = 16384;
+
     // Network handler → processing thread (thread-safe intermediaries)
     private final ConcurrentLinkedQueue<IncomingRequest> incomingRequests = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger incomingRequestCount = new AtomicInteger();
     private final ConcurrentLinkedQueue<Integer> incomingCancels = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger incomingCancelCount = new AtomicInteger();
     // Main thread → processing thread (dirty column clear requests)
     private final ConcurrentLinkedQueue<long[]> pendingDirtyClear = new ConcurrentLinkedQueue<>();
     // Processing thread → main thread (thread-safe output)
@@ -84,12 +92,20 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     // ---- Incoming request helpers (subclasses call these from addRequest) ----
 
     protected void enqueueIncomingRequest(IncomingRequest request) {
+        if (this.incomingRequestCount.get() >= MAX_INCOMING_QUEUE) {
+            return;
+        }
         this.incomingRequests.add(request);
+        this.incomingRequestCount.incrementAndGet();
         this.totalRequestsReceived.incrementAndGet();
     }
 
     public void addCancel(int requestId) {
+        if (this.incomingCancelCount.get() >= MAX_INCOMING_QUEUE) {
+            return;
+        }
         this.incomingCancels.add(requestId);
+        this.incomingCancelCount.incrementAndGet();
     }
 
     // ---- Queue management ----
@@ -141,6 +157,8 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     protected void onDimensionChangeBase() {
         this.incomingRequests.clear();
         this.incomingCancels.clear();
+        this.incomingRequestCount.set(0);
+        this.incomingCancelCount.set(0);
         this.readyPayloads.clear();
         this.sendQueue.clear();
         this.pendingDirtyClear.clear();
@@ -162,7 +180,9 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
 
     @Override
     public IncomingRequest pollIncomingRequest() {
-        return this.incomingRequests.poll();
+        var r = this.incomingRequests.poll();
+        if (r != null) this.incomingRequestCount.decrementAndGet();
+        return r;
     }
 
     @Override
@@ -216,7 +236,9 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
 
     @Override
     public Integer pollCancel() {
-        return this.incomingCancels.poll();
+        var c = this.incomingCancels.poll();
+        if (c != null) this.incomingCancelCount.decrementAndGet();
+        return c;
     }
 
     public boolean hasDiskReadDone(int cx, int cz) {

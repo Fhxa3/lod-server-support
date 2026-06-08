@@ -24,7 +24,6 @@ import java.util.concurrent.atomic.AtomicLong;
 class ClientColumnProcessor {
     static final int MAX_QUEUED_COLUMNS = 8000;
     private static final long DROP_WARN_INTERVAL_MS = 5000;
-    private static final int MAX_SECTIONS_PER_COLUMN = 64;
 
     private final ConcurrentLinkedQueue<VoxelColumnS2CPayload> columnQueue = new ConcurrentLinkedQueue<>();
     private final AtomicInteger queueSize = new AtomicInteger();
@@ -112,7 +111,9 @@ class ClientColumnProcessor {
             try {
                 var buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(decompressed));
                 try {
-                    int sectionCount = Math.max(0, Math.min(buf.readVarInt(), MAX_SECTIONS_PER_COLUMN));
+                    // Bound by the client world's actual section count: supports tall/modded
+                    // worlds (no silent truncation) while still capping allocation from a peer.
+                    int sectionCount = Math.max(0, Math.min(buf.readVarInt(), level.getSectionsCount()));
                     var sectionDatas = new VoxelColumnData.SectionData[sectionCount];
 
                     for (int i = 0; i < sectionCount; i++) {

@@ -47,11 +47,15 @@ public class ChunkDiskReader extends AbstractChunkDiskReader<ChunkDiskReader.Rea
                 try {
                     this.readChunkNbtAndSerialize(playerUuid, requestId, chunkMap, chunkX, chunkZ,
                             dimension, registryAccess, submissionOrder);
-                } catch (Exception e) {
-                    LSSLogger.error("Failed to read chunk from disk at " + chunkX + ", " + chunkZ, e);
+                } catch (Throwable t) {
+                    // Catch Throwable: an Error must not escape the task without producing a
+                    // result, or the request is stranded in-flight forever (leaked concurrency
+                    // permit + orphaned dedup group). Emit an empty result, then rethrow Errors.
+                    LSSLogger.error("Failed to read chunk from disk at " + chunkX + ", " + chunkZ, t);
                     this.diag.recordError();
                     this.diag.recordCompleted(0);
                     addResult(playerUuid, emptyResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+                    if (t instanceof Error) throw (Error) t;
                 }
             });
         } catch (RejectedExecutionException e) {

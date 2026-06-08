@@ -20,7 +20,11 @@ public final class PositionUtil {
     }
 
     public static int chebyshevDistance(int x1, int z1, int x2, int z2) {
-        return Math.max(Math.abs(x1 - x2), Math.abs(z1 - z2));
+        // Widen to long before subtracting so extreme client-supplied coordinates
+        // (e.g. Integer.MIN_VALUE) can't overflow and slip under the distance gate.
+        long dx = Math.abs((long) x1 - x2);
+        long dz = Math.abs((long) z1 - z2);
+        return (int) Math.min(Integer.MAX_VALUE, Math.max(dx, dz));
     }
 
     public static boolean isOutOfRange(long packed, int playerCx, int playerCz, int distance) {
