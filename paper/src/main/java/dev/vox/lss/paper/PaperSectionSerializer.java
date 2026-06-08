@@ -26,6 +26,10 @@ final class PaperSectionSerializer {
      */
     private record SectionInfo(int index, int sectionY, SectionPos sectionPos, DataLayer blLayer, boolean hasBlockLight) {}
 
+    // LevelChunkSection.write(buf) is @Deprecated on Paper (an anti-xray overload was added),
+    // but the 1-arg form is the canonical vanilla serialization and is byte-identical to the
+    // Fabric path. The wire format must match Fabric exactly, so keep this call (do not migrate).
+    @SuppressWarnings("deprecation")
     static LoadedColumnData serializeColumn(ServerLevel level, LevelChunk chunk, int cx, int cz) {
         int minSectionY = level.getMinSectionY();
         var sections = chunk.getSections();

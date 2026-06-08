@@ -20,7 +20,7 @@ public class LSSClientGameTests implements FabricClientGameTest {
             client.options.simulationDistance().set(2);
         });
 
-        try (TestSingleplayerContext sp = context.worldBuilder().create()) {
+        try (TestSingleplayerContext _ = context.worldBuilder().create()) {
             // Wait for join -> handshake -> session config -> LodRequestManager creation
             context.waitTicks(40);
 

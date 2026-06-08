@@ -36,7 +36,6 @@ public class PaperWorldHandler {
     /**
      * Register listeners for all configured event classes.
      */
-    @SuppressWarnings("unchecked")
     public void registerUpdateListeners(List<String> eventClassNames) {
         for (String className : eventClassNames) {
             try {

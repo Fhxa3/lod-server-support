@@ -5,20 +5,17 @@ import dev.vox.lss.common.LSSConstants;
 import io.netty.buffer.Unpooled;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.server.level.ChunkMap;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.biome.Biome;
-import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.PalettedContainerRO;
-import net.minecraft.world.level.chunk.Strategy;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 import java.util.concurrent.TimeUnit;
@@ -37,6 +34,10 @@ final class PaperNbtSectionSerializer {
      * into MC-native wire format.
      * Returns the serialized byte array, or null if the chunk is missing/not FULL/empty.
      */
+    // LevelChunkSection.write(buf) is @Deprecated on Paper (an anti-xray overload was added),
+    // but the 1-arg form is the canonical vanilla serialization and is byte-identical to the
+    // Fabric path. The wire format must match Fabric exactly, so keep this call (do not migrate).
+    @SuppressWarnings("deprecation")
     static byte[] readAndSerializeSections(ChunkMap chunkMap, RegistryAccess registryAccess,
                                             int cx, int cz) throws Exception {
         var future = chunkMap.read(new ChunkPos(cx, cz));
@@ -50,9 +51,6 @@ final class PaperNbtSectionSerializer {
         var factory = PalettedContainerFactory.create(registryAccess);
         var blockStateCodec = factory.blockStatesContainerCodec();
         var biomeCodec = factory.biomeContainerCodec();
-        var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
-        var defaultBiome = biomeRegistry.getOrThrow(Biomes.PLAINS);
-        var biomeHolderMap = biomeRegistry.asHolderIdMap();
 
         var sectionsTag = chunkNbt.getList("sections");
         if (sectionsTag.isEmpty()) return null;
@@ -70,7 +68,7 @@ final class PaperNbtSectionSerializer {
 
             byte[] blockLightData = sectionTag.getByteArray("BlockLight").orElse(EMPTY);
             var result = parseSection(sectionTag, sectionY, blockStateCodec, biomeCodec,
-                    defaultBiome, biomeHolderMap, blockLightData);
+                    factory, blockLightData);
             if (result != null) {
                 byte[] skyLightData = sectionTag.getByteArray("SkyLight").orElse(EMPTY);
                 parsed.add(new ParsedSection(sectionY, result, blockLightData, skyLightData));
@@ -116,8 +114,7 @@ final class PaperNbtSectionSerializer {
             CompoundTag sectionTag, int sectionY,
             Codec<PalettedContainer<BlockState>> blockStateCodec,
             Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec,
-            Holder<Biome> defaultBiome,
-            net.minecraft.core.IdMap<Holder<Biome>> biomeHolderMap,
+            PalettedContainerFactory factory,
             byte[] blockLightData) {
 
         var blockStatesOpt = sectionTag.getCompound("block_states");
@@ -140,9 +137,7 @@ final class PaperNbtSectionSerializer {
         if (biomes instanceof PalettedContainer<Holder<Biome>> biomeContainer) {
             section = new LevelChunkSection(blockStates, biomeContainer);
         } else {
-            var defaultBiomeContainer = new PalettedContainer<>(
-                    defaultBiome, Strategy.createForBiomes(biomeHolderMap));
-            section = new LevelChunkSection(blockStates, defaultBiomeContainer);
+            section = new LevelChunkSection(blockStates, factory.createForBiomes());
         }
 
         if (section.hasOnlyAir()) {

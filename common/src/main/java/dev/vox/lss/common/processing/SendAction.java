@@ -12,15 +12,17 @@ public sealed interface SendAction {
     UUID playerUuid();
     int requestId();
 
-    default byte responseType() {
-        return switch (this) {
-            case RateLimited a -> LSSConstants.RESPONSE_RATE_LIMITED;
-            case ColumnUpToDate a -> LSSConstants.RESPONSE_UP_TO_DATE;
-            case ColumnNotGenerated a -> LSSConstants.RESPONSE_NOT_GENERATED;
-        };
+    byte responseType();
+
+    record RateLimited(UUID playerUuid, int requestId) implements SendAction {
+        @Override public byte responseType() { return LSSConstants.RESPONSE_RATE_LIMITED; }
     }
 
-    record RateLimited(UUID playerUuid, int requestId) implements SendAction {}
-    record ColumnUpToDate(UUID playerUuid, int requestId) implements SendAction {}
-    record ColumnNotGenerated(UUID playerUuid, int requestId) implements SendAction {}
+    record ColumnUpToDate(UUID playerUuid, int requestId) implements SendAction {
+        @Override public byte responseType() { return LSSConstants.RESPONSE_UP_TO_DATE; }
+    }
+
+    record ColumnNotGenerated(UUID playerUuid, int requestId) implements SendAction {
+        @Override public byte responseType() { return LSSConstants.RESPONSE_NOT_GENERATED; }
+    }
 }

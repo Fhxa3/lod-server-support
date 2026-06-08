@@ -15,10 +15,6 @@ public class ProcessingDiagnostics {
     private volatile int procTickInMemory;
     private volatile int procTickSkippedDuplicate;
     private volatile int procTickUpToDate;
-    private volatile int procTickSyncRateLimited;
-    private volatile int procTickGenRateLimited;
-    private volatile int procTickQueueFull;
-    private volatile int procTickQueued;
 
     // Cumulative counters — never reset
     private volatile long totalQueueFull;
@@ -36,10 +32,6 @@ public class ProcessingDiagnostics {
         procTickInMemory = 0;
         procTickSkippedDuplicate = 0;
         procTickUpToDate = 0;
-        procTickSyncRateLimited = 0;
-        procTickGenRateLimited = 0;
-        procTickQueueFull = 0;
-        procTickQueued = 0;
     }
 
     // Per-tick increment methods
@@ -63,22 +55,18 @@ public class ProcessingDiagnostics {
     }
 
     public void incrementSyncRateLimited() {
-        procTickSyncRateLimited++;
         totalSyncRateLimited++;
     }
 
     public void incrementGenRateLimited() {
-        procTickGenRateLimited++;
         totalGenRateLimited++;
     }
 
     public void incrementQueueFull() {
-        procTickQueueFull++;
         totalQueueFull++;
     }
 
     public void incrementQueued() {
-        procTickQueued++;
         totalQueued++;
     }
 
