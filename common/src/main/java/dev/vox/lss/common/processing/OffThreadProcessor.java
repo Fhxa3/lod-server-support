@@ -27,9 +27,8 @@ import java.util.concurrent.TimeUnit;
  * accumulate until consumed). All event producers run on the main thread.
  *
  * @param <PlayerState>  the platform-specific player state type
- * @param <ReadResult>   the platform-specific disk reader result type (must implement {@link ReadResultAccess})
  */
-public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerRequestState<?>, ReadResult extends ReadResultAccess> {
+public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerRequestState<?>> {
 
     private static final int SNAPSHOT_POLL_MS = 50;
     private static final int SHUTDOWN_JOIN_MS = 5000;
@@ -65,6 +64,9 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     private final Thread processingThread;
     private final ColumnTimestampCache timestampCache;
     private final Map<UUID, PlayerState> players;
+    // Nullable: disk reading is disabled when no reader is configured
+    private final AbstractChunkDiskReader diskReader;
+    private final SendActionBatcher sendActionBatcher = new SendActionBatcher();
 
     private final boolean generationAvailable;
 
@@ -92,9 +94,10 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     // construction completes.
     @SuppressWarnings("this-escape")
     protected OffThreadProcessor(Map<UUID, PlayerState> players,
-                                  boolean diskReadingAvailable, boolean generationAvailable,
+                                  AbstractChunkDiskReader diskReader, boolean generationAvailable,
                                   Path dataDir, int perDimensionTimestampCacheSizeMB) {
         this.players = players;
+        this.diskReader = diskReader;
         this.generationAvailable = generationAvailable;
         this.dataDir = dataDir;
         this.timestampCache = new ColumnTimestampCache(
@@ -105,7 +108,7 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
         this.ctx = new ProcessingContext(this.sendActions, this.generationTicketRequests,
                 new ProcessingDiagnostics(), new SequenceCounter());
         this.requestRouter = new IncomingRequestRouter<>(this, this.players, this.timestampCache,
-                this.dedupTracker, diskReadingAvailable, generationAvailable, this.ctx);
+                this.dedupTracker, diskReader != null, generationAvailable, this.ctx);
         this.processingThread = new Thread(this::processingLoop, "LSS Processing Thread");
         this.processingThread.setDaemon(true);
         this.processingThread.setPriority(Thread.NORM_PRIORITY - 1);
@@ -167,9 +170,37 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
 
     // ---- Main-thread output drains ----
 
-    /** Drain completed send actions (called by main thread). */
-    public SendAction pollSendAction() {
-        return this.sendActions.poll();
+    /** Platform hook that sends one batched-response frame to a player. */
+    @FunctionalInterface
+    public interface BatchSender<PlayerState> {
+        void send(PlayerState state, byte[] responseTypes, long[] packedPositions, int count) throws Exception;
+    }
+
+    /**
+     * Drain completed send actions and flush them as one batched response per player
+     * (called by the main thread each tick).
+     */
+    public void drainSendActions(BatchSender<PlayerState> sender) {
+        this.sendActionBatcher.clear();
+
+        SendAction action;
+        while ((action = this.sendActions.poll()) != null) {
+            var state = this.players.get(action.playerUuid());
+            if (state == null || !state.hasCompletedHandshake()) continue;
+            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.packedPosition());
+        }
+
+        if (this.sendActionBatcher.isEmpty()) return;
+
+        this.sendActionBatcher.forEach((uuid, types, positions, count) -> {
+            var state = this.players.get(uuid);
+            if (state == null || !state.hasCompletedHandshake()) return;
+            try {
+                sender.send(state, types, positions, count);
+            } catch (Exception e) {
+                LSSLogger.error("Failed to send batch response to " + state.getPlayerName(), e);
+            }
+        });
     }
 
     /** Drain generation ticket requests (called by main thread). */
@@ -178,9 +209,6 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     }
 
     // ---- Platform hooks ----
-
-    /** Drain disk reader results for a player. Returns ReadResult or null. */
-    protected abstract ReadResult pollDiskResult(PlayerState state);
 
     /**
      * Submit a disk read for an unloaded chunk (called from processing thread). Returns
@@ -329,8 +357,12 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
             UUID playerUuid = entry.getKey();
             String dimension = entry.getValue();
 
-            ReadResult result;
-            while ((result = this.pollDiskResult(state)) != null) {
+            if (this.diskReader == null) continue;
+            var queue = this.diskReader.getPlayerQueue(state.getPlayerUUID());
+            if (queue == null) continue;
+
+            ChunkReadResult result;
+            while ((result = queue.poll()) != null) {
                 int cx = result.chunkX();
                 int cz = result.chunkZ();
                 long packed = PositionUtil.packPosition(cx, cz);
@@ -361,7 +393,7 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
      * slot), then answer with RateLimited / not-found fallback / column data / up-to-date.
      * Shared by the primary requester and every dedup-attached player.
      */
-    private void deliverDiskResult(UUID playerUuid, PlayerState state, ReadResult result,
+    private void deliverDiskResult(UUID playerUuid, PlayerState state, ChunkReadResult result,
                                     long submissionOrder) {
         int cx = result.chunkX();
         int cz = result.chunkZ();

@@ -21,7 +21,7 @@ import java.util.UUID;
  */
 class IncomingRequestRouter<PS extends AbstractPlayerRequestState<?>> {
 
-    private final OffThreadProcessor<PS, ?> processor;
+    private final OffThreadProcessor<PS> processor;
     private final Map<UUID, PS> players;
     private final ColumnTimestampCache timestampCache;
     private final DedupTracker dedupTracker;
@@ -32,7 +32,7 @@ class IncomingRequestRouter<PS extends AbstractPlayerRequestState<?>> {
     // Per-cycle state (processing thread only), set by routeAll for the duration of a cycle
     private long cycleNow;
 
-    IncomingRequestRouter(OffThreadProcessor<PS, ?> processor,
+    IncomingRequestRouter(OffThreadProcessor<PS> processor,
                           Map<UUID, PS> players,
                           ColumnTimestampCache timestampCache,
                           DedupTracker dedupTracker,

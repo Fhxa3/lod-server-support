@@ -1,125 +1,26 @@
 package dev.vox.lss.paper;
 
-import dev.vox.lss.common.LSSConstants;
-import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.processing.AbstractChunkDiskReader;
-import dev.vox.lss.common.processing.ReadResultAccess;
-import net.minecraft.core.RegistryAccess;
-import net.minecraft.resources.ResourceKey;
-import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.Level;
 
 import java.util.UUID;
-import java.util.concurrent.RejectedExecutionException;
 
 /**
- * Async region file reader for Paper. Accesses ChunkMap directly via NMS
- * (Paper uses Mojang mappings, so no mixin accessor needed).
+ * Async region file reader for Paper. The shared base owns the executor, result queues,
+ * and error triage; this class only captures the NMS handles (Paper uses Mojang mappings,
+ * so no mixin accessor needed) and serializes via {@link PaperNbtSectionSerializer}.
  */
-public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDiskReader.SimpleReadResult> {
-    public record SimpleReadResult(UUID playerUuid, int chunkX, int chunkZ,
-                                    byte[] sectionBytes, String dimension, int estimatedBytes,
-                                    long columnTimestamp,
-                                    boolean notFound, boolean saturated,
-                                    long submissionOrder) implements ReadResultAccess {}
-
-    static SimpleReadResult emptyResult(UUID playerUuid, int chunkX, int chunkZ, long submissionOrder) {
-        return new SimpleReadResult(playerUuid, chunkX, chunkZ,
-                null, null, 0, 0L, true, false, submissionOrder);
-    }
-
-    static SimpleReadResult saturatedResult(UUID playerUuid, int chunkX, int chunkZ, long submissionOrder) {
-        return new SimpleReadResult(playerUuid, chunkX, chunkZ,
-                null, null, 0, 0L, false, true, submissionOrder);
-    }
+public class PaperChunkDiskReader extends AbstractChunkDiskReader {
 
     public PaperChunkDiskReader(int threadCount) {
         super(threadCount);
     }
 
-    /**
-     * Submit a disk read that skips timestamp and cache lookup (already done by initial probe).
-     * Goes straight to NBT read → serialize.
-     */
-    public void submitReadDirect(UUID playerUuid, ServerLevel level, int chunkX, int chunkZ,
-                                  long submissionOrder) {
-        if (isShutdown()) return;
-
-        this.diag.recordSubmitted();
-        var dimension = level.dimension();
+    public void submitReadDirect(UUID playerUuid, String dimension, ServerLevel level,
+                                  int chunkX, int chunkZ, long submissionOrder) {
         var registryAccess = level.registryAccess();
         var chunkMap = level.getChunkSource().chunkMap;
-        try {
-            this.executor.submit(() -> {
-                if (isShutdown()) return;
-                try {
-                    this.readChunkNbtAndSerialize(playerUuid, chunkMap, chunkX, chunkZ,
-                            dimension, registryAccess, submissionOrder);
-                } catch (Throwable t) {
-                    // Catch Throwable: an Error must not escape the task without producing a
-                    // result, or the request is stranded in-flight forever (leaked concurrency
-                    // permit + orphaned dedup group). Emit an empty result, then rethrow Errors.
-                    LSSLogger.error("Failed to read chunk from disk at " + chunkX + ", " + chunkZ, t);
-                    this.diag.recordError();
-                    this.diag.recordCompleted(0);
-                    addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
-                    if (t instanceof Error) throw (Error) t;
-                }
-            });
-        } catch (RejectedExecutionException e) {
-            LSSLogger.warn("Disk reader executor saturated, returning rate-limited for " + chunkX + "," + chunkZ);
-            this.diag.recordSaturation();
-            this.diag.recordCompleted(0);
-            addResult(playerUuid, saturatedResult(playerUuid, chunkX, chunkZ, submissionOrder));
-        }
-    }
-
-    /**
-     * Read chunk NBT and serialize into MC-native format.
-     */
-    private void readChunkNbtAndSerialize(UUID playerUuid, ChunkMap chunkMap,
-                                          int chunkX, int chunkZ,
-                                          ResourceKey<Level> dimension, RegistryAccess registryAccess,
-                                          long submissionOrder) {
-        if (isShutdown()) return;
-        long startNs = System.nanoTime();
-
-        try {
-            byte[] serialized = PaperNbtSectionSerializer.readAndSerializeSections(
-                    chunkMap, registryAccess, chunkX, chunkZ);
-
-            if (serialized == null) {
-                this.diag.recordEmpty();
-                this.diag.recordCompleted(System.nanoTime() - startNs);
-                addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
-                return;
-            }
-
-            if (serialized.length == 0) {
-                // Chunk exists on disk (FULL status) but is all air — resolve as found, not "not found"
-                long columnTimestamp = LSSConstants.epochSeconds();
-                String dimensionStr = dimension.identifier().toString();
-                this.diag.recordEmpty();
-                this.diag.recordCompleted(System.nanoTime() - startNs);
-                addResult(playerUuid, new SimpleReadResult(playerUuid, chunkX, chunkZ,
-                        null, dimensionStr, 0, columnTimestamp, false, false, submissionOrder));
-                return;
-            }
-
-            long columnTimestamp = LSSConstants.epochSeconds();
-            String dimensionStr = dimension.identifier().toString();
-            int estimatedBytes = serialized.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES;
-
-            this.diag.recordCompleted(System.nanoTime() - startNs);
-            addResult(playerUuid, new SimpleReadResult(playerUuid, chunkX, chunkZ,
-                    serialized, dimensionStr, estimatedBytes, columnTimestamp,
-                    false, false, submissionOrder));
-        } catch (Exception e) {
-            LSSLogger.error("Failed to read/serialize chunk at " + chunkX + ", " + chunkZ, e);
-            this.diag.recordError();
-            this.diag.recordCompleted(System.nanoTime() - startNs);
-            addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
-        }
+        submitRead(playerUuid, chunkX, chunkZ, dimension, submissionOrder,
+                () -> PaperNbtSectionSerializer.readAndSerializeSections(chunkMap, registryAccess, chunkX, chunkZ));
     }
 }

@@ -6,7 +6,6 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
@@ -50,61 +49,23 @@ public class PaperCommands implements CommandExecutor, TabCompleter {
         }
 
         sender.sendMessage("=== LSS LOD Request Stats ===");
-        for (var entry : players.entrySet()) {
-            var state = entry.getValue();
-            var player = state.getPlayer();
-
-            String line = String.format(
-                    "%s: handshake=%s, sent=%d sections (%s), pending_sync=%d, pending_gen=%d, send_queue=%d, requests=%d",
-                    player.getName().getString(),
-                    state.hasCompletedHandshake() ? "yes" : "no",
-                    state.getTotalSectionsSent(),
-                    DiagnosticsFormatter.formatBytes(state.getTotalBytesSent()),
-                    state.getHeldSyncSlots(),
-                    state.getHeldGenSlots(),
-                    state.getSendQueueSize(),
-                    state.getTotalRequestsReceived()
-            );
-            sender.sendMessage(line);
+        for (var state : players.values()) {
+            sender.sendMessage(DiagnosticsFormatter.formatStatsLine(state));
         }
     }
 
     private void showDiagnostics(CommandSender sender, PaperRequestProcessingService service) {
         var config = this.plugin.getLssConfig();
-        long uptimeSec = service.getUptimeSeconds();
-        var diag = service.getOffThreadProcessor().getDiagnostics();
-        var diskReader = service.getDiskReader();
-        long diskCompleted = diskReader.getDiag().getSuccessfulReadCount();
         var genService = service.getGenerationService();
-        var bwLimiter = service.getBandwidthLimiter();
-
-        long totalSent = 0;
-        long totalBytes = 0;
-        var players = new ArrayList<DiagnosticsFormatter.PlayerDiag>();
-        for (var entry : service.getPlayers().entrySet()) {
-            var state = entry.getValue();
-            totalSent += state.getTotalSectionsSent();
-            totalBytes += state.getTotalBytesSent();
-            players.add(new DiagnosticsFormatter.PlayerDiag(
-                    state.getPlayer().getName().getString(),
-                    state.getSendQueueSize(), config.sendQueueLimitPerPlayer,
-                    state.getHeldSyncSlots(), state.getHeldGenSlots(),
-                    state.getTotalSectionsSent(), state.getTotalBytesSent()
-            ));
-        }
-
-        var data = new DiagnosticsFormatter.DiagData(
+        var data = DiagnosticsFormatter.collectDiagData(
                 config.enabled, config.lodDistanceChunks,
                 config.bytesPerSecondLimitPerPlayer, config.bytesPerSecondLimitGlobal,
-                uptimeSec, totalSent, totalBytes,
-                diag.getTotalInMemory(), diag.getTotalUpToDate(), diag.getTotalGenDrained(),
-                diskCompleted,
-                service.getTickDiagnostics(),
-                diskReader.getDiagnostics(),
-                genService != null ? genService.getDiagnostics() : null, genService != null,
-                bwLimiter.getTotalBytesSent(),
-                service.getWindowBandwidthRate(),
-                players
+                config.sendQueueLimitPerPlayer,
+                service.getUptimeSeconds(), service.getTickDiagnostics(), service.getWindowBandwidthRate(),
+                service.getOffThreadProcessor().getDiagnostics(), service.getDiskReader(),
+                service.getBandwidthLimiter(),
+                genService != null ? genService.getDiagnostics() : null,
+                service.getPlayers().values()
         );
 
         for (var line : DiagnosticsFormatter.formatDiagnostics(data)) {

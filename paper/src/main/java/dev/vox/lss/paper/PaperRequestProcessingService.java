@@ -1,13 +1,12 @@
 package dev.vox.lss.paper;
 
+import dev.vox.lss.common.DiagnosticsFormatter;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.SharedBandwidthLimiter;
 import dev.vox.lss.common.processing.LoadedColumnData;
 import dev.vox.lss.common.processing.OffThreadProcessor;
-import dev.vox.lss.common.processing.SendAction;
-import dev.vox.lss.common.processing.SendActionBatcher;
 import dev.vox.lss.common.processing.TickDiagnostics;
 import dev.vox.lss.common.processing.TickSnapshot;
 import dev.vox.lss.common.tracking.DirtyColumnTracker;
@@ -52,7 +51,7 @@ public class PaperRequestProcessingService {
 
     private final TickDiagnostics diag = new TickDiagnostics();
 
-    private final SendActionBatcher sendActionBatcher = new SendActionBatcher();
+
 
     private static final int DIAG_LOG_INTERVAL_TICKS = 100;
     private static final int MAX_PROBES_PER_TICK_PER_PLAYER = 512;
@@ -165,16 +164,8 @@ public class PaperRequestProcessingService {
         Map<UUID, String> playerDimensions = new HashMap<>();
         Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes = new HashMap<>();
 
-        // Build per-player set of generation-ready packed positions to skip in probeLoadedChunks
-        Map<UUID, LongOpenHashSet> genReadyPositions = null;
-        if (!generationReady.isEmpty()) {
-            genReadyPositions = new HashMap<>();
-            for (var genData : generationReady) {
-                genReadyPositions.computeIfAbsent(genData.playerUuid(),
-                        k -> new LongOpenHashSet())
-                        .add(PositionUtil.packPosition(genData.columnData().cx(), genData.columnData().cz()));
-            }
-        }
+        // Per-player set of generation-outcome positions to skip in probeLoadedChunks
+        Map<UUID, LongOpenHashSet> genReadyPositions = TickSnapshot.groupPositionsByPlayer(generationReady);
 
         int activeCount = 0;
         List<UUID> toRemove = null;
@@ -248,25 +239,18 @@ public class PaperRequestProcessingService {
         for (var state : this.players.values()) {
             if (!state.hasCompletedHandshake())
                 continue;
-            this.flushSendQueue(state, perPlayerCap);
+            var bukkitPlayer = state.getPlayer().getBukkitEntity();
+            state.flushSendQueue(perPlayerCap, this.bandwidthLimiter, this.diag,
+                    data -> PaperPayloadHandler.sendRawNmsPayload(bukkitPlayer,
+                            PaperPayloadHandler.ID_VOXEL_COLUMN, data));
         }
     }
 
     private void tickDiagnosticsLog() {
         if (++this.diagLogCounter >= DIAG_LOG_INTERVAL_TICKS) {
             this.diagLogCounter = 0;
-            if (LSSLogger.isDebugEnabled()) {
-                long uptimeSec = this.getUptimeSeconds();
-                long bwRate = uptimeSec > 0 ? this.bandwidthLimiter.getTotalBytesSent() / uptimeSec : 0;
-                LSSLogger.debug(this.diag.formatSummary(bwRate, this.config.bytesPerSecondLimitGlobal));
-                for (var state : this.players.values()) {
-                    if (!state.hasCompletedHandshake()) continue;
-                    LSSLogger.debug(String.format("  %s: sq=%d, syncSlots=%d/%d, genSlots=%d/%d",
-                            state.getPlayer().getName().getString(), state.getSendQueueSize(),
-                            state.getHeldSyncSlots(), state.getSyncSlotCap(),
-                            state.getHeldGenSlots(), state.getGenSlotCap()));
-                }
-            }
+            DiagnosticsFormatter.logDebugSummary(this.diag, this.getUptimeSeconds(),
+                    this.config.bytesPerSecondLimitGlobal, this.bandwidthLimiter, this.players.values());
         }
     }
 
@@ -296,27 +280,9 @@ public class PaperRequestProcessingService {
     }
 
     private void drainSendActions() {
-        this.sendActionBatcher.clear();
-
-        SendAction action;
-        while ((action = this.offThreadProcessor.pollSendAction()) != null) {
-            var state = this.players.get(action.playerUuid());
-            if (state == null || !state.hasCompletedHandshake()) continue;
-            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.packedPosition());
-        }
-
-        if (this.sendActionBatcher.isEmpty()) return;
-
-        this.sendActionBatcher.forEach((uuid, types, ids, count) -> {
-            var state = this.players.get(uuid);
-            if (state == null || !state.hasCompletedHandshake()) return;
-            try {
-                var bukkitPlayer = state.getPlayer().getBukkitEntity();
-                PaperPayloadHandler.sendBatchResponse(bukkitPlayer, types, ids, count);
-            } catch (Exception e) {
-                LSSLogger.error("Failed to send batch response to " + state.getPlayer().getName().getString(), e);
-            }
-        });
+        this.offThreadProcessor.drainSendActions((state, types, positions, count) ->
+                PaperPayloadHandler.sendBatchResponse(state.getPlayer().getBukkitEntity(),
+                        types, positions, count));
     }
 
     private void drainGenerationTicketRequests() {
@@ -343,32 +309,6 @@ public class PaperRequestProcessingService {
                         l -> l.dimension().identifier().toString());
                 this.offThreadProcessor.feedGenerationFailure(
                         req.playerUuid(), req.cx(), req.cz(), dimension, req.submissionOrder());
-            }
-        }
-    }
-
-    private void flushSendQueue(PaperPlayerRequestState state, long allocationBytes) {
-        state.drainReadyPayloads();
-        var queue = state.getSendQueue();
-
-        while (!queue.isEmpty()) {
-            if (!state.canSend(allocationBytes))
-                return;
-
-            var queued = queue.peek();
-            try {
-                var bukkitPlayer = state.getPlayer().getBukkitEntity();
-                PaperPayloadHandler.sendRawNmsPayload(bukkitPlayer,
-                        PaperPayloadHandler.ID_VOXEL_COLUMN, queued.data());
-                queue.poll();
-                state.recordSend(queued.estimatedBytes());
-                this.bandwidthLimiter.recordSend(queued.estimatedBytes());
-                this.diag.recordSectionSent(queued.estimatedBytes());
-            } catch (Exception e) {
-                LSSLogger.error("Failed to send queued payload to " + state.getPlayer().getName().getString()
-                        + ", dropping remaining queue (" + queue.size() + " entries)", e);
-                queue.clear();
-                return;
             }
         }
     }
@@ -401,7 +341,7 @@ public class PaperRequestProcessingService {
         return (System.nanoTime() - this.startTimeNanos) / LSSConstants.NANOS_PER_SECOND;
     }
 
-    public OffThreadProcessor<?, ?> getOffThreadProcessor() {
+    public OffThreadProcessor<?> getOffThreadProcessor() {
         return this.offThreadProcessor;
     }
 

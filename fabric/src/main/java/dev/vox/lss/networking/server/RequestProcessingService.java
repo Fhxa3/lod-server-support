@@ -1,13 +1,12 @@
 package dev.vox.lss.networking.server;
 
+import dev.vox.lss.common.DiagnosticsFormatter;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.SharedBandwidthLimiter;
 import dev.vox.lss.common.processing.LoadedColumnData;
 import dev.vox.lss.common.processing.OffThreadProcessor;
-import dev.vox.lss.common.processing.SendAction;
-import dev.vox.lss.common.processing.SendActionBatcher;
 import dev.vox.lss.common.processing.TickDiagnostics;
 import dev.vox.lss.common.processing.TickSnapshot;
 import dev.vox.lss.common.tracking.DirtyColumnTracker;
@@ -49,8 +48,6 @@ public class RequestProcessingService {
     private int diagLogCounter = 0;
 
     private final TickDiagnostics diag = new TickDiagnostics();
-
-    private final SendActionBatcher sendActionBatcher = new SendActionBatcher();
 
     private static final int DIAG_LOG_INTERVAL_TICKS = 100;
     private static final int MAX_PROBES_PER_TICK_PER_PLAYER = 512;
@@ -158,16 +155,8 @@ public class RequestProcessingService {
         Map<UUID, String> playerDimensions = new HashMap<>();
         Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes = new HashMap<>();
 
-        // Build per-player set of generation-ready packed positions to skip in probeLoadedChunks
-        Map<UUID, LongOpenHashSet> genReadyPositions = null;
-        if (!generationReady.isEmpty()) {
-            genReadyPositions = new HashMap<>();
-            for (var genData : generationReady) {
-                genReadyPositions.computeIfAbsent(genData.playerUuid(),
-                        k -> new LongOpenHashSet())
-                        .add(PositionUtil.packPosition(genData.columnData().cx(), genData.columnData().cz()));
-            }
-        }
+        // Per-player set of generation-outcome positions to skip in probeLoadedChunks
+        Map<UUID, LongOpenHashSet> genReadyPositions = TickSnapshot.groupPositionsByPlayer(generationReady);
 
         int activeCount = 0;
         List<UUID> toRemove = null;
@@ -238,7 +227,8 @@ public class RequestProcessingService {
 
         for (var state : this.players.values()) {
             if (!state.hasCompletedHandshake()) continue;
-            this.flushSendQueue(state, perPlayerCap);
+            state.flushSendQueue(perPlayerCap, this.bandwidthLimiter, this.diag,
+                    payload -> ServerPlayNetworking.send(state.getPlayer(), payload));
         }
     }
 
@@ -249,18 +239,8 @@ public class RequestProcessingService {
     private void tickDiagnosticsLog(LSSServerConfig config) {
         if (++this.diagLogCounter >= DIAG_LOG_INTERVAL_TICKS) {
             this.diagLogCounter = 0;
-            if (LSSLogger.isDebugEnabled()) {
-                long uptimeSec = this.getUptimeSeconds();
-                long bwRate = uptimeSec > 0 ? this.bandwidthLimiter.getTotalBytesSent() / uptimeSec : 0;
-                LSSLogger.debug(this.diag.formatSummary(bwRate, config.bytesPerSecondLimitGlobal));
-                for (var state : this.players.values()) {
-                    if (!state.hasCompletedHandshake()) continue;
-                    LSSLogger.debug(String.format("  %s: sq=%d, syncSlots=%d/%d, genSlots=%d/%d",
-                            state.getPlayer().getName().getString(), state.getSendQueueSize(),
-                            state.getHeldSyncSlots(), state.getSyncSlotCap(),
-                            state.getHeldGenSlots(), state.getGenSlotCap()));
-                }
-            }
+            DiagnosticsFormatter.logDebugSummary(this.diag, this.getUptimeSeconds(),
+                    config.bytesPerSecondLimitGlobal, this.bandwidthLimiter, this.players.values());
         }
     }
 
@@ -322,57 +302,11 @@ public class RequestProcessingService {
         }
     }
 
-    /**
-     * Drain send actions produced by the processing thread and batch into
-     * one {@link BatchResponseS2CPayload} per player per tick.
-     */
     private void drainSendActions() {
-        this.sendActionBatcher.clear();
-
-        SendAction action;
-        while ((action = this.offThreadProcessor.pollSendAction()) != null) {
-            var state = this.players.get(action.playerUuid());
-            if (state == null || !state.hasCompletedHandshake()) continue;
-            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.packedPosition());
-        }
-
-        if (this.sendActionBatcher.isEmpty()) return;
-
-        this.sendActionBatcher.forEach((uuid, types, positions, count) -> {
-            var state = this.players.get(uuid);
-            if (state == null || !state.hasCompletedHandshake()) return;
-            try {
+        this.offThreadProcessor.drainSendActions((state, types, positions, count) ->
                 ServerPlayNetworking.send(state.getPlayer(),
-                        new BatchResponseS2CPayload(types, positions, count));
-            } catch (Exception e) {
-                LSSLogger.error("Failed to send batch response to " + state.getPlayer().getName().getString(), e);
-            }
-        });
+                        new BatchResponseS2CPayload(types, positions, count)));
     }
-
-    private void flushSendQueue(PlayerRequestState state, long allocationBytes) {
-        state.drainReadyPayloads();
-        var queue = state.getSendQueue();
-
-        while (!queue.isEmpty()) {
-            if (!state.canSend(allocationBytes)) return;
-
-            var queued = queue.peek();
-            try {
-                ServerPlayNetworking.send(state.getPlayer(), queued.payload());
-                queue.poll();
-                state.recordSend(queued.estimatedBytes());
-                this.bandwidthLimiter.recordSend(queued.estimatedBytes());
-                this.diag.recordSectionSent(queued.estimatedBytes());
-            } catch (Exception e) {
-                LSSLogger.error("Failed to send queued payload to " + state.getPlayer().getName().getString()
-                        + ", dropping remaining queue (" + queue.size() + " entries)", e);
-                queue.clear();
-                return;
-            }
-        }
-    }
-
 
     public Map<UUID, PlayerRequestState> getPlayers() {
         return Collections.unmodifiableMap(this.players);
@@ -394,7 +328,7 @@ public class RequestProcessingService {
         return (System.nanoTime() - this.startTimeNanos) / LSSConstants.NANOS_PER_SECOND;
     }
 
-    public OffThreadProcessor<?, ?> getOffThreadProcessor() {
+    public OffThreadProcessor<?> getOffThreadProcessor() {
         return this.offThreadProcessor;
     }
 

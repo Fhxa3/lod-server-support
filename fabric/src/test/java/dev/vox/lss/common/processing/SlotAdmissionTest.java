@@ -22,6 +22,9 @@ class SlotAdmissionTest {
         TestState(int syncCap, int genCap) {
             super(UUID.randomUUID(), syncCap, genCap);
         }
+
+        @Override
+        public String getPlayerName() { return "test"; }
     }
 
     private TestState state;

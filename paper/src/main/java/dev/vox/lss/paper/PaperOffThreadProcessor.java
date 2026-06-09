@@ -3,6 +3,7 @@ package dev.vox.lss.paper;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.processing.OffThreadProcessor;
+import dev.vox.lss.common.processing.QueuedPayload;
 import net.minecraft.server.level.ServerLevel;
 
 import java.nio.file.Path;
@@ -14,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * Paper-specific off-thread processor. Produces encoded byte[] payloads
  * that will be sent via Plugin Messaging on the main thread.
  */
-public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerRequestState, PaperChunkDiskReader.SimpleReadResult> {
+public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerRequestState> {
     private final PaperChunkDiskReader diskReader;
 
     // Stored dimension strings for disk read submission. Grows but never prunes — acceptable because
@@ -26,20 +27,12 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
                                     boolean generationAvailable,
                                     Path dataDir, int perDimensionTimestampCacheSizeMB) {
         super(players,
-                diskReader != null, generationAvailable, dataDir, perDimensionTimestampCacheSizeMB);
+                diskReader, generationAvailable, dataDir, perDimensionTimestampCacheSizeMB);
         this.diskReader = diskReader;
     }
 
     public void updateDimensionContext(String dimension, ServerLevel level) {
         this.dimensionLevelMap.putIfAbsent(dimension, level);
-    }
-
-    @Override
-    protected PaperChunkDiskReader.SimpleReadResult pollDiskResult(PaperPlayerRequestState state) {
-        if (this.diskReader == null) return null;
-        var queue = this.diskReader.getPlayerQueue(state.getPlayerUUID());
-        if (queue == null) return null;
-        return queue.poll();
     }
 
     @Override
@@ -52,7 +45,7 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
             LSSLogger.debug("No dimension context for " + dimension + ", skipping disk read for " + cx + "," + cz);
             return false;
         }
-        this.diskReader.submitReadDirect(playerUuid, level,
+        this.diskReader.submitReadDirect(playerUuid, dimension, level,
                 cx, cz, submissionOrder);
         return true;
     }
@@ -70,8 +63,7 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
         }
         byte[] encoded = PaperPayloadHandler.encodeVoxelColumnPreEncoded(
                 cx, cz, dimension, columnTimestamp, sectionBytes);
-        state.addReadyPayload(new PaperPlayerRequestState.QueuedPayload(
-                encoded, estimatedBytes, submissionOrder));
+        state.addReadyPayload(new QueuedPayload<>(encoded, estimatedBytes, submissionOrder));
     }
 
     @Override

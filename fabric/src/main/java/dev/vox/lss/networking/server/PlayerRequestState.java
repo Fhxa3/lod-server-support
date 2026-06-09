@@ -8,17 +8,9 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.Level;
 
-public class PlayerRequestState extends AbstractPlayerRequestState<PlayerRequestState.QueuedPayload> {
+public class PlayerRequestState extends AbstractPlayerRequestState<CustomPacketPayload> {
     private volatile ServerPlayer player;
     private ResourceKey<Level> lastDimension;
-
-    public record QueuedPayload(CustomPacketPayload payload,
-                                int estimatedBytes, long submissionOrder) implements Comparable<QueuedPayload> {
-        @Override
-        public int compareTo(QueuedPayload other) {
-            return Long.compare(this.submissionOrder, other.submissionOrder);
-        }
-    }
 
     public PlayerRequestState(ServerPlayer player, int syncConcurrency, int genConcurrency) {
         super(player.getUUID(), syncConcurrency, genConcurrency);
@@ -37,6 +29,9 @@ public class PlayerRequestState extends AbstractPlayerRequestState<PlayerRequest
     }
 
     public ServerPlayer getPlayer() { return this.player; }
+
+    @Override
+    public String getPlayerName() { return this.player.getName().getString(); }
     public ResourceKey<Level> getLastDimension() { return this.lastDimension; }
 
     public boolean checkDimensionChange() {

@@ -3,6 +3,7 @@ package dev.vox.lss.networking.server;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.processing.OffThreadProcessor;
+import dev.vox.lss.common.processing.QueuedPayload;
 import dev.vox.lss.networking.payloads.VoxelColumnS2CPayload;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
@@ -19,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * Fabric-specific off-thread processor. Produces CustomPacketPayload objects
  * that will be sent via Fabric networking on the main thread.
  */
-public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestState, ChunkDiskReader.ReadResult> {
+public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestState> {
     private final ChunkDiskReader diskReader;
 
     // Stored references for disk read submission. Grows but never prunes — acceptable because
@@ -33,7 +34,7 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
                                      ChunkDiskReader diskReader,
                                      boolean generationAvailable,
                                      Path dataDir, int perDimensionTimestampCacheSizeMB) {
-        super(players, diskReader != null, generationAvailable, dataDir, perDimensionTimestampCacheSizeMB);
+        super(players, diskReader, generationAvailable, dataDir, perDimensionTimestampCacheSizeMB);
         this.diskReader = diskReader;
     }
 
@@ -43,21 +44,13 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
     }
 
     @Override
-    protected ChunkDiskReader.ReadResult pollDiskResult(PlayerRequestState state) {
-        if (this.diskReader == null) return null;
-        var queue = this.diskReader.getPlayerQueue(state.getPlayerUUID());
-        if (queue == null) return null;
-        return queue.poll();
-    }
-
-    @Override
     protected boolean submitDiskRead(UUID playerUuid, String dimension,
                                    int cx, int cz,
                                    long submissionOrder) {
         if (this.diskReader == null) return false;
         var level = this.dimensionLevelMap.get(dimension);
         if (level == null) return false;
-        this.diskReader.submitReadDirect(playerUuid, level,
+        this.diskReader.submitReadDirect(playerUuid, dimension, level,
                 cx, cz, submissionOrder);
         return true;
     }
@@ -77,8 +70,7 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
                 d -> ResourceKey.create(Registries.DIMENSION, Identifier.parse(d)));
         var payload = new VoxelColumnS2CPayload(cx, cz, dimensionKey, columnTimestamp,
                 sectionBytes);
-        state.addReadyPayload(new PlayerRequestState.QueuedPayload(
-                payload, estimatedBytes, submissionOrder));
+        state.addReadyPayload(new QueuedPayload<>(payload, estimatedBytes, submissionOrder));
     }
 
     @Override

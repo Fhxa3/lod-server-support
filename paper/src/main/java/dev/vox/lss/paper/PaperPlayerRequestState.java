@@ -10,17 +10,9 @@ import net.minecraft.world.level.Level;
  * Per-player state tracking for the Paper plugin. Adapted from Fabric's PlayerRequestState
  * with QueuedPayload holding encoded byte[] + channel name instead of CustomPacketPayload.
  */
-public class PaperPlayerRequestState extends AbstractPlayerRequestState<PaperPlayerRequestState.QueuedPayload> {
+public class PaperPlayerRequestState extends AbstractPlayerRequestState<byte[]> {
     private volatile ServerPlayer player;
     private ResourceKey<Level> lastDimension;
-
-    public record QueuedPayload(byte[] data,
-                                int estimatedBytes, long submissionOrder) implements Comparable<QueuedPayload> {
-        @Override
-        public int compareTo(QueuedPayload other) {
-            return Long.compare(this.submissionOrder, other.submissionOrder);
-        }
-    }
 
     public PaperPlayerRequestState(ServerPlayer player, int syncConcurrency, int genConcurrency) {
         super(player.getUUID(), syncConcurrency, genConcurrency);
@@ -37,6 +29,9 @@ public class PaperPlayerRequestState extends AbstractPlayerRequestState<PaperPla
     }
 
     public ServerPlayer getPlayer() { return this.player; }
+
+    @Override
+    public String getPlayerName() { return this.player.getName().getString(); }
     public ResourceKey<Level> getLastDimension() { return this.lastDimension; }
 
     public boolean checkDimensionChange() {

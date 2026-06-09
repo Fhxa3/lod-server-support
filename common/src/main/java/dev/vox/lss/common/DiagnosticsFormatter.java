@@ -1,6 +1,12 @@
 package dev.vox.lss.common;
 
+import dev.vox.lss.common.processing.AbstractPlayerRequestState;
+import dev.vox.lss.common.processing.AbstractChunkDiskReader;
+import dev.vox.lss.common.processing.ProcessingDiagnostics;
+import dev.vox.lss.common.processing.TickDiagnostics;
+
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 public final class DiagnosticsFormatter {
@@ -86,6 +92,74 @@ public final class DiagnosticsFormatter {
         }
 
         return lines;
+    }
+
+    /** The /lsslod stats per-player line, shared by both platform command handlers. */
+    public static String formatStatsLine(AbstractPlayerRequestState<?> state) {
+        return String.format(
+                "%s: handshake=%s, sent=%d sections (%s), pending_sync=%d, pending_gen=%d, send_queue=%d, requests=%d",
+                state.getPlayerName(),
+                state.hasCompletedHandshake() ? "yes" : "no",
+                state.getTotalSectionsSent(),
+                formatBytes(state.getTotalBytesSent()),
+                state.getHeldSyncSlots(),
+                state.getHeldGenSlots(),
+                state.getSendQueueSize(),
+                state.getTotalRequestsReceived()
+        );
+    }
+
+    /** Collect the /lsslod diag data from common-typed sources, shared by both platforms. */
+    public static DiagData collectDiagData(boolean enabled, int lodDistanceChunks,
+                                           long bwPerPlayer, long bwGlobal, int sendQueueLimitPerPlayer,
+                                           long uptimeSec, String tickDiagnostics, long windowBandwidthRate,
+                                           ProcessingDiagnostics diag, AbstractChunkDiskReader diskReader,
+                                           SharedBandwidthLimiter bwLimiter,
+                                           String generationDiagnosticsOrNull,
+                                           Collection<? extends AbstractPlayerRequestState<?>> states) {
+        long totalSent = 0;
+        long totalBytes = 0;
+        var players = new ArrayList<PlayerDiag>();
+        for (var state : states) {
+            totalSent += state.getTotalSectionsSent();
+            totalBytes += state.getTotalBytesSent();
+            players.add(new PlayerDiag(
+                    state.getPlayerName(),
+                    state.getSendQueueSize(), sendQueueLimitPerPlayer,
+                    state.getHeldSyncSlots(), state.getHeldGenSlots(),
+                    state.getTotalSectionsSent(), state.getTotalBytesSent()
+            ));
+        }
+
+        return new DiagData(
+                enabled, lodDistanceChunks,
+                bwPerPlayer, bwGlobal,
+                uptimeSec, totalSent, totalBytes,
+                diag.getTotalInMemory(), diag.getTotalUpToDate(), diag.getTotalGenDrained(),
+                diskReader.getDiag().getSuccessfulReadCount(),
+                tickDiagnostics,
+                diskReader.getDiagnostics(),
+                generationDiagnosticsOrNull, generationDiagnosticsOrNull != null,
+                bwLimiter.getTotalBytesSent(),
+                windowBandwidthRate,
+                players
+        );
+    }
+
+    /** The periodic server debug summary, shared by both platform tick loops. */
+    public static void logDebugSummary(TickDiagnostics diag, long uptimeSec, long globalByteLimit,
+                                       SharedBandwidthLimiter bwLimiter,
+                                       Collection<? extends AbstractPlayerRequestState<?>> states) {
+        if (!LSSLogger.isDebugEnabled()) return;
+        long bwRate = uptimeSec > 0 ? bwLimiter.getTotalBytesSent() / uptimeSec : 0;
+        LSSLogger.debug(diag.formatSummary(bwRate, globalByteLimit));
+        for (var state : states) {
+            if (!state.hasCompletedHandshake()) continue;
+            LSSLogger.debug(String.format("  %s: sq=%d, syncSlots=%d/%d, genSlots=%d/%d",
+                    state.getPlayerName(), state.getSendQueueSize(),
+                    state.getHeldSyncSlots(), state.getSyncSlotCap(),
+                    state.getHeldGenSlots(), state.getGenSlotCap()));
+        }
     }
 
     public static String formatRate(double rate) {

@@ -1,28 +1,31 @@
-package dev.vox.lss.config;
+package dev.vox.lss.common.config;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import dev.vox.lss.common.LSSLogger;
-import net.fabricmc.loader.api.FabricLoader;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
  * Generic JSON config loader. Subclasses declare public fields as config entries;
- * this base class handles persistence via GSON.
+ * this base class handles persistence via GSON. The config directory is supplied
+ * at load time (platforms resolve it differently).
  */
 public abstract class JsonConfig {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
+    // Set by load(); transient so GSON neither serializes nor overwrites it.
+    private transient Path configDir;
+
     protected abstract String getFileName();
 
     /** Override to clamp or correct field values after deserialization. */
-    protected void validate() {}
+    public void validate() {}
 
     public void save() {
         try {
-            Path path = resolvePath();
+            Path path = this.configDir.resolve(getFileName());
             Files.createDirectories(path.getParent());
             Files.writeString(path, GSON.toJson(this));
         } catch (Exception e) {
@@ -30,18 +33,15 @@ public abstract class JsonConfig {
         }
     }
 
-    private Path resolvePath() {
-        return FabricLoader.getInstance().getConfigDir().resolve(getFileName());
-    }
-
-    protected static <T extends JsonConfig> T load(Class<T> type, String fileName) {
-        Path path = FabricLoader.getInstance().getConfigDir().resolve(fileName);
+    protected static <T extends JsonConfig> T load(Class<T> type, String fileName, Path configDir) {
+        Path path = configDir.resolve(fileName);
         boolean fileExists = Files.isRegularFile(path);
         if (fileExists) {
             try {
                 String json = Files.readString(path);
                 T config = GSON.fromJson(json, type);
                 if (config != null) {
+                    ((JsonConfig) config).configDir = configDir;
                     config.validate();
                     config.save();
                     return config;
@@ -53,6 +53,8 @@ public abstract class JsonConfig {
         }
         try {
             T config = type.getDeclaredConstructor().newInstance();
+            ((JsonConfig) config).configDir = configDir;
+            config.validate();
             if (!fileExists) {
                 config.save();
             }

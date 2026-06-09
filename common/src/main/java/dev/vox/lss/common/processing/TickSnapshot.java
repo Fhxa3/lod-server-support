@@ -1,7 +1,11 @@
 package dev.vox.lss.common.processing;
 
+import dev.vox.lss.common.PositionUtil;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -39,5 +43,19 @@ public record TickSnapshot(
     /** Shutdown sentinel — tells the processing thread to exit. */
     public static TickSnapshot shutdownSentinel() {
         return new TickSnapshot(Map.of(), Map.of(), 0, true);
+    }
+
+    /**
+     * Group generation outcomes' packed positions by player, for skipping those positions
+     * in the loaded-chunk probe pass. Returns null when there is nothing to group.
+     */
+    public static Map<UUID, LongOpenHashSet> groupPositionsByPlayer(List<GenerationReadyData> generationReady) {
+        if (generationReady.isEmpty()) return null;
+        Map<UUID, LongOpenHashSet> grouped = new HashMap<>();
+        for (var genData : generationReady) {
+            grouped.computeIfAbsent(genData.playerUuid(), k -> new LongOpenHashSet())
+                    .add(PositionUtil.packPosition(genData.cx(), genData.cz()));
+        }
+        return grouped;
     }
 }
