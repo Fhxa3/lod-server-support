@@ -26,10 +26,10 @@ import java.util.concurrent.TimeUnit;
  * (generation outcomes, player removals, timestamp invalidations, and dirty-clears
  * accumulate until consumed). All event producers run on the main thread.
  *
- * @param <PlayerState>  the platform-specific player state type (must implement {@link PlayerStateAccess})
+ * @param <PlayerState>  the platform-specific player state type
  * @param <ReadResult>   the platform-specific disk reader result type (must implement {@link ReadResultAccess})
  */
-public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, ReadResult extends ReadResultAccess> {
+public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerRequestState<?>, ReadResult extends ReadResultAccess> {
 
     private static final int SNAPSHOT_POLL_MS = 50;
     private static final int SHUTDOWN_JOIN_MS = 5000;
@@ -87,8 +87,9 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
     });
 
     // this-escape is benign: the Thread is created here but only started later via start()
-    // (post-construction), and processingLoop is private (not subclass-overridable), so no
-    // partially-initialized subclass state is touched before construction completes.
+    // (post-construction), and the router's back-reference is only used from the processing
+    // loop after start(), so no partially-initialized subclass state is touched before
+    // construction completes.
     @SuppressWarnings("this-escape")
     protected OffThreadProcessor(Map<UUID, PlayerState> players,
                                   boolean diskReadingAvailable, boolean generationAvailable,
@@ -103,7 +104,7 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         }
         this.ctx = new ProcessingContext(this.sendActions, this.generationTicketRequests,
                 new ProcessingDiagnostics(), new SequenceCounter());
-        this.requestRouter = new IncomingRequestRouter<>(this.timestampCache,
+        this.requestRouter = new IncomingRequestRouter<>(this, this.players, this.timestampCache,
                 this.dedupTracker, diskReadingAvailable, generationAvailable, this.ctx);
         this.processingThread = new Thread(this::processingLoop, "LSS Processing Thread");
         this.processingThread.setDaemon(true);
@@ -180,9 +181,6 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
 
     /** Drain disk reader results for a player. Returns ReadResult or null. */
     protected abstract ReadResult pollDiskResult(PlayerState state);
-
-    /** Enqueue payloads from a disk result into the player's ready queue. */
-    protected abstract void enqueueResultPayloads(PlayerState state, ReadResult result);
 
     /**
      * Submit a disk read for an unloaded chunk (called from processing thread). Returns
@@ -335,65 +333,60 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
             while ((result = this.pollDiskResult(state)) != null) {
                 int cx = result.chunkX();
                 int cz = result.chunkZ();
-                var pending = state.removePendingByPosition(cx, cz);
-
                 long packed = PositionUtil.packPosition(cx, cz);
 
-                if (result.saturated()) {
-                    this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, packed));
-                    if (LSSLogger.isDebugEnabled()) {
-                        LSSLogger.debug("Rate-limited " + playerUuid + " (disk saturated): chunk [" + cx + ", " + cz + "]");
-                    }
-                } else if (result.notFound()) {
-                    handleDiskNotFound(playerUuid, state, packed, cx, cz, pending);
-                } else {
-                    state.markDiskReadDone(cx, cz);
-                    if (result.sectionBytes() != null) {
-                        this.enqueueResultPayloads(state, result);
-                    } else {
-                        // All-air chunk (exists on disk but no visible sections) — notify client
-                        this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed));
-                    }
+                deliverDiskResult(playerUuid, state, result, result.submissionOrder());
+
+                if (!result.saturated() && !result.notFound()) {
                     // Store timestamp so reconnecting clients get up-to-date responses
                     this.timestampCache.put(dimension, packed, result.columnTimestamp(), this.cycleNow);
                 }
-                this.ctx.diagnostics().incrementDiskDrained();
 
-                // Dispatch to attached players in the dedup group
+                // Dispatch the same result to attached players in the dedup group
                 var group = this.dedupTracker.removeGroup(packed, dimension);
                 if (group != null) {
-                    dispatchDedupGroup(group, result, cx, cz);
+                    for (var attachment : group.attached()) {
+                        var attachedState = this.players.get(attachment.playerUuid());
+                        if (attachedState == null) continue;
+                        deliverDiskResult(attachment.playerUuid(), attachedState, result,
+                                attachment.submissionOrder());
+                    }
                 }
             }
         }
     }
 
-    private void dispatchDedupGroup(DedupTracker.Group group, ReadResult result,
-                                     int cx, int cz) {
-        byte[] sectionBytes = result.sectionBytes();
+    /**
+     * Deliver one disk read result to one recipient: resolve the pending entry (freeing its
+     * slot), then answer with RateLimited / not-found fallback / column data / up-to-date.
+     * Shared by the primary requester and every dedup-attached player.
+     */
+    private void deliverDiskResult(UUID playerUuid, PlayerState state, ReadResult result,
+                                    long submissionOrder) {
+        int cx = result.chunkX();
+        int cz = result.chunkZ();
         long packed = PositionUtil.packPosition(cx, cz);
-        for (var attachment : group.attached()) {
-            var attachedState = this.players.get(attachment.playerUuid());
-            if (attachedState == null) continue;
+        var pending = state.removePendingByPosition(cx, cz);
 
-            var attachedPending = attachedState.removePendingByPosition(cx, cz);
-
-            if (result.saturated()) {
-                this.ctx.sendActions().add(new SendAction.RateLimited(attachment.playerUuid(), packed));
-            } else if (result.notFound()) {
-                handleDiskNotFound(attachment.playerUuid(), attachedState, packed, cx, cz, attachedPending);
-            } else if (sectionBytes != null) {
-                attachedState.markDiskReadDone(cx, cz);
-                buildAndEnqueueColumnPayload(attachedState, cx, cz, group.dimension(),
-                        result.columnTimestamp(), attachment.submissionOrder(),
-                        sectionBytes, result.estimatedBytes());
-            } else {
-                // Empty column (all air) — mark done and notify client
-                attachedState.markDiskReadDone(cx, cz);
-                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(attachment.playerUuid(), packed));
+        if (result.saturated()) {
+            this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, packed));
+            if (LSSLogger.isDebugEnabled()) {
+                LSSLogger.debug("Rate-limited " + playerUuid + " (disk saturated): chunk [" + cx + ", " + cz + "]");
             }
-            this.ctx.diagnostics().incrementDiskDrained();
+        } else if (result.notFound()) {
+            handleDiskNotFound(playerUuid, state, packed, cx, cz, pending);
+        } else {
+            state.markDiskReadDone(cx, cz);
+            if (result.sectionBytes() != null) {
+                buildAndEnqueueColumnPayload(state, cx, cz, result.dimension(),
+                        result.columnTimestamp(), submissionOrder,
+                        result.sectionBytes(), result.estimatedBytes());
+            } else {
+                // All-air chunk (exists on disk but no visible sections) — notify client
+                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed));
+            }
         }
+        this.ctx.diagnostics().incrementDiskDrained();
     }
 
     /** Disk-first fallback: if the original request was GENERATION and generation is available,
@@ -440,8 +433,7 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
     // ---- Phase 4: Route incoming requests per player ----
 
     private void routeIncomingRequests(TickSnapshot snapshot) {
-        this.requestRouter.routeAll(snapshot, this.players,
-                this::submitDiskRead, this::enqueueLoadedColumn, this.cycleNow);
+        this.requestRouter.routeAll(snapshot, this.cycleNow);
     }
 
     public ProcessingDiagnostics getDiagnostics() {

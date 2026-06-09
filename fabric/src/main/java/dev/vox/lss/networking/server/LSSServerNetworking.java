@@ -56,12 +56,20 @@ public class LSSServerNetworking {
                         return;
                     }
 
+                    if ((payload.capabilities() & LSSConstants.CAPABILITY_VOXEL_COLUMNS) == 0) {
+                        // No consumer on the client — registering would only create a zombie
+                        // state that ignores every request. Visible to admins via this log.
+                        LSSLogger.info("Player " + player.getName().getString()
+                                + " has no LOD consumer (caps=" + payload.capabilities()
+                                + "), skipping LOD registration");
+                        return;
+                    }
+
                     if (effectiveEnabled) {
                         service.registerPlayer(player, payload.capabilities());
                         LSSLogger.info("Player " + player.getName().getString()
-                                + " registered for LSS LOD request processing"
-                                + (payload.capabilities() != 0
-                                        ? " (caps=" + payload.capabilities() + ")" : ""));
+                                + " registered for LSS LOD request processing (caps="
+                                + payload.capabilities() + ")");
                     }
                 }
         );

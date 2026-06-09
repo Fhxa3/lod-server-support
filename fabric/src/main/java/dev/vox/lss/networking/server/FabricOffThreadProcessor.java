@@ -51,15 +51,6 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
     }
 
     @Override
-    protected void enqueueResultPayloads(PlayerRequestState state, ChunkDiskReader.ReadResult result) {
-        if (result.sectionBytes() != null) {
-            buildAndEnqueueColumnPayload(state, result.chunkX(), result.chunkZ(),
-                    result.dimension(), result.columnTimestamp(),
-                    result.submissionOrder(), result.sectionBytes(), result.estimatedBytes());
-        }
-    }
-
-    @Override
     protected boolean submitDiskRead(UUID playerUuid, String dimension,
                                    int cx, int cz,
                                    long submissionOrder) {

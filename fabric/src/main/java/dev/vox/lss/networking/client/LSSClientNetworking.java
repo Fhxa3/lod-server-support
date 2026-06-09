@@ -64,10 +64,10 @@ public class LSSClientNetworking {
         Minecraft.getInstance().execute(() -> {
             if (!LSSClientConfig.CONFIG.receiveServerLods) return;
             if (requestManager != null) return;
+            if (!LSSApi.hasVoxelConsumers()) return; // no LOD consumer -> stay silent
             try {
-                int clientCaps = LSSApi.hasVoxelConsumers()
-                        ? LSSConstants.CAPABILITY_VOXEL_COLUMNS : 0;
-                ClientPlayNetworking.send(new HandshakeC2SPayload(LSSConstants.PROTOCOL_VERSION, clientCaps));
+                ClientPlayNetworking.send(new HandshakeC2SPayload(
+                        LSSConstants.PROTOCOL_VERSION, LSSConstants.CAPABILITY_VOXEL_COLUMNS));
             } catch (Exception e) {
                 LSSLogger.debug("LAN host handshake send failed: " + e.getMessage());
             }
@@ -98,7 +98,9 @@ public class LSSClientNetworking {
                     serverEnabled = payload.enabled();
                     serverLodDistance = payload.lodDistanceChunks();
 
-                    if (payload.enabled()) {
+                    // Without a registered LSSApi consumer there is nothing to deliver columns
+                    // to — skip session setup entirely (capability is sampled at JOIN).
+                    if (payload.enabled() && LSSApi.hasVoxelConsumers()) {
                         connectionStartMs = System.currentTimeMillis();
                         var manager = new LodRequestManager();
                         var mc = Minecraft.getInstance();
@@ -184,10 +186,12 @@ public class LSSClientNetworking {
                 return;
             }
 
+            // Without a consumer the server would ignore our requests anyway — stay silent.
+            if (!LSSApi.hasVoxelConsumers()) return;
+
             try {
-                int clientCaps = LSSApi.hasVoxelConsumers()
-                        ? LSSConstants.CAPABILITY_VOXEL_COLUMNS : 0;
-                ClientPlayNetworking.send(new HandshakeC2SPayload(LSSConstants.PROTOCOL_VERSION, clientCaps));
+                ClientPlayNetworking.send(new HandshakeC2SPayload(
+                        LSSConstants.PROTOCOL_VERSION, LSSConstants.CAPABILITY_VOXEL_COLUMNS));
             } catch (Exception e) {
                 LSSLogger.debug("Handshake send failed (server likely doesn't have LSS): " + e.getMessage());
             }

@@ -9,6 +9,7 @@ package dev.vox.lss.common.processing;
 public interface ReadResultAccess {
     int chunkX();
     int chunkZ();
+    String dimension();
     long columnTimestamp();
     boolean notFound();
     long submissionOrder();

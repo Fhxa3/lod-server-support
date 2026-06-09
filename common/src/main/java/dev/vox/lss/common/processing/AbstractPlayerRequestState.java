@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * @param <Q> the queued payload type (must be {@link Comparable} for priority queue ordering)
  */
-public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implements PlayerStateAccess {
+public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> {
 
     private final UUID playerUuid;
     private volatile boolean hasHandshake = false;
@@ -117,16 +117,14 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         this.bandwidth.recordSend(bytes);
     }
 
-    // ---- PlayerStateAccess per-request methods ----
+    // ---- Processing-thread-facing per-request API ----
 
-    @Override
     public IncomingRequest pollIncomingRequest() {
         var r = this.incomingRequests.poll();
         if (r != null) this.incomingRequestCount.decrementAndGet();
         return r;
     }
 
-    @Override
     public boolean tryAdmit(PendingRequest pending) {
         int cap = pending.heldSlot() == SlotType.SYNC_ON_LOAD ? this.syncSlotCap : this.genSlotCap;
         int held = pending.heldSlot() == SlotType.SYNC_ON_LOAD ? this.heldSyncSlots : this.heldGenSlots;
@@ -144,7 +142,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         adjustSlot(pending.heldSlot(), +1);
     }
 
-    @Override
     public PendingRequest removePendingByPosition(int cx, int cz) {
         long packed = PositionUtil.packPosition(cx, cz);
         var pending = this.pendingByPosition.remove(packed);
@@ -154,7 +151,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         return pending;
     }
 
-    @Override
     public boolean hasPendingRequest(int cx, int cz) {
         return this.pendingByPosition.containsKey(PositionUtil.packPosition(cx, cz));
     }
@@ -173,7 +169,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     }
 
     /** Clear dirty positions from diskReadDone (processing thread, from dirty-clear events). */
-    @Override
     public void clearDiskReadDone(long[] positions) {
         for (long pos : positions) {
             this.diskReadDone.remove(pos);
@@ -192,7 +187,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
 
     // ---- Getters ----
 
-    @Override
     public UUID getPlayerUUID() { return this.playerUuid; }
     public PriorityQueue<Q> getSendQueue() { return this.sendQueue; }
     /** Returns a volatile snapshot of the send queue size, safe for cross-thread reads. */

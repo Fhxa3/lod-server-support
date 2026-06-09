@@ -122,12 +122,20 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
             return;
         }
 
+        if ((handshake.capabilities() & LSSConstants.CAPABILITY_VOXEL_COLUMNS) == 0) {
+            // No consumer on the client — registering would only create a zombie
+            // state that ignores every request. Visible to admins via this log.
+            LSSLogger.info("Player " + nmsPlayer.getName().getString()
+                    + " has no LOD consumer (caps=" + handshake.capabilities()
+                    + "), skipping LOD registration");
+            return;
+        }
+
         if (effectiveEnabled) {
             this.requestService.registerPlayer(nmsPlayer, handshake.capabilities());
             LSSLogger.info("Player " + nmsPlayer.getName().getString()
-                    + " registered for LSS LOD request processing"
-                    + (handshake.capabilities() != 0
-                            ? " (caps=" + handshake.capabilities() + ")" : ""));
+                    + " registered for LSS LOD request processing (caps="
+                    + handshake.capabilities() + ")");
         }
     }
 

@@ -14,33 +14,32 @@ import java.util.UUID;
  * duplicate check → queue-full check → timestamp check → loaded-probe check →
  * slot admission (or rate-limit bounce) → disk/generation submit.
  *
+ * <p>Processing-thread-owned; collaborates with its owning {@link OffThreadProcessor}
+ * (fixed at construction) for disk submission and loaded-column serialization.
+ *
  * @param <PS> the platform-specific player state type
  */
-class IncomingRequestRouter<PS extends PlayerStateAccess> {
+class IncomingRequestRouter<PS extends AbstractPlayerRequestState<?>> {
 
-    @FunctionalInterface
-    interface DiskReadSubmitter {
-        /** @return false if the read could not be submitted, so the caller can unwind. */
-        boolean submit(UUID playerUuid, String dimension,
-                       int cx, int cz, long submissionOrder);
-    }
-
-    @FunctionalInterface
-    interface LoadedColumnSerializer<PS> {
-        boolean serializeAndEnqueue(PS state, LoadedColumnData column,
-                                   long columnTimestamp, long submissionOrder, String dimension);
-    }
-
+    private final OffThreadProcessor<PS, ?> processor;
+    private final Map<UUID, PS> players;
     private final ColumnTimestampCache timestampCache;
     private final DedupTracker dedupTracker;
     private final boolean diskReadingAvailable;
     private final boolean generationAvailable;
     private final ProcessingContext ctx;
 
-    IncomingRequestRouter(ColumnTimestampCache timestampCache,
+    // Per-cycle state (processing thread only), set by routeAll for the duration of a cycle
+    private long cycleNow;
+
+    IncomingRequestRouter(OffThreadProcessor<PS, ?> processor,
+                          Map<UUID, PS> players,
+                          ColumnTimestampCache timestampCache,
                           DedupTracker dedupTracker,
                           boolean diskReadingAvailable, boolean generationAvailable,
                           ProcessingContext ctx) {
+        this.processor = processor;
+        this.players = players;
         this.timestampCache = timestampCache;
         this.dedupTracker = dedupTracker;
         this.diskReadingAvailable = diskReadingAvailable;
@@ -48,25 +47,19 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
         this.ctx = ctx;
     }
 
-    void routeAll(TickSnapshot snapshot, Map<UUID, PS> players,
-                  DiskReadSubmitter diskReadSubmitter,
-                  LoadedColumnSerializer<PS> loadedSerializer,
-                  long cycleNow) {
+    void routeAll(TickSnapshot snapshot, long cycleNow) {
+        this.cycleNow = cycleNow;
         for (var entry : snapshot.playerDimensions().entrySet()) {
-            var state = players.get(entry.getKey());
+            var state = this.players.get(entry.getKey());
             if (state == null) continue;
             if (!state.supportsVoxelColumns()) continue;
 
-            processIncomingRequests(state, entry.getKey(), entry.getValue(), snapshot,
-                    diskReadSubmitter, loadedSerializer, cycleNow);
+            processIncomingRequests(state, entry.getKey(), entry.getValue(), snapshot);
         }
     }
 
     private void processIncomingRequests(PS state, UUID playerUuid, String dimension,
-                                          TickSnapshot snapshot,
-                                          DiskReadSubmitter diskReadSubmitter,
-                                          LoadedColumnSerializer<PS> loadedSerializer,
-                                          long cycleNow) {
+                                          TickSnapshot snapshot) {
         var loadedProbes = snapshot.loadedChunkProbes().getOrDefault(playerUuid, Long2ObjectMaps.emptyMap());
 
         IncomingRequest req;
@@ -78,10 +71,10 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
             if (resolvedFromTimestamp(state, playerUuid, req, packed, dimension)) continue;
 
             // Check loaded probes before admission — in-memory hits don't need a disk/gen slot
-            if (resolvedFromLoadedProbe(state, playerUuid, req, packed, loadedProbes, dimension, loadedSerializer, cycleNow)) continue;
+            if (resolvedFromLoadedProbe(state, playerUuid, req, packed, loadedProbes, dimension)) continue;
 
             RequestType type = req.clientTimestamp() == 0 ? RequestType.GENERATION : RequestType.SYNC;
-            submitToDiskOrGeneration(state, playerUuid, req, packed, dimension, type, diskReadSubmitter);
+            submitToDiskOrGeneration(state, playerUuid, req, packed, dimension, type);
         }
     }
 
@@ -110,13 +103,11 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
 
     /** Returns true if resolved from an in-memory loaded chunk probe. */
     private boolean resolvedFromLoadedProbe(PS state, UUID playerUuid, IncomingRequest req, long packed,
-                                             Long2ObjectMap<LoadedColumnData> probes, String dimension,
-                                             LoadedColumnSerializer<PS> loadedSerializer,
-                                             long cycleNow) {
+                                             Long2ObjectMap<LoadedColumnData> probes, String dimension) {
         var probe = probes.get(packed);
         if (probe == null) return false;
 
-        boolean sent = loadedSerializer.serializeAndEnqueue(state, probe, cycleNow,
+        boolean sent = this.processor.enqueueLoadedColumn(state, probe, this.cycleNow,
                 this.ctx.sequence().next(), dimension);
         if (!sent) {
             this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed));
@@ -149,17 +140,16 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
      *  GENERATION when disk is available) or to the generation service. A full slot bounces the
      *  request with RateLimited; the client retries on a later scan. */
     private void submitToDiskOrGeneration(PS state, UUID playerUuid, IncomingRequest req,
-                                           long packed, String dimension, RequestType type,
-                                           DiskReadSubmitter diskReadSubmitter) {
+                                           long packed, String dimension, RequestType type) {
         if (type == RequestType.SYNC || this.diskReadingAvailable) {
             // Route through disk reader (with cross-player dedup)
             if (!state.tryAdmit(new PendingRequest(req.cx(), req.cz(), type, SlotType.SYNC_ON_LOAD))) {
-                rateLimit(state, playerUuid, req, packed, type, dimension);
+                rateLimit(playerUuid, req, packed, type, dimension);
                 return;
             }
             long order = this.ctx.sequence().next();
             boolean attached = this.dedupTracker.tryAttachOrCreate(packed, dimension, playerUuid, order);
-            if (!attached && !diskReadSubmitter.submit(playerUuid, dimension, req.cx(), req.cz(), order)) {
+            if (!attached && !this.processor.submitDiskRead(playerUuid, dimension, req.cx(), req.cz(), order)) {
                 // Submit was a no-op (e.g. the dimension's level isn't registered yet). Unwind the
                 // pending entry (which frees the slot) and the dedup group so they aren't leaked,
                 // and tell the client we couldn't serve this position so it re-requests later.
@@ -172,7 +162,7 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
         } else if (this.generationAvailable) {
             // No disk reader — direct generation (type is GENERATION here by the branch above)
             if (!state.tryAdmit(new PendingRequest(req.cx(), req.cz(), type, SlotType.GENERATION))) {
-                rateLimit(state, playerUuid, req, packed, type, dimension);
+                rateLimit(playerUuid, req, packed, type, dimension);
                 return;
             }
             this.ctx.generationTicketRequests().add(
@@ -184,7 +174,7 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
         }
     }
 
-    private void rateLimit(PS state, UUID playerUuid, IncomingRequest req, long packed,
+    private void rateLimit(UUID playerUuid, IncomingRequest req, long packed,
                             RequestType type, String dimension) {
         this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, packed));
         this.ctx.diagnostics().incrementRateLimited(type);

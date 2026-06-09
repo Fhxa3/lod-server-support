@@ -43,15 +43,6 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
     }
 
     @Override
-    protected void enqueueResultPayloads(PaperPlayerRequestState state, PaperChunkDiskReader.SimpleReadResult result) {
-        if (result.sectionBytes() != null) {
-            buildAndEnqueueColumnPayload(state, result.chunkX(), result.chunkZ(),
-                    result.dimension(), result.columnTimestamp(),
-                    result.submissionOrder(), result.sectionBytes(), result.estimatedBytes());
-        }
-    }
-
-    @Override
     protected boolean submitDiskRead(UUID playerUuid, String dimension,
                                     int cx, int cz,
                                     long submissionOrder) {
