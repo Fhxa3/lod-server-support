@@ -7,7 +7,6 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.PositionUtil;
 
-import java.util.ArrayDeque;
 import java.util.PriorityQueue;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -23,9 +22,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implements PlayerStateAccess {
 
-    /** A request waiting in the per-player queue for a concurrency slot to open. */
-    public record QueuedRequest(IncomingRequest request, RequestType type, String dimension) {}
-
     private final UUID playerUuid;
     private volatile boolean hasHandshake = false;
     private volatile int capabilities = 0;
@@ -38,8 +34,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     // Network handler → processing thread (thread-safe intermediaries)
     private final ConcurrentLinkedQueue<IncomingRequest> incomingRequests = new ConcurrentLinkedQueue<>();
     private final AtomicInteger incomingRequestCount = new AtomicInteger();
-    private final ConcurrentLinkedQueue<Integer> incomingCancels = new ConcurrentLinkedQueue<>();
-    private final AtomicInteger incomingCancelCount = new AtomicInteger();
     // Main thread → processing thread (dirty column clear requests)
     private final ConcurrentLinkedQueue<long[]> pendingDirtyClear = new ConcurrentLinkedQueue<>();
     // Processing thread → main thread (thread-safe output)
@@ -52,19 +46,16 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     private final LongOpenHashSet diskReadDone = new LongOpenHashSet();
     private final PlayerBandwidthTracker bandwidth = new PlayerBandwidthTracker();
     private final RateLimiterSet rateLimiters;
-    private final ArrayDeque<QueuedRequest> waitingQueue = new ArrayDeque<>();
     private final AtomicLong totalRequestsReceived = new AtomicLong();
-    private volatile long desiredBandwidth = Long.MAX_VALUE;
     // Single-writer (main thread) — volatile for cross-thread visibility to processing thread
     private volatile int sendQueueSizeSnapshot = 0;
     // Single-writer (processing thread only) — volatile sufficient for cross-thread visibility
     private volatile int pendingSyncCount = 0;
     private volatile int pendingGenerationCount = 0;
 
-    protected AbstractPlayerRequestState(UUID playerUuid, int syncRate, int syncConcurrency,
-                                          int genRate, int genConcurrency) {
+    protected AbstractPlayerRequestState(UUID playerUuid, int syncConcurrency, int genConcurrency) {
         this.playerUuid = playerUuid;
-        this.rateLimiters = new RateLimiterSet(syncRate, syncConcurrency, genRate, genConcurrency);
+        this.rateLimiters = new RateLimiterSet(syncConcurrency, genConcurrency);
     }
 
     // ---- Handshake / Capability ----
@@ -98,14 +89,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         this.incomingRequests.add(request);
         this.incomingRequestCount.incrementAndGet();
         this.totalRequestsReceived.incrementAndGet();
-    }
-
-    public void addCancel(int requestId) {
-        if (this.incomingCancelCount.get() >= MAX_INCOMING_QUEUE) {
-            return;
-        }
-        this.incomingCancels.add(requestId);
-        this.incomingCancelCount.incrementAndGet();
     }
 
     // ---- Queue management ----
@@ -156,9 +139,7 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
      */
     protected void onDimensionChangeBase() {
         this.incomingRequests.clear();
-        this.incomingCancels.clear();
         this.incomingRequestCount.set(0);
-        this.incomingCancelCount.set(0);
         this.readyPayloads.clear();
         this.sendQueue.clear();
         this.pendingDirtyClear.clear();
@@ -171,7 +152,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         this.pendingByPosition.clear();
         this.pendingByRequestId.clear();
         this.diskReadDone.clear();
-        this.waitingQueue.clear();
         this.pendingSyncCount = 0;
         this.pendingGenerationCount = 0;
         // A dimension change abandons all in-flight requests (pending cleared above, and the disk/
@@ -240,13 +220,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         else this.pendingGenerationCount--;
     }
 
-    @Override
-    public Integer pollCancel() {
-        var c = this.incomingCancels.poll();
-        if (c != null) this.incomingCancelCount.decrementAndGet();
-        return c;
-    }
-
     public boolean hasDiskReadDone(int cx, int cz) {
         return this.diskReadDone.contains(PositionUtil.packPosition(cx, cz));
     }
@@ -274,10 +247,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     @Override
     public RateLimiterSet getRateLimiters() { return this.rateLimiters; }
     @Override
-    public ArrayDeque<QueuedRequest> getWaitingQueue() { return this.waitingQueue; }
-    @Override
-    public int getWaitingQueueSize() { return this.waitingQueue.size(); }
-    @Override
     public UUID getPlayerUUID() { return this.playerUuid; }
     public PriorityQueue<Q> getSendQueue() { return this.sendQueue; }
     /** Returns a volatile snapshot of the send queue size, safe for cross-thread reads. */
@@ -287,6 +256,4 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     public long getTotalSectionsSent() { return this.bandwidth.getTotalSectionsSent(); }
     public long getTotalBytesSent() { return this.bandwidth.getTotalBytesSent(); }
     public long getTotalRequestsReceived() { return this.totalRequestsReceived.get(); }
-    public void setDesiredBandwidth(long desiredRate) { this.desiredBandwidth = desiredRate; }
-    public long getDesiredBandwidth() { return this.desiredBandwidth; }
 }

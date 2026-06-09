@@ -85,8 +85,7 @@ public class LSSClientNetworking {
                 (payload, context) -> context.client().execute(() -> {
                     LSSLogger.info("Server session config received (protocol v" + payload.protocolVersion()
                             + ", LOD distance: " + payload.lodDistanceChunks() + " chunks"
-                            + ", enabled: " + payload.enabled()
-                            + ", syncRate: " + payload.syncOnLoadRateLimitPerPlayer() + ")");
+                            + ", enabled: " + payload.enabled() + ")");
 
                     if (payload.protocolVersion() != LSSConstants.PROTOCOL_VERSION) {
                         LSSLogger.warn("Server has incompatible LSS protocol version " + payload.protocolVersion()

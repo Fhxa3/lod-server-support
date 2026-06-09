@@ -3,8 +3,6 @@ package dev.vox.lss.networking.server;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.config.LSSServerConfig;
-import dev.vox.lss.networking.payloads.BandwidthUpdateC2SPayload;
-import dev.vox.lss.networking.payloads.CancelRequestC2SPayload;
 import dev.vox.lss.networking.payloads.BatchChunkRequestC2SPayload;
 import dev.vox.lss.networking.payloads.HandshakeC2SPayload;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
@@ -42,19 +40,13 @@ public class LSSServerNetworking {
                     var service = requestService;
                     boolean effectiveEnabled = config.enabled && service != null;
 
-                    int serverCaps = LSSConstants.CAPABILITY_VOXEL_COLUMNS;
-
                     ServerPlayNetworking.send(player, new SessionConfigS2CPayload(
                             LSSConstants.PROTOCOL_VERSION,
                             effectiveEnabled,
                             config.lodDistanceChunks,
-                            serverCaps,
-                            config.syncOnLoadRateLimitPerPlayer,
                             config.syncOnLoadConcurrencyLimitPerPlayer,
-                            config.generationRateLimitPerPlayer,
                             config.generationConcurrencyLimitPerPlayer,
-                            config.enableChunkGeneration,
-                            config.bytesPerSecondLimitPerPlayer
+                            config.enableChunkGeneration
                     ));
 
                     if (payload.protocolVersion() != LSSConstants.PROTOCOL_VERSION) {
@@ -80,26 +72,6 @@ public class LSSServerNetworking {
                     var service = requestService;
                     if (service != null) {
                         service.handleBatchRequest(context.player(), payload);
-                    }
-                }
-        );
-
-        ServerPlayNetworking.registerGlobalReceiver(
-                CancelRequestC2SPayload.TYPE,
-                (payload, context) -> {
-                    var service = requestService;
-                    if (service != null) {
-                        service.handleCancel(context.player(), payload);
-                    }
-                }
-        );
-
-        ServerPlayNetworking.registerGlobalReceiver(
-                BandwidthUpdateC2SPayload.TYPE,
-                (payload, context) -> {
-                    var service = requestService;
-                    if (service != null) {
-                        service.handleBandwidthUpdate(context.player(), payload);
                     }
                 }
         );

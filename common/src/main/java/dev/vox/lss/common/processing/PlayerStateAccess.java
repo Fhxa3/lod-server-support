@@ -1,6 +1,5 @@
 package dev.vox.lss.common.processing;
 
-import java.util.ArrayDeque;
 import java.util.UUID;
 
 /**
@@ -19,8 +18,6 @@ public interface PlayerStateAccess {
     boolean supportsVoxelColumns();
     UUID getPlayerUUID();
     RateLimiterSet getRateLimiters();
-    ArrayDeque<AbstractPlayerRequestState.QueuedRequest> getWaitingQueue();
-    int getWaitingQueueSize();
 
     // Per-request methods
     IncomingRequest pollIncomingRequest();
@@ -28,7 +25,4 @@ public interface PlayerStateAccess {
     PendingRequest removePendingByPosition(int cx, int cz);
     PendingRequest removePendingByRequestId(int requestId);
     boolean hasPendingRequest(int cx, int cz);
-
-    // Cancel support
-    Integer pollCancel();
 }

@@ -92,7 +92,6 @@ public final class BenchmarkMetricsExporter {
         rateLimiting.put("sync_rate_limited", diag.getTotalSyncRateLimited());
         rateLimiting.put("gen_rate_limited", diag.getTotalGenRateLimited());
         rateLimiting.put("queue_full", diag.getTotalQueueFull());
-        rateLimiting.put("queued", diag.getTotalQueued());
         result.put("rate_limiting", rateLimiting);
 
         // Bandwidth

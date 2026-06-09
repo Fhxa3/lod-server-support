@@ -57,16 +57,16 @@ The system property `-Dlss.test.integratedServer=true` (set in fabric/build.grad
 - **Fabric:** `LSSClient` — client initializer: sets up client networking, commands, mod compatibility
 - **Paper:** `LSSPaperPlugin` — plugin entry point: registers Plugin Messaging channels, starts `PaperRequestProcessingService`
 
-### Networking Protocol (v15)
+### Networking Protocol (v16)
 
-Batch model with 8 payload types. Fabric uses `LSSNetworking` with Fabric `StreamCodec`;
+Batch model with 6 payload types. Fabric uses `LSSNetworking` with Fabric `StreamCodec`;
 Paper uses `PaperPayloadHandler` with raw `FriendlyByteBuf` encoding. Both produce identical wire format.
 
-**C2S:** `HandshakeC2SPayload` (capabilities bitmask) → `BatchChunkRequestC2SPayload` (batch of requestId + packed position + clientTimestamp tuples) → `CancelRequestC2SPayload` (cancel in-flight request) → `BandwidthUpdateC2SPayload` (client desired bandwidth)
+**C2S:** `HandshakeC2SPayload` (capabilities bitmask) → `BatchChunkRequestC2SPayload` (batch of requestId + packed position + clientTimestamp tuples)
 
-**S2C:** `SessionConfigS2CPayload` (limits/config/rate limits/generation toggle) → `VoxelColumnS2CPayload` (requestId + MC-native sections + columnTimestamp) → `BatchResponseS2CPayload` (batch of responseType + requestId pairs — covers rate-limited, up-to-date, and not-generated) → `DirtyColumnsS2CPayload` (server-pushed change notifications)
+**S2C:** `SessionConfigS2CPayload` (enabled/LOD distance/concurrency limits/generation toggle) → `VoxelColumnS2CPayload` (requestId + MC-native sections + columnTimestamp) → `BatchResponseS2CPayload` (batch of responseType + requestId pairs — covers rate-limited, up-to-date, and not-generated) → `DirtyColumnsS2CPayload` (server-pushed change notifications)
 
-Flow: client handshakes with capabilities bitmask (CAPABILITY_VOXEL_COLUMNS set if LSSApi has consumers) → server sends session config with rate limits → client scans in expanding spiral every second (20 ticks) and sends batched requests with clientTimestamp (-1 for unknown/first request, 0 for generation request, >0 for resync) → server routes by timestamp: sync-on-load path (clientTimestamp > 0 or -1) checks rate limiter then reads disk, generation path (clientTimestamp == 0) checks rate limiter then generates → server batches lightweight responses (rate-limited, up-to-date, not-generated) per tick; column data payloads are sent individually. After initial scan, server periodically pushes `DirtyColumnsS2CPayload` listing changed columns, client re-requests only those.
+Flow: client handshakes with capabilities bitmask (CAPABILITY_VOXEL_COLUMNS set if LSSApi has consumers) → server sends session config with concurrency limits → client scans in expanding spiral every second (20 ticks) and sends batched requests with clientTimestamp (-1 for unknown/first request, 0 for generation request, >0 for resync) → server routes by timestamp: sync-on-load path (clientTimestamp > 0 or -1) acquires a concurrency slot then reads disk, generation path (clientTimestamp == 0) acquires a slot then generates; a full limiter bounces the request with rate-limited and the client retries on a later scan → server batches lightweight responses (rate-limited, up-to-date, not-generated) per tick; column data payloads are sent individually. After initial scan, server periodically pushes `DirtyColumnsS2CPayload` listing changed columns, client re-requests only those.
 
 Chunk coordinates are packed as `((long)chunkX << 32) | (chunkZ & 0xFFFFFFFFL)`.
 
@@ -131,7 +131,7 @@ LOD rendering mods register a `VoxelColumnConsumer` via `LSSApi.registerColumnCo
 ### Configuration
 
 **Fabric:** `JsonConfig` base class with GSON. Two configs auto-created in `config/`:
-- `lss-server-config.json` — bandwidth caps, LOD distance, disk reader threads, send queue limits, rate limits, generation toggle, dirty broadcast interval, concurrency limits
+- `lss-server-config.json` — bandwidth caps, LOD distance, disk reader threads, send queue limits, generation toggle, dirty broadcast interval, concurrency limits
 - `lss-client-config.json` — receive toggle (`receiveServerLods`), distance override (`lodDistanceChunks`), off-thread section processing toggle (`offThreadSectionProcessing`)
 
 **Paper:** `PaperConfig` with GSON. Config at `plugins/LodServerSupport/lss-server-config.json` — same fields and defaults as Fabric server config, plus an `updateEvents` list of Bukkit event class names for dirty chunk detection.

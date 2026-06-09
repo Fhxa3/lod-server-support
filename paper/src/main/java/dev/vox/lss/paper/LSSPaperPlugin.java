@@ -31,8 +31,6 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
         // sendPluginMessage channel check), so no outgoing registration needed.
         getServer().getMessenger().registerIncomingPluginChannel(this, LSSConstants.CHANNEL_HANDSHAKE, this);
         getServer().getMessenger().registerIncomingPluginChannel(this, LSSConstants.CHANNEL_CHUNK_REQUEST, this);
-        getServer().getMessenger().registerIncomingPluginChannel(this, LSSConstants.CHANNEL_CANCEL_REQUEST, this);
-        getServer().getMessenger().registerIncomingPluginChannel(this, LSSConstants.CHANNEL_BANDWIDTH_UPDATE, this);
         // Register event listener for player quit
         getServer().getPluginManager().registerEvents(this, this);
 
@@ -93,8 +91,6 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
             switch (channel) {
                 case LSSConstants.CHANNEL_HANDSHAKE -> handleHandshake(player, nmsPlayer, message);
                 case LSSConstants.CHANNEL_CHUNK_REQUEST -> handleBatchChunkRequest(nmsPlayer, message);
-                case LSSConstants.CHANNEL_CANCEL_REQUEST -> handleCancelRequest(nmsPlayer, message);
-                case LSSConstants.CHANNEL_BANDWIDTH_UPDATE -> handleBandwidthUpdate(nmsPlayer, message);
             }
         } catch (Exception e) {
             LSSLogger.error("Error handling plugin message on channel " + channel + " from " + player.getName(), e);
@@ -111,19 +107,13 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
 
         boolean effectiveEnabled = this.lssConfig.enabled && this.requestService != null;
 
-        int serverCaps = LSSConstants.CAPABILITY_VOXEL_COLUMNS;
-
         PaperPayloadHandler.sendSessionConfig(bukkitPlayer,
                 LSSConstants.PROTOCOL_VERSION,
                 effectiveEnabled,
                 this.lssConfig.lodDistanceChunks,
-                serverCaps,
-                this.lssConfig.syncOnLoadRateLimitPerPlayer,
                 this.lssConfig.syncOnLoadConcurrencyLimitPerPlayer,
-                this.lssConfig.generationRateLimitPerPlayer,
                 this.lssConfig.generationConcurrencyLimitPerPlayer,
-                this.lssConfig.enableChunkGeneration,
-                this.lssConfig.bytesPerSecondLimitPerPlayer);
+                this.lssConfig.enableChunkGeneration);
 
         if (handshake.protocolVersion() != LSSConstants.PROTOCOL_VERSION) {
             LSSLogger.warn("Player " + nmsPlayer.getName().getString()
@@ -147,24 +137,6 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
         var service = this.requestService;
         if (service != null) {
             service.handleBatchRequest(nmsPlayer, decoded);
-        }
-    }
-
-    private void handleCancelRequest(ServerPlayer nmsPlayer, byte[] data) {
-        var decoded = PaperPayloadHandler.decodeCancelRequest(data);
-        if (decoded == null) return;
-        var service = this.requestService;
-        if (service != null) {
-            service.handleCancel(nmsPlayer, decoded.requestId());
-        }
-    }
-
-    private void handleBandwidthUpdate(ServerPlayer nmsPlayer, byte[] data) {
-        var decoded = PaperPayloadHandler.decodeBandwidthUpdate(data);
-        if (decoded == null) return;
-        var service = this.requestService;
-        if (service != null) {
-            service.handleBandwidthUpdate(nmsPlayer, decoded.desiredRate());
         }
     }
 

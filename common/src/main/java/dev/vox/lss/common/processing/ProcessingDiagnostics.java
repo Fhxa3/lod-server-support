@@ -18,7 +18,6 @@ public class ProcessingDiagnostics {
 
     // Cumulative counters — never reset
     private volatile long totalQueueFull;
-    private volatile long totalQueued;
     private volatile long totalInMemory;
     private volatile long totalUpToDate;
     private volatile long totalGenDrained;
@@ -66,10 +65,6 @@ public class ProcessingDiagnostics {
         totalQueueFull++;
     }
 
-    public void incrementQueued() {
-        totalQueued++;
-    }
-
     public void incrementRateLimited(RequestType type) {
         if (type == RequestType.SYNC) {
             incrementSyncRateLimited();
@@ -92,5 +87,4 @@ public class ProcessingDiagnostics {
     public long getTotalSyncRateLimited() { return totalSyncRateLimited; }
     public long getTotalGenRateLimited() { return totalGenRateLimited; }
     public long getTotalQueueFull() { return totalQueueFull; }
-    public long getTotalQueued() { return totalQueued; }
 }

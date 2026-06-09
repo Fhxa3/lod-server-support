@@ -90,8 +90,7 @@ public class PaperRequestProcessingService {
 
     public PaperPlayerRequestState registerPlayer(ServerPlayer player, int capabilities) {
         var state = this.players.computeIfAbsent(player.getUUID(), uuid -> new PaperPlayerRequestState(
-                player, this.config.syncOnLoadRateLimitPerPlayer, this.config.syncOnLoadConcurrencyLimitPerPlayer,
-                this.config.generationRateLimitPerPlayer, this.config.generationConcurrencyLimitPerPlayer));
+                player, this.config.syncOnLoadConcurrencyLimitPerPlayer, this.config.generationConcurrencyLimitPerPlayer));
         this.diskReader.registerPlayer(player.getUUID());
         if (this.generationService != null) this.generationService.registerPlayer(player.getUUID());
         state.setCapabilities(capabilities);
@@ -126,20 +125,6 @@ public class PaperRequestProcessingService {
             if (PositionUtil.chebyshevDistance(cx, cz, playerCx, playerCz) > maxDist) continue;
             state.addRequest(batch.requestIds()[i], cx, cz, batch.clientTimestamps()[i]);
         }
-    }
-
-    public void handleCancel(ServerPlayer player, int requestId) {
-        var state = this.players.get(player.getUUID());
-        if (state == null || !state.hasCompletedHandshake())
-            return;
-        state.addCancel(requestId);
-    }
-
-    public void handleBandwidthUpdate(ServerPlayer player, long desiredRate) {
-        var state = this.players.get(player.getUUID());
-        if (state == null || !state.hasCompletedHandshake())
-            return;
-        state.setDesiredBandwidth(desiredRate);
     }
 
     public void tick() {
@@ -270,8 +255,7 @@ public class PaperRequestProcessingService {
         for (var state : this.players.values()) {
             if (!state.hasCompletedHandshake())
                 continue;
-            long effective = Math.min(perPlayerCap, Math.max(1, state.getDesiredBandwidth()));
-            this.flushSendQueue(state, effective);
+            this.flushSendQueue(state, perPlayerCap);
         }
     }
 
@@ -285,12 +269,11 @@ public class PaperRequestProcessingService {
                 for (var state : this.players.values()) {
                     if (!state.hasCompletedHandshake()) continue;
                     var rl = state.getRateLimiters();
-                    LSSLogger.debug(String.format("  %s: sq=%d, psync=%d, pgen=%d, syncCC=%d/%d, genCC=%d/%d, wq=%d",
+                    LSSLogger.debug(String.format("  %s: sq=%d, psync=%d, pgen=%d, syncCC=%d/%d, genCC=%d/%d",
                             state.getPlayer().getName().getString(), state.getSendQueueSize(),
                             state.getPendingSyncCount(), state.getPendingGenerationCount(),
                             rl.syncOnLoad().getCurrentConcurrency(), rl.syncOnLoad().getMaxConcurrency(),
-                            rl.generation().getCurrentConcurrency(), rl.generation().getMaxConcurrency(),
-                            state.getWaitingQueueSize()));
+                            rl.generation().getCurrentConcurrency(), rl.generation().getMaxConcurrency()));
                 }
             }
         }

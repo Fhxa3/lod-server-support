@@ -1,7 +1,5 @@
 package dev.vox.lss.networking;
 
-import dev.vox.lss.networking.payloads.BandwidthUpdateC2SPayload;
-import dev.vox.lss.networking.payloads.CancelRequestC2SPayload;
 import dev.vox.lss.networking.payloads.BatchChunkRequestC2SPayload;
 import dev.vox.lss.networking.payloads.BatchResponseS2CPayload;
 import dev.vox.lss.networking.payloads.DirtyColumnsS2CPayload;
@@ -21,14 +19,6 @@ public class LSSNetworking {
         PayloadTypeRegistry.serverboundPlay().register(
                 BatchChunkRequestC2SPayload.TYPE,
                 BatchChunkRequestC2SPayload.CODEC
-        );
-        PayloadTypeRegistry.serverboundPlay().register(
-                CancelRequestC2SPayload.TYPE,
-                CancelRequestC2SPayload.CODEC
-        );
-        PayloadTypeRegistry.serverboundPlay().register(
-                BandwidthUpdateC2SPayload.TYPE,
-                BandwidthUpdateC2SPayload.CODEC
         );
 
         // Server -> Client

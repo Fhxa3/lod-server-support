@@ -22,9 +22,8 @@ public class PaperPlayerRequestState extends AbstractPlayerRequestState<PaperPla
         }
     }
 
-    public PaperPlayerRequestState(ServerPlayer player, int syncRate, int syncConcurrency,
-                                   int genRate, int genConcurrency) {
-        super(player.getUUID(), syncRate, syncConcurrency, genRate, genConcurrency);
+    public PaperPlayerRequestState(ServerPlayer player, int syncConcurrency, int genConcurrency) {
+        super(player.getUUID(), syncConcurrency, genConcurrency);
         this.player = player;
         this.lastDimension = player.level().dimension();
     }

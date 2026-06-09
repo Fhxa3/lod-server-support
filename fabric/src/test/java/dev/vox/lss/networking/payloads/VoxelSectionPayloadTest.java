@@ -126,18 +126,14 @@ class VoxelSectionPayloadTest {
     }
 
     @Test
-    void sessionConfigWithCapabilitiesRoundtrip() {
-        var original = new SessionConfigS2CPayload(9, true, 128, 1, 50, 100, 20, 40, true, 8_388_608L);
+    void sessionConfigRoundtrip() {
+        var original = new SessionConfigS2CPayload(9, true, 128, 100, 40, true);
         var b = buf();
         SessionConfigS2CPayload.CODEC.encode(b, original);
         var decoded = SessionConfigS2CPayload.CODEC.decode(b);
-        assertEquals(1, decoded.serverCapabilities());
-        assertEquals(50, decoded.syncOnLoadRateLimitPerPlayer());
         assertEquals(100, decoded.syncOnLoadConcurrencyLimitPerPlayer());
-        assertEquals(20, decoded.generationRateLimitPerPlayer());
         assertEquals(40, decoded.generationConcurrencyLimitPerPlayer());
         assertTrue(decoded.generationEnabled());
-        assertEquals(8_388_608L, decoded.playerBandwidthLimit());
         b.release();
     }
 

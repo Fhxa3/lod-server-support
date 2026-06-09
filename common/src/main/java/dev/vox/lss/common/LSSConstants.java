@@ -8,7 +8,7 @@ public final class LSSConstants {
 
     public static final String MOD_ID = "lss";
 
-    public static final int PROTOCOL_VERSION = 15;
+    public static final int PROTOCOL_VERSION = 16;
 
     // Channel identifiers (used as Minecraft resource location strings)
     public static final String CHANNEL_HANDSHAKE = "lss:handshake_c2s";
@@ -17,8 +17,6 @@ public final class LSSConstants {
     public static final String CHANNEL_DIRTY_COLUMNS = "lss:dirty_columns";
     public static final String CHANNEL_VOXEL_COLUMN = "lss:voxel_column";
     public static final String CHANNEL_BATCH_RESPONSE = "lss:batch_response";
-    public static final String CHANNEL_CANCEL_REQUEST = "lss:cancel_request";
-    public static final String CHANNEL_BANDWIDTH_UPDATE = "lss:bandwidth_update";
 
     // Time conversion constants
     public static final long NANOS_PER_SECOND = 1_000_000_000L;
@@ -35,8 +33,8 @@ public final class LSSConstants {
 
     // Wire format limits
     public static final int MAX_DIRTY_COLUMN_POSITIONS = 10240;
-    /** Estimated per-column wire overhead bytes (requestId + coord + timestamp + framing). */
-    public static final int ESTIMATED_COLUMN_OVERHEAD_BYTES = 25;
+    /** Estimated per-column wire overhead bytes (requestId + coord + dimension string + timestamp + framing). */
+    public static final int ESTIMATED_COLUMN_OVERHEAD_BYTES = 45;
     /** Max serialized section bytes per column. The client decoder rejects (and disconnects on)
      *  anything larger, so the server drops oversized columns rather than send an unreadable frame. */
     public static final int MAX_SECTIONS_SIZE = 2_097_152; // 2 MB
@@ -57,8 +55,6 @@ public final class LSSConstants {
     public static final int MAX_GENERATION_TIMEOUT = 600;
     public static final int MIN_DIRTY_BROADCAST_INTERVAL = 1;
     public static final int MAX_DIRTY_BROADCAST_INTERVAL = 300;
-    public static final int MIN_RATE_LIMIT = 1;
-    public static final int MAX_RATE_LIMIT = 1000;
     public static final int MIN_CONCURRENCY_LIMIT = 1;
     public static final int MAX_CONCURRENCY_LIMIT = 1000;
     public static final int MIN_TIMESTAMP_CACHE_SIZE_MB = 1;
@@ -74,12 +70,6 @@ public final class LSSConstants {
     // Capabilities bitmask
     public static final int CAPABILITY_VOXEL_COLUMNS = 1;
 
-    // Dimension ordinals for compact wire encoding (v8+)
-    public static final int DIM_OVERWORLD = 0;
-    public static final int DIM_THE_NETHER = 1;
-    public static final int DIM_THE_END = 2;
-    public static final int DIM_CUSTOM = -1;
-
     // Dimension resource location strings (common/ has no MC deps, so plain strings)
     public static final String DIM_STR_OVERWORLD = "minecraft:overworld";
     public static final String DIM_STR_THE_NETHER = "minecraft:the_nether";
@@ -88,16 +78,6 @@ public final class LSSConstants {
     /** Current time as epoch seconds (protocol timestamp granularity). */
     public static long epochSeconds() {
         return System.currentTimeMillis() / 1000;
-    }
-
-    /** Map a dimension resource location string to a wire ordinal. */
-    public static int dimensionStringToOrdinal(String dimStr) {
-        return switch (dimStr) {
-            case DIM_STR_OVERWORLD -> DIM_OVERWORLD;
-            case DIM_STR_THE_NETHER -> DIM_THE_NETHER;
-            case DIM_STR_THE_END -> DIM_THE_END;
-            default -> DIM_CUSTOM;
-        };
     }
 
 }

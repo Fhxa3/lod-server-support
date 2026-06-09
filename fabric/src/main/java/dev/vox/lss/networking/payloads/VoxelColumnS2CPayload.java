@@ -16,8 +16,7 @@ import net.minecraft.world.level.Level;
  * built-in network compression (zlib) handles wire-level compression
  * transparently for all packets exceeding {@code network-compression-threshold}.
  * <p>
- * Dimension is encoded as a VarInt ordinal (0=overworld, 1=nether, 2=end)
- * with a UTF fallback for modded dimensions (ordinal=-1).
+ * Dimension is encoded as a length-capped UTF resource-location string (v16+).
  */
 public final class VoxelColumnS2CPayload implements CustomPacketPayload {
 
@@ -63,23 +62,11 @@ public final class VoxelColumnS2CPayload implements CustomPacketPayload {
         return sectionBytes.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES;
     }
 
-    /** Map a dimension ResourceKey to a wire ordinal via identity comparison (avoids String allocation). */
-    private static int dimensionToOrdinal(ResourceKey<Level> dim) {
-        if (dim == Level.OVERWORLD) return LSSConstants.DIM_OVERWORLD;
-        if (dim == Level.NETHER) return LSSConstants.DIM_THE_NETHER;
-        if (dim == Level.END) return LSSConstants.DIM_THE_END;
-        return LSSConstants.DIM_CUSTOM;
-    }
-
     private static void write(FriendlyByteBuf buf, VoxelColumnS2CPayload payload) {
         buf.writeVarInt(payload.requestId);
         buf.writeInt(payload.chunkX);
         buf.writeInt(payload.chunkZ);
-        int ordinal = dimensionToOrdinal(payload.dimension);
-        buf.writeVarInt(ordinal);
-        if (ordinal == LSSConstants.DIM_CUSTOM) {
-            buf.writeUtf(payload.dimension.identifier().toString());
-        }
+        buf.writeUtf(payload.dimension.identifier().toString());
         buf.writeLong(payload.columnTimestamp);
         buf.writeByteArray(payload.sectionBytes);
     }
@@ -88,14 +75,8 @@ public final class VoxelColumnS2CPayload implements CustomPacketPayload {
         int requestId = buf.readVarInt();
         int cx = buf.readInt();
         int cz = buf.readInt();
-        ResourceKey<Level> dim;
-        int ordinal = buf.readVarInt();
-        dim = switch (ordinal) {
-            case LSSConstants.DIM_OVERWORLD -> Level.OVERWORLD;
-            case LSSConstants.DIM_THE_NETHER -> Level.NETHER;
-            case LSSConstants.DIM_THE_END -> Level.END;
-            default -> ResourceKey.create(Registries.DIMENSION, Identifier.parse(buf.readUtf(MAX_DIMENSION_STRING_LENGTH)));
-        };
+        ResourceKey<Level> dim = ResourceKey.create(Registries.DIMENSION,
+                Identifier.parse(buf.readUtf(MAX_DIMENSION_STRING_LENGTH)));
         long columnTimestamp = buf.readLong();
         byte[] sectionBytes = buf.readByteArray(LSSConstants.MAX_SECTIONS_SIZE);
 

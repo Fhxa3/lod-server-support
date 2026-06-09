@@ -97,38 +97,18 @@ class WireParityTest {
                 new BatchChunkRequestC2SPayload(new int[0], new long[0], new long[0], 0)));
     }
 
-    @Test
-    void cancelRequest() {
-        for (int id : new int[]{0, 42, Integer.MAX_VALUE, -1}) {
-            byte[] expected = ref(b -> b.writeVarInt(id));
-            assertArrayEquals(expected, encode(CancelRequestC2SPayload.CODEC, new CancelRequestC2SPayload(id)));
-        }
-    }
-
-    @Test
-    void bandwidthUpdate() {
-        for (long rate : new long[]{0L, 127L, 128L, 1_000_000L, Long.MAX_VALUE}) {
-            byte[] expected = ref(b -> b.writeVarLong(rate));
-            assertArrayEquals(expected, encode(BandwidthUpdateC2SPayload.CODEC, new BandwidthUpdateC2SPayload(rate)));
-        }
-    }
-
     // ---- S2C ----
 
     @Test
     void sessionConfig() {
-        var p = new SessionConfigS2CPayload(3, true, 8, 42, 300, 4, 128, 16, false, 8_388_608L);
+        var p = new SessionConfigS2CPayload(3, true, 8, 300, 16, false);
         byte[] expected = ref(b -> {
             b.writeVarInt(3);
             b.writeBoolean(true);
             b.writeVarInt(8);
-            b.writeVarInt(42);
             b.writeVarInt(300);
-            b.writeVarInt(4);
-            b.writeVarInt(128);
             b.writeVarInt(16);
             b.writeBoolean(false);
-            b.writeVarLong(8_388_608L);
         });
         assertArrayEquals(expected, encode(SessionConfigS2CPayload.CODEC, p));
     }
@@ -163,19 +143,20 @@ class WireParityTest {
     @Test
     void voxelColumnVanillaDimensions() {
         byte[] sections = {1, 2, 3};
-        record Case(ResourceKey<Level> key, int ordinal) {}
-        for (Case c : new Case[]{new Case(Level.OVERWORLD, 0), new Case(Level.NETHER, 1), new Case(Level.END, 2)}) {
+        record Case(ResourceKey<Level> key, String dim) {}
+        for (Case c : new Case[]{new Case(Level.OVERWORLD, "minecraft:overworld"),
+                new Case(Level.NETHER, "minecraft:the_nether"), new Case(Level.END, "minecraft:the_end")}) {
             byte[] expected = ref(b -> {
                 b.writeVarInt(300);
                 b.writeInt(-5);
                 b.writeInt(Integer.MAX_VALUE);
-                b.writeVarInt(c.ordinal());
+                b.writeUtf(c.dim());
                 b.writeLong(-1L);
                 b.writeByteArray(sections);
             });
             assertArrayEquals(expected, encode(VoxelColumnS2CPayload.CODEC,
                     new VoxelColumnS2CPayload(300, -5, Integer.MAX_VALUE, c.key(), -1L, sections)),
-                    "voxelColumn dim ordinal " + c.ordinal());
+                    "voxelColumn dim " + c.dim());
         }
     }
 
@@ -187,7 +168,6 @@ class WireParityTest {
             b.writeVarInt(7);
             b.writeInt(0);
             b.writeInt(0);
-            b.writeVarInt(LSSConstants.DIM_CUSTOM);
             b.writeUtf("lsstest:custom");
             b.writeLong(42L);
             b.writeByteArray(sections);

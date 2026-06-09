@@ -34,35 +34,30 @@ public final class PaperPayloadHandler {
     // ---- S2C Encoding ----
 
     public static byte[] encodeSessionConfig(int protocolVersion, boolean enabled,
-                                             int lodDistanceChunks, int serverCapabilities,
-                                             int syncOnLoadRateLimitPerPlayer, int syncOnLoadConcurrencyLimitPerPlayer,
-                                             int generationRateLimitPerPlayer, int generationConcurrencyLimitPerPlayer,
-                                             boolean generationEnabled, long playerBandwidthLimit) {
+                                             int lodDistanceChunks,
+                                             int syncOnLoadConcurrencyLimitPerPlayer,
+                                             int generationConcurrencyLimitPerPlayer,
+                                             boolean generationEnabled) {
         return encodeToBytes(buf -> {
             buf.writeVarInt(protocolVersion);
             buf.writeBoolean(enabled);
             buf.writeVarInt(lodDistanceChunks);
-            buf.writeVarInt(serverCapabilities);
-            buf.writeVarInt(syncOnLoadRateLimitPerPlayer);
             buf.writeVarInt(syncOnLoadConcurrencyLimitPerPlayer);
-            buf.writeVarInt(generationRateLimitPerPlayer);
             buf.writeVarInt(generationConcurrencyLimitPerPlayer);
             buf.writeBoolean(generationEnabled);
-            buf.writeVarLong(playerBandwidthLimit);
         });
     }
 
     public static void sendSessionConfig(Player player,
                                           int protocolVersion, boolean enabled,
-                                          int lodDistanceChunks, int serverCapabilities,
-                                          int syncOnLoadRateLimitPerPlayer, int syncOnLoadConcurrencyLimitPerPlayer,
-                                          int generationRateLimitPerPlayer, int generationConcurrencyLimitPerPlayer,
-                                          boolean generationEnabled, long playerBandwidthLimit) {
+                                          int lodDistanceChunks,
+                                          int syncOnLoadConcurrencyLimitPerPlayer,
+                                          int generationConcurrencyLimitPerPlayer,
+                                          boolean generationEnabled) {
         sendRawNmsPayload(player, ID_SESSION_CONFIG, encodeSessionConfig(
-                protocolVersion, enabled, lodDistanceChunks, serverCapabilities,
-                syncOnLoadRateLimitPerPlayer, syncOnLoadConcurrencyLimitPerPlayer,
-                generationRateLimitPerPlayer, generationConcurrencyLimitPerPlayer,
-                generationEnabled, playerBandwidthLimit));
+                protocolVersion, enabled, lodDistanceChunks,
+                syncOnLoadConcurrencyLimitPerPlayer, generationConcurrencyLimitPerPlayer,
+                generationEnabled));
     }
 
     public static byte[] encodeBatchResponse(byte[] responseTypes, int[] requestIds, int count) {
@@ -90,11 +85,7 @@ public final class PaperPayloadHandler {
             buf.writeVarInt(requestId);
             buf.writeInt(chunkX);
             buf.writeInt(chunkZ);
-            int ordinal = LSSConstants.dimensionStringToOrdinal(dimensionStr);
-            buf.writeVarInt(ordinal);
-            if (ordinal == LSSConstants.DIM_CUSTOM) {
-                buf.writeUtf(dimensionStr);
-            }
+            buf.writeUtf(dimensionStr);
             buf.writeLong(columnTimestamp);
             buf.writeByteArray(sectionBytes);
         });
@@ -158,20 +149,6 @@ public final class PaperPayloadHandler {
             }
             return new DecodedBatchChunkRequest(requestIds, packedPositions, clientTimestamps, count);
         });
-    }
-
-    public record DecodedCancelRequest(int requestId) {}
-
-    public static DecodedCancelRequest decodeCancelRequest(byte[] data) {
-        if (data == null || data.length == 0) return null;
-        return withReadBuffer(data, buf -> new DecodedCancelRequest(buf.readVarInt()));
-    }
-
-    public record DecodedBandwidthUpdate(long desiredRate) {}
-
-    public static DecodedBandwidthUpdate decodeBandwidthUpdate(byte[] data) {
-        if (data == null || data.length == 0) return null;
-        return withReadBuffer(data, buf -> new DecodedBandwidthUpdate(buf.readVarLong()));
     }
 
     // ---- Helpers ----

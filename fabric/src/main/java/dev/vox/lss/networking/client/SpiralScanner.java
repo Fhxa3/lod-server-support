@@ -55,8 +55,7 @@ class SpiralScanner {
      * Returns the base scan budget for the given server concurrency limit.
      */
     static int baseBudget(SessionConfigS2CPayload config) {
-        int concurrencyBased = config.syncOnLoadConcurrencyLimitPerPlayer() * BUDGET_MULTIPLIER;
-        return Math.min(concurrencyBased, config.syncOnLoadRateLimitPerPlayer());
+        return config.syncOnLoadConcurrencyLimitPerPlayer() * BUDGET_MULTIPLIER;
     }
 
     /**

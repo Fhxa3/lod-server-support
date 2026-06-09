@@ -17,9 +17,7 @@ public class LSSServerConfig extends JsonConfig {
     public int generationConcurrencyLimitGlobal = 32;
     public int generationTimeoutSeconds = 60;
     public int dirtyBroadcastIntervalSeconds = 10;
-    public int syncOnLoadRateLimitPerPlayer = 800;
     public int syncOnLoadConcurrencyLimitPerPlayer = 200;
-    public int generationRateLimitPerPlayer = 80;
     public int generationConcurrencyLimitPerPlayer = 16;
     public int perDimensionTimestampCacheSizeMB = 32;
 
@@ -39,9 +37,7 @@ public class LSSServerConfig extends JsonConfig {
 
         generationTimeoutSeconds = Math.clamp(generationTimeoutSeconds, LSSConstants.MIN_GENERATION_TIMEOUT, LSSConstants.MAX_GENERATION_TIMEOUT);
         dirtyBroadcastIntervalSeconds = Math.clamp(dirtyBroadcastIntervalSeconds, LSSConstants.MIN_DIRTY_BROADCAST_INTERVAL, LSSConstants.MAX_DIRTY_BROADCAST_INTERVAL);
-        syncOnLoadRateLimitPerPlayer = Math.clamp(syncOnLoadRateLimitPerPlayer, LSSConstants.MIN_RATE_LIMIT, LSSConstants.MAX_RATE_LIMIT);
         syncOnLoadConcurrencyLimitPerPlayer = Math.clamp(syncOnLoadConcurrencyLimitPerPlayer, LSSConstants.MIN_CONCURRENCY_LIMIT, LSSConstants.MAX_CONCURRENCY_LIMIT);
-        generationRateLimitPerPlayer = Math.clamp(generationRateLimitPerPlayer, LSSConstants.MIN_RATE_LIMIT, LSSConstants.MAX_RATE_LIMIT);
         generationConcurrencyLimitPerPlayer = Math.clamp(generationConcurrencyLimitPerPlayer, LSSConstants.MIN_CONCURRENCY_LIMIT, LSSConstants.MAX_CONCURRENCY_LIMIT);
         perDimensionTimestampCacheSizeMB = Math.clamp(perDimensionTimestampCacheSizeMB, LSSConstants.MIN_TIMESTAMP_CACHE_SIZE_MB, LSSConstants.MAX_TIMESTAMP_CACHE_SIZE_MB);
     }

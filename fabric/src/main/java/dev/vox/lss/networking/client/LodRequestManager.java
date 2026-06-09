@@ -3,7 +3,6 @@ package dev.vox.lss.networking.client;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.networking.payloads.BatchChunkRequestC2SPayload;
-import dev.vox.lss.networking.payloads.CancelRequestC2SPayload;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
@@ -136,14 +135,14 @@ public class LodRequestManager {
         }
         this.lastDimension = currentDim;
 
-        // --- Movement: prune out-of-range data + cancel stale requests ---
+        // --- Movement: prune out-of-range data + drop stale in-flight tracking ---
         if (playerCx != this.lastChunkX || playerCz != this.lastChunkZ) {
             int pruneDistance = this.scanner.getPruneDistance(this.sessionConfig);
             this.scanner.pruneOutOfRangeTimestamps(this.columnTimestamps, this.metrics, playerCx, playerCz, pruneDistance);
             this.scanner.pruneOutOfRangePositions(this.dirtyColumns, playerCx, playerCz, pruneDistance);
             this.scanner.pruneOutOfRangePositions(this.rateLimitRetryPositions, playerCx, playerCz, pruneDistance);
             this.scanner.pruneOutOfRangePositions(this.validatedThisSession, playerCx, playerCz, pruneDistance);
-            this.pruneAndCancelOutOfRangePending(playerCx, playerCz, pruneDistance);
+            this.tracker.pruneOutOfRange(playerCx, playerCz, pruneDistance);
             this.lastChunkX = playerCx;
             this.lastChunkZ = playerCz;
             this.scanner.resetScanCounter();
@@ -342,7 +341,6 @@ public class LodRequestManager {
 
     private void onDimensionChange(ResourceKey<Level> newDimension) {
         saveCache();
-        this.cancelAllPending();
         resetRequestState();
         this.queue.clear();
         this.scanner.resetScanCounter();
@@ -363,19 +361,6 @@ public class LodRequestManager {
         this.pendingCacheLoad = ColumnCacheStore.loadAsync(this.serverAddress, dimension);
     }
 
-    private void sendCancelPacket(int reqId) {
-        try { ClientPlayNetworking.send(new CancelRequestC2SPayload(reqId)); }
-        catch (Exception ignored) {}
-    }
-
-    private void pruneAndCancelOutOfRangePending(int playerCx, int playerCz, int pruneDistance) {
-        this.tracker.pruneOutOfRange(playerCx, playerCz, pruneDistance, this::sendCancelPacket);
-    }
-
-    private void cancelAllPending() {
-        this.tracker.forEachRequestId(this::sendCancelPacket);
-    }
-
     public void disconnect() {
         this.tracker.clear();
     }
@@ -390,7 +375,6 @@ public class LodRequestManager {
         if (this.serverAddress != null) {
             ColumnCacheStore.clearForServer(this.serverAddress);
         }
-        this.cancelAllPending();
         resetRequestState();
         this.queue.clear();
         this.scanner.reset();

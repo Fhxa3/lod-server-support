@@ -1,22 +1,16 @@
 package dev.vox.lss.common.processing;
 
 /**
- * Holds the two per-player concurrency limiters (one for sync-on-load requests,
- * one for generation requests) and per-type rate limits derived from the configured
- * values.
+ * Holds the two per-player concurrency limiters: one for sync-on-load requests,
+ * one for generation requests.
  */
 public class RateLimiterSet {
     private final ConcurrencyLimiter syncOnLoadLimiter;
     private final ConcurrencyLimiter generationLimiter;
-    private final int syncRateLimit;
-    private final int genRateLimit;
 
-    public RateLimiterSet(int syncRateLimit, int syncConcurrency,
-                          int genRateLimit, int genConcurrency) {
+    public RateLimiterSet(int syncConcurrency, int genConcurrency) {
         this.syncOnLoadLimiter = new ConcurrencyLimiter(syncConcurrency);
         this.generationLimiter = new ConcurrencyLimiter(genConcurrency);
-        this.syncRateLimit = syncRateLimit;
-        this.genRateLimit = genRateLimit;
     }
 
     public ConcurrencyLimiter syncOnLoad() {
@@ -37,13 +31,5 @@ public class RateLimiterSet {
         return (type == RequestType.SYNC || diskReadingAvailable)
                 ? this.syncOnLoadLimiter
                 : this.generationLimiter;
-    }
-
-    public int syncRateLimit() {
-        return this.syncRateLimit;
-    }
-
-    public int genRateLimit() {
-        return this.genRateLimit;
     }
 }

@@ -20,9 +20,8 @@ public class PlayerRequestState extends AbstractPlayerRequestState<PlayerRequest
         }
     }
 
-    public PlayerRequestState(ServerPlayer player, int syncRate, int syncConcurrency,
-                              int genRate, int genConcurrency) {
-        super(player.getUUID(), syncRate, syncConcurrency, genRate, genConcurrency);
+    public PlayerRequestState(ServerPlayer player, int syncConcurrency, int genConcurrency) {
+        super(player.getUUID(), syncConcurrency, genConcurrency);
         this.player = player;
         this.lastDimension = player.level().dimension();
     }

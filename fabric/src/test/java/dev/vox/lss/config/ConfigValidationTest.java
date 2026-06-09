@@ -109,18 +109,6 @@ class ConfigValidationTest {
     }
 
     @Test
-    void syncOnLoadRateLimitPerPlayerClamped() {
-        var c = serverConfig();
-        c.syncOnLoadRateLimitPerPlayer = 0;
-        c.validate();
-        assertEquals(1, c.syncOnLoadRateLimitPerPlayer);
-
-        c.syncOnLoadRateLimitPerPlayer = 9999;
-        c.validate();
-        assertEquals(1000, c.syncOnLoadRateLimitPerPlayer);
-    }
-
-    @Test
     void syncOnLoadConcurrencyLimitPerPlayerClamped() {
         var c = serverConfig();
         c.syncOnLoadConcurrencyLimitPerPlayer = 0;
@@ -130,18 +118,6 @@ class ConfigValidationTest {
         c.syncOnLoadConcurrencyLimitPerPlayer = 9999;
         c.validate();
         assertEquals(1000, c.syncOnLoadConcurrencyLimitPerPlayer);
-    }
-
-    @Test
-    void generationRateLimitPerPlayerClamped() {
-        var c = serverConfig();
-        c.generationRateLimitPerPlayer = 0;
-        c.validate();
-        assertEquals(1, c.generationRateLimitPerPlayer);
-
-        c.generationRateLimitPerPlayer = 9999;
-        c.validate();
-        assertEquals(1000, c.generationRateLimitPerPlayer);
     }
 
     @Test

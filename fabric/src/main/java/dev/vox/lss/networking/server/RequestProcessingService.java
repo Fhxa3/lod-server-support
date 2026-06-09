@@ -14,8 +14,6 @@ import dev.vox.lss.common.tracking.DirtyColumnTracker;
 import dev.vox.lss.config.LSSServerConfig;
 import dev.vox.lss.networking.payloads.BatchChunkRequestC2SPayload;
 import dev.vox.lss.networking.payloads.BatchResponseS2CPayload;
-import dev.vox.lss.networking.payloads.BandwidthUpdateC2SPayload;
-import dev.vox.lss.networking.payloads.CancelRequestC2SPayload;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -88,8 +86,7 @@ public class RequestProcessingService {
     public PlayerRequestState registerPlayer(ServerPlayer player, int capabilities) {
         var config = LSSServerConfig.CONFIG;
         var state = this.players.computeIfAbsent(player.getUUID(), uuid -> new PlayerRequestState(
-                player, config.syncOnLoadRateLimitPerPlayer, config.syncOnLoadConcurrencyLimitPerPlayer,
-                config.generationRateLimitPerPlayer, config.generationConcurrencyLimitPerPlayer));
+                player, config.syncOnLoadConcurrencyLimitPerPlayer, config.generationConcurrencyLimitPerPlayer));
         this.diskReader.registerPlayer(player.getUUID());
         if (this.generationService != null) this.generationService.registerPlayer(player.getUUID());
         state.setCapabilities(capabilities);
@@ -123,18 +120,6 @@ public class RequestProcessingService {
             if (PositionUtil.chebyshevDistance(cx, cz, playerCx, playerCz) > maxDist) continue;
             state.addRequest(payload.requestIds()[i], packedPosition, payload.clientTimestamps()[i]);
         }
-    }
-
-    public void handleCancel(ServerPlayer player, CancelRequestC2SPayload payload) {
-        var state = this.players.get(player.getUUID());
-        if (state == null || !state.hasCompletedHandshake()) return;
-        state.addCancel(payload.requestId());
-    }
-
-    public void handleBandwidthUpdate(ServerPlayer player, BandwidthUpdateC2SPayload payload) {
-        var state = this.players.get(player.getUUID());
-        if (state == null || !state.hasCompletedHandshake()) return;
-        state.setDesiredBandwidth(payload.desiredRate());
     }
 
     public void tick() {
@@ -260,8 +245,7 @@ public class RequestProcessingService {
 
         for (var state : this.players.values()) {
             if (!state.hasCompletedHandshake()) continue;
-            long effective = Math.min(perPlayerCap, Math.max(1, state.getDesiredBandwidth()));
-            this.flushSendQueue(state, effective);
+            this.flushSendQueue(state, perPlayerCap);
         }
     }
 
@@ -279,12 +263,11 @@ public class RequestProcessingService {
                 for (var state : this.players.values()) {
                     if (!state.hasCompletedHandshake()) continue;
                     var rl = state.getRateLimiters();
-                    LSSLogger.debug(String.format("  %s: sq=%d, psync=%d, pgen=%d, syncCC=%d/%d, genCC=%d/%d, wq=%d",
+                    LSSLogger.debug(String.format("  %s: sq=%d, psync=%d, pgen=%d, syncCC=%d/%d, genCC=%d/%d",
                             state.getPlayer().getName().getString(), state.getSendQueueSize(),
                             state.getPendingSyncCount(), state.getPendingGenerationCount(),
                             rl.syncOnLoad().getCurrentConcurrency(), rl.syncOnLoad().getMaxConcurrency(),
-                            rl.generation().getCurrentConcurrency(), rl.generation().getMaxConcurrency(),
-                            state.getWaitingQueueSize()));
+                            rl.generation().getCurrentConcurrency(), rl.generation().getMaxConcurrency()));
                 }
             }
         }

@@ -103,9 +103,7 @@ Server config is generated on first run:
 | `bytesPerSecondLimitGlobal` | `104857600` | Total pre-compression bandwidth cap (100 MB/s) |
 | `diskReaderThreads` | `5` | Thread pool size for async disk reads |
 | `sendQueueLimitPerPlayer` | `4000` | Max queued sections per player |
-| `syncOnLoadRateLimitPerPlayer` | `800` | Sync-on-load requests per second per player |
 | `syncOnLoadConcurrencyLimitPerPlayer` | `200` | Max in-flight sync requests per player |
-| `generationRateLimitPerPlayer` | `80` | Generation requests per second per player |
 | `generationConcurrencyLimitPerPlayer` | `16` | Max in-flight generation requests per player |
 | `enableChunkGeneration` | `true` | Generate missing chunks on demand for LOD data |
 | `generationConcurrencyLimitGlobal` | `32` | Max chunks generating server-wide at once |

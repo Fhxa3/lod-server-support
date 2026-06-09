@@ -283,15 +283,6 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
                 cleanupDedupGroups(this.dedupTracker.removePlayer(entry.getKey()));
             }
             state.drainDirtyClearRequests();
-
-            // Drain cancel requests
-            Integer cancelId;
-            while ((cancelId = state.pollCancel()) != null) {
-                var pending = state.removePendingByRequestId(cancelId);
-                if (pending != null) {
-                    state.getRateLimiters().forRequest(pending.type(), this.diskReadingAvailable).release();
-                }
-            }
         }
     }
 

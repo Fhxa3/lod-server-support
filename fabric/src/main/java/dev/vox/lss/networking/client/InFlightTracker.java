@@ -6,8 +6,6 @@ import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
-import java.util.function.IntConsumer;
-
 /**
  * Tracks in-flight chunk requests: the 3-way mapping between packed positions,
  * request IDs, and send timestamps. Also tracks which positions are generation
@@ -123,29 +121,20 @@ class InFlightTracker {
     }
 
     /**
-     * Remove all pending requests outside the given Chebyshev distance from
-     * the player. Calls back with each request ID for cancellation packets.
+     * Remove all pending requests outside the given Chebyshev distance from the player.
+     * The server resolves the abandoned requests on its own; the client simply stops
+     * tracking them (any late response for an untracked id is ignored).
      */
-    void pruneOutOfRange(int playerCx, int playerCz, int pruneDistance, IntConsumer cancelCallback) {
+    void pruneOutOfRange(int playerCx, int playerCz, int pruneDistance) {
         var iter = this.pendingRequests.long2LongEntrySet().iterator();
         while (iter.hasNext()) {
             var entry = iter.next();
             long pos = entry.getLongKey();
             if (PositionUtil.isOutOfRange(pos, playerCx, playerCz, pruneDistance)) {
-                int requestId = removeFromSecondaryMaps(pos);
+                removeFromSecondaryMaps(pos);
                 this.generationPositions.remove(pos);
-                if (requestId != -1) cancelCallback.accept(requestId);
                 iter.remove();
             }
-        }
-    }
-
-    /**
-     * Invoke callback for each in-flight request ID (for sending cancel packets).
-     */
-    void forEachRequestId(IntConsumer callback) {
-        for (var entry : this.positionToRequestId.long2IntEntrySet()) {
-            callback.accept(entry.getIntValue());
         }
     }
 

@@ -11,8 +11,8 @@ import java.util.UUID;
 
 /**
  * Routes incoming chunk requests through the resolution pipeline for all players:
- * drain waiting queue → duplicate check → queue-full check → timestamp check →
- * concurrency acquire (or enqueue) → loaded-probe check → disk/generation submit.
+ * duplicate check → queue-full check → timestamp check → loaded-probe check →
+ * concurrency acquire (or rate-limit bounce) → disk/generation submit.
  *
  * @param <PS> the platform-specific player state type
  */
@@ -72,11 +72,6 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
         String dimension = playerData.dimension();
         var loadedProbes = snapshot.loadedChunkProbes().getOrDefault(playerUuid, Long2ObjectMaps.emptyMap());
 
-        // Phase 1: Drain previously queued requests that now have concurrency slots
-        drainWaitingQueue(state, playerUuid, dimension, loadedProbes, snapshot,
-                diskReadSubmitter, loadedSerializer, cycleNow);
-
-        // Phase 2: Process new incoming requests
         IncomingRequest req;
         while ((req = state.pollIncomingRequest()) != null) {
             if (resolvedAsDuplicate(state, playerUuid, req)) continue;
@@ -89,55 +84,10 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
             if (resolvedFromLoadedProbe(state, playerUuid, req, packed, loadedProbes, dimension, loadedSerializer, cycleNow)) continue;
 
             RequestType type = req.clientTimestamp() == 0 ? RequestType.GENERATION : RequestType.SYNC;
-            var limiter = tryConcurrencyOrEnqueue(state, playerUuid, req, type, dimension);
+            var limiter = tryAcquireOrRateLimit(state, playerUuid, req, type, dimension);
             if (limiter == null) continue;
 
             submitToDiskOrGeneration(state, playerUuid, req, packed, dimension, type, limiter, diskReadSubmitter);
-        }
-    }
-
-    /**
-     * Drain the per-player waiting queue: peek front → re-check timestamp → try acquire concurrency →
-     * if fail, stop (FIFO order preserved) → if success, pop and route through loaded-probe/disk/gen.
-     */
-    private void drainWaitingQueue(PS state, UUID playerUuid, String dimension,
-                                    Long2ObjectMap<LoadedColumnData> loadedProbes,
-                                    TickSnapshot snapshot,
-                                    DiskReadSubmitter diskReadSubmitter,
-                                    LoadedColumnSerializer<PS> loadedSerializer,
-                                    long cycleNow) {
-        var queue = state.getWaitingQueue();
-        while (!queue.isEmpty()) {
-            var queued = queue.peek();
-            var req = queued.request();
-            long packed = PositionUtil.packPosition(req.cx(), req.cz());
-
-            // Re-check: might have been resolved by another player's read since enqueue
-            if (state.hasDiskReadDone(req.cx(), req.cz())) {
-                queue.poll();
-                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, req.requestId()));
-                continue;
-            }
-
-            // Re-check timestamp (may have been served since enqueue)
-            if (resolvedFromTimestamp(state, playerUuid, req, packed, dimension)) {
-                queue.poll();
-                continue;
-            }
-
-            // Check loaded probes before acquiring concurrency — in-memory hits don't need a slot
-            if (resolvedFromLoadedProbe(state, playerUuid, req, packed, loadedProbes, dimension, loadedSerializer, cycleNow)) {
-                queue.poll();
-                continue;
-            }
-
-            // Try acquire concurrency slot
-            var limiter = state.getRateLimiters().forRequest(queued.type(), this.diskReadingAvailable);
-            if (!limiter.tryAcquire()) break; // stop draining — FIFO preserved
-
-            queue.poll();
-
-            submitToDiskOrGeneration(state, playerUuid, req, packed, dimension, queued.type(), limiter, diskReadSubmitter);
         }
     }
 
@@ -165,32 +115,21 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
     }
 
     /**
-     * Try to acquire a concurrency slot. If the slot is available, returns the limiter.
-     * If not, enqueues the request in the waiting queue (or sends RateLimited if queue is full).
-     * Returns null when the request was enqueued or rejected.
+     * Try to acquire a concurrency slot. Returns the limiter on success; on a full limiter,
+     * sends RateLimited (the client retries on its next scan) and returns null.
      */
-    private ConcurrencyLimiter tryConcurrencyOrEnqueue(PS state, UUID playerUuid, IncomingRequest req,
-                                                        RequestType type, String dimension) {
-        var limiters = state.getRateLimiters();
-        var limiter = limiters.forRequest(type, this.diskReadingAvailable);
-
+    private ConcurrencyLimiter tryAcquireOrRateLimit(PS state, UUID playerUuid, IncomingRequest req,
+                                                      RequestType type, String dimension) {
+        var limiter = state.getRateLimiters().forRequest(type, this.diskReadingAvailable);
         if (limiter.tryAcquire()) {
             return limiter;
         }
 
-        // Concurrency full — try to enqueue
-        int queueCap = limiters.syncRateLimit() + limiters.genRateLimit();
-        if (state.getWaitingQueueSize() < queueCap) {
-            state.getWaitingQueue().add(new AbstractPlayerRequestState.QueuedRequest(req, type, dimension));
-            this.ctx.diagnostics().incrementQueued();
-        } else {
-            // Queue overflow — reject
-            this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, req.requestId()));
-            this.ctx.diagnostics().incrementRateLimited(type);
-            if (LSSLogger.isDebugEnabled()) {
-                LSSLogger.debug("Rate-limited " + playerUuid + " (" + type + "): queue full at " + queueCap
-                        + " for chunk [" + req.cx() + ", " + req.cz() + "] in " + dimension);
-            }
+        this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, req.requestId()));
+        this.ctx.diagnostics().incrementRateLimited(type);
+        if (LSSLogger.isDebugEnabled()) {
+            LSSLogger.debug("Rate-limited " + playerUuid + " (" + type + "): concurrency full"
+                    + " for chunk [" + req.cx() + ", " + req.cz() + "] in " + dimension);
         }
         return null;
     }

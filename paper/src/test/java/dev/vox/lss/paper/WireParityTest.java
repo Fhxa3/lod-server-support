@@ -80,26 +80,6 @@ class WireParityTest {
         assertEquals(0, empty.count());
     }
 
-    @Test
-    void cancelRequest() {
-        for (int id : new int[]{0, 42, Integer.MAX_VALUE, -1}) {
-            byte[] frame = ref(b -> b.writeVarInt(id));
-            var d = PaperPayloadHandler.decodeCancelRequest(frame);
-            assertNotNull(d);
-            assertEquals(id, d.requestId());
-        }
-    }
-
-    @Test
-    void bandwidthUpdate() {
-        for (long rate : new long[]{0L, 127L, 128L, 1_000_000L, Long.MAX_VALUE}) {
-            byte[] frame = ref(b -> b.writeVarLong(rate));
-            var d = PaperPayloadHandler.decodeBandwidthUpdate(frame);
-            assertNotNull(d);
-            assertEquals(rate, d.desiredRate());
-        }
-    }
-
     // ---- S2C (Paper encodes; bytes must match the reference) ----
 
     @Test
@@ -108,16 +88,12 @@ class WireParityTest {
             b.writeVarInt(3);
             b.writeBoolean(true);
             b.writeVarInt(8);
-            b.writeVarInt(42);
             b.writeVarInt(300);
-            b.writeVarInt(4);
-            b.writeVarInt(128);
             b.writeVarInt(16);
             b.writeBoolean(false);
-            b.writeVarLong(8_388_608L);
         });
         assertArrayEquals(expected, PaperPayloadHandler.encodeSessionConfig(
-                3, true, 8, 42, 300, 4, 128, 16, false, 8_388_608L));
+                3, true, 8, 300, 16, false));
     }
 
     @Test
@@ -149,21 +125,18 @@ class WireParityTest {
     @Test
     void voxelColumnVanillaDimensions() {
         byte[] sections = {1, 2, 3};
-        record Case(String dim, int ordinal) {}
-        for (Case c : new Case[]{
-                new Case("minecraft:overworld", 0),
-                new Case("minecraft:the_nether", 1),
-                new Case("minecraft:the_end", 2)}) {
+        for (String dim : new String[]{
+                "minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"}) {
             byte[] expected = ref(b -> {
                 b.writeVarInt(300);
                 b.writeInt(-5);
                 b.writeInt(Integer.MAX_VALUE);
-                b.writeVarInt(c.ordinal());
+                b.writeUtf(dim);
                 b.writeLong(-1L);
                 b.writeByteArray(sections);
             });
             assertArrayEquals(expected, PaperPayloadHandler.encodeVoxelColumnPreEncoded(
-                    300, -5, Integer.MAX_VALUE, c.dim(), -1L, sections), "voxelColumn " + c.dim());
+                    300, -5, Integer.MAX_VALUE, dim, -1L, sections), "voxelColumn " + dim);
         }
     }
 
@@ -174,7 +147,6 @@ class WireParityTest {
             b.writeVarInt(7);
             b.writeInt(0);
             b.writeInt(0);
-            b.writeVarInt(LSSConstants.DIM_CUSTOM);
             b.writeUtf("lsstest:custom");
             b.writeLong(42L);
             b.writeByteArray(sections);
