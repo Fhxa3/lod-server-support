@@ -15,25 +15,25 @@ import java.util.concurrent.RejectedExecutionException;
 
 public class ChunkDiskReader extends AbstractChunkDiskReader<ChunkDiskReader.ReadResult> {
 
-    public record ReadResult(UUID playerUuid, int requestId, int chunkX, int chunkZ,
+    public record ReadResult(UUID playerUuid, int chunkX, int chunkZ,
                                 byte[] sectionBytes, String dimension, int estimatedBytes,
                                 long columnTimestamp,
                                 boolean notFound, boolean saturated,
                                 long submissionOrder) implements ReadResultAccess {}
 
-    static ReadResult emptyResult(UUID playerUuid, int requestId, int chunkX, int chunkZ, long submissionOrder) {
-        return new ReadResult(playerUuid, requestId, chunkX, chunkZ, null, null, 0, 0L, true, false, submissionOrder);
+    static ReadResult emptyResult(UUID playerUuid, int chunkX, int chunkZ, long submissionOrder) {
+        return new ReadResult(playerUuid, chunkX, chunkZ, null, null, 0, 0L, true, false, submissionOrder);
     }
 
-    static ReadResult saturatedResult(UUID playerUuid, int requestId, int chunkX, int chunkZ, long submissionOrder) {
-        return new ReadResult(playerUuid, requestId, chunkX, chunkZ, null, null, 0, 0L, false, true, submissionOrder);
+    static ReadResult saturatedResult(UUID playerUuid, int chunkX, int chunkZ, long submissionOrder) {
+        return new ReadResult(playerUuid, chunkX, chunkZ, null, null, 0, 0L, false, true, submissionOrder);
     }
 
     public ChunkDiskReader(int threadCount) {
         super(threadCount);
     }
 
-    public void submitReadDirect(UUID playerUuid, int requestId, ServerLevel level, int chunkX, int chunkZ,
+    public void submitReadDirect(UUID playerUuid, ServerLevel level, int chunkX, int chunkZ,
                                   long submissionOrder) {
         if (isShutdown()) return;
 
@@ -45,7 +45,7 @@ public class ChunkDiskReader extends AbstractChunkDiskReader<ChunkDiskReader.Rea
             this.executor.submit(() -> {
                 if (isShutdown()) return;
                 try {
-                    this.readChunkNbtAndSerialize(playerUuid, requestId, chunkMap, chunkX, chunkZ,
+                    this.readChunkNbtAndSerialize(playerUuid, chunkMap, chunkX, chunkZ,
                             dimension, registryAccess, submissionOrder);
                 } catch (Throwable t) {
                     // Catch Throwable: an Error must not escape the task without producing a
@@ -54,7 +54,7 @@ public class ChunkDiskReader extends AbstractChunkDiskReader<ChunkDiskReader.Rea
                     LSSLogger.error("Failed to read chunk from disk at " + chunkX + ", " + chunkZ, t);
                     this.diag.recordError();
                     this.diag.recordCompleted(0);
-                    addResult(playerUuid, emptyResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+                    addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
                     if (t instanceof Error err) throw err;
                 }
             });
@@ -62,11 +62,11 @@ public class ChunkDiskReader extends AbstractChunkDiskReader<ChunkDiskReader.Rea
             LSSLogger.warn("Disk reader executor saturated, returning rate-limited for " + chunkX + "," + chunkZ);
             this.diag.recordSaturation();
             this.diag.recordCompleted(0);
-            addResult(playerUuid, saturatedResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+            addResult(playerUuid, saturatedResult(playerUuid, chunkX, chunkZ, submissionOrder));
         }
     }
 
-    private void readChunkNbtAndSerialize(UUID playerUuid, int requestId, ChunkMap chunkMap,
+    private void readChunkNbtAndSerialize(UUID playerUuid, ChunkMap chunkMap,
                                            int chunkX, int chunkZ,
                                            ResourceKey<Level> dimension, RegistryAccess registryAccess,
                                            long submissionOrder) {
@@ -80,14 +80,14 @@ public class ChunkDiskReader extends AbstractChunkDiskReader<ChunkDiskReader.Rea
             LSSLogger.error("Failed to read chunk NBT from disk at " + chunkX + ", " + chunkZ, e);
             this.diag.recordError();
             this.diag.recordCompleted(System.nanoTime() - startNs);
-            addResult(playerUuid, emptyResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+            addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
             return;
         }
 
         if (serializedSections == null) {
             this.diag.recordEmpty();
             this.diag.recordCompleted(System.nanoTime() - startNs);
-            addResult(playerUuid, emptyResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+            addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
             return;
         }
 
@@ -97,7 +97,7 @@ public class ChunkDiskReader extends AbstractChunkDiskReader<ChunkDiskReader.Rea
             String dimensionStr = dimension.identifier().toString();
             this.diag.recordEmpty();
             this.diag.recordCompleted(System.nanoTime() - startNs);
-            addResult(playerUuid, new ReadResult(playerUuid, requestId, chunkX, chunkZ,
+            addResult(playerUuid, new ReadResult(playerUuid, chunkX, chunkZ,
                     null, dimensionStr, 0, columnTimestamp, false, false, submissionOrder));
             return;
         }
@@ -107,7 +107,7 @@ public class ChunkDiskReader extends AbstractChunkDiskReader<ChunkDiskReader.Rea
         int estimatedBytes = serializedSections.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES;
 
         this.diag.recordCompleted(System.nanoTime() - startNs);
-        addResult(playerUuid, new ReadResult(playerUuid, requestId, chunkX, chunkZ,
+        addResult(playerUuid, new ReadResult(playerUuid, chunkX, chunkZ,
                 serializedSections, dimensionStr, estimatedBytes, columnTimestamp,
                 false, false, submissionOrder));
     }

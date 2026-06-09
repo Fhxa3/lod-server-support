@@ -18,19 +18,19 @@ import java.util.concurrent.RejectedExecutionException;
  * (Paper uses Mojang mappings, so no mixin accessor needed).
  */
 public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDiskReader.SimpleReadResult> {
-    public record SimpleReadResult(UUID playerUuid, int requestId, int chunkX, int chunkZ,
+    public record SimpleReadResult(UUID playerUuid, int chunkX, int chunkZ,
                                     byte[] sectionBytes, String dimension, int estimatedBytes,
                                     long columnTimestamp,
                                     boolean notFound, boolean saturated,
                                     long submissionOrder) implements ReadResultAccess {}
 
-    static SimpleReadResult emptyResult(UUID playerUuid, int requestId, int chunkX, int chunkZ, long submissionOrder) {
-        return new SimpleReadResult(playerUuid, requestId, chunkX, chunkZ,
+    static SimpleReadResult emptyResult(UUID playerUuid, int chunkX, int chunkZ, long submissionOrder) {
+        return new SimpleReadResult(playerUuid, chunkX, chunkZ,
                 null, null, 0, 0L, true, false, submissionOrder);
     }
 
-    static SimpleReadResult saturatedResult(UUID playerUuid, int requestId, int chunkX, int chunkZ, long submissionOrder) {
-        return new SimpleReadResult(playerUuid, requestId, chunkX, chunkZ,
+    static SimpleReadResult saturatedResult(UUID playerUuid, int chunkX, int chunkZ, long submissionOrder) {
+        return new SimpleReadResult(playerUuid, chunkX, chunkZ,
                 null, null, 0, 0L, false, true, submissionOrder);
     }
 
@@ -42,7 +42,7 @@ public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDisk
      * Submit a disk read that skips timestamp and cache lookup (already done by initial probe).
      * Goes straight to NBT read → serialize.
      */
-    public void submitReadDirect(UUID playerUuid, int requestId, ServerLevel level, int chunkX, int chunkZ,
+    public void submitReadDirect(UUID playerUuid, ServerLevel level, int chunkX, int chunkZ,
                                   long submissionOrder) {
         if (isShutdown()) return;
 
@@ -54,7 +54,7 @@ public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDisk
             this.executor.submit(() -> {
                 if (isShutdown()) return;
                 try {
-                    this.readChunkNbtAndSerialize(playerUuid, requestId, chunkMap, chunkX, chunkZ,
+                    this.readChunkNbtAndSerialize(playerUuid, chunkMap, chunkX, chunkZ,
                             dimension, registryAccess, submissionOrder);
                 } catch (Throwable t) {
                     // Catch Throwable: an Error must not escape the task without producing a
@@ -63,7 +63,7 @@ public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDisk
                     LSSLogger.error("Failed to read chunk from disk at " + chunkX + ", " + chunkZ, t);
                     this.diag.recordError();
                     this.diag.recordCompleted(0);
-                    addResult(playerUuid, emptyResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+                    addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
                     if (t instanceof Error) throw (Error) t;
                 }
             });
@@ -71,14 +71,14 @@ public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDisk
             LSSLogger.warn("Disk reader executor saturated, returning rate-limited for " + chunkX + "," + chunkZ);
             this.diag.recordSaturation();
             this.diag.recordCompleted(0);
-            addResult(playerUuid, saturatedResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+            addResult(playerUuid, saturatedResult(playerUuid, chunkX, chunkZ, submissionOrder));
         }
     }
 
     /**
      * Read chunk NBT and serialize into MC-native format.
      */
-    private void readChunkNbtAndSerialize(UUID playerUuid, int requestId, ChunkMap chunkMap,
+    private void readChunkNbtAndSerialize(UUID playerUuid, ChunkMap chunkMap,
                                           int chunkX, int chunkZ,
                                           ResourceKey<Level> dimension, RegistryAccess registryAccess,
                                           long submissionOrder) {
@@ -92,7 +92,7 @@ public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDisk
             if (serialized == null) {
                 this.diag.recordEmpty();
                 this.diag.recordCompleted(System.nanoTime() - startNs);
-                addResult(playerUuid, emptyResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+                addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
                 return;
             }
 
@@ -102,7 +102,7 @@ public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDisk
                 String dimensionStr = dimension.identifier().toString();
                 this.diag.recordEmpty();
                 this.diag.recordCompleted(System.nanoTime() - startNs);
-                addResult(playerUuid, new SimpleReadResult(playerUuid, requestId, chunkX, chunkZ,
+                addResult(playerUuid, new SimpleReadResult(playerUuid, chunkX, chunkZ,
                         null, dimensionStr, 0, columnTimestamp, false, false, submissionOrder));
                 return;
             }
@@ -112,14 +112,14 @@ public class PaperChunkDiskReader extends AbstractChunkDiskReader<PaperChunkDisk
             int estimatedBytes = serialized.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES;
 
             this.diag.recordCompleted(System.nanoTime() - startNs);
-            addResult(playerUuid, new SimpleReadResult(playerUuid, requestId, chunkX, chunkZ,
+            addResult(playerUuid, new SimpleReadResult(playerUuid, chunkX, chunkZ,
                     serialized, dimensionStr, estimatedBytes, columnTimestamp,
                     false, false, submissionOrder));
         } catch (Exception e) {
             LSSLogger.error("Failed to read/serialize chunk at " + chunkX + ", " + chunkZ, e);
             this.diag.recordError();
             this.diag.recordCompleted(System.nanoTime() - startNs);
-            addResult(playerUuid, emptyResult(playerUuid, requestId, chunkX, chunkZ, submissionOrder));
+            addResult(playerUuid, emptyResult(playerUuid, chunkX, chunkZ, submissionOrder));
         }
     }
 }

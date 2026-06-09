@@ -21,13 +21,13 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
     @FunctionalInterface
     interface DiskReadSubmitter {
         /** @return false if the read could not be submitted, so the caller can unwind. */
-        boolean submit(UUID playerUuid, int requestId, String dimension,
+        boolean submit(UUID playerUuid, String dimension,
                        int cx, int cz, long submissionOrder);
     }
 
     @FunctionalInterface
     interface LoadedColumnSerializer<PS> {
-        boolean serializeAndEnqueue(PS state, LoadedColumnData column, int requestId,
+        boolean serializeAndEnqueue(PS state, LoadedColumnData column,
                                    long columnTimestamp, long submissionOrder, String dimension);
     }
 
@@ -74,17 +74,17 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
 
         IncomingRequest req;
         while ((req = state.pollIncomingRequest()) != null) {
-            if (resolvedAsDuplicate(state, playerUuid, req)) continue;
+            long packed = PositionUtil.packPosition(req.cx(), req.cz());
+            if (resolvedAsDuplicate(state, playerUuid, req, packed)) continue;
             if (sendQueueFull(state, snapshot)) break;
 
-            long packed = PositionUtil.packPosition(req.cx(), req.cz());
             if (resolvedFromTimestamp(state, playerUuid, req, packed, dimension)) continue;
 
             // Check loaded probes before acquiring concurrency — in-memory hits don't need a disk/gen slot
             if (resolvedFromLoadedProbe(state, playerUuid, req, packed, loadedProbes, dimension, loadedSerializer, cycleNow)) continue;
 
             RequestType type = req.clientTimestamp() == 0 ? RequestType.GENERATION : RequestType.SYNC;
-            var limiter = tryAcquireOrRateLimit(state, playerUuid, req, type, dimension);
+            var limiter = tryAcquireOrRateLimit(state, playerUuid, req, packed, type, dimension);
             if (limiter == null) continue;
 
             submitToDiskOrGeneration(state, playerUuid, req, packed, dimension, type, limiter, diskReadSubmitter);
@@ -92,9 +92,9 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
     }
 
     /** Returns true if the request is a known duplicate (already served or in-flight). */
-    private boolean resolvedAsDuplicate(PS state, UUID playerUuid, IncomingRequest req) {
+    private boolean resolvedAsDuplicate(PS state, UUID playerUuid, IncomingRequest req, long packed) {
         if (state.hasDiskReadDone(req.cx(), req.cz())) {
-            this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, req.requestId()));
+            this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed));
             return true;
         }
         if (state.hasPendingRequest(req.cx(), req.cz())) {
@@ -119,13 +119,13 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
      * sends RateLimited (the client retries on its next scan) and returns null.
      */
     private ConcurrencyLimiter tryAcquireOrRateLimit(PS state, UUID playerUuid, IncomingRequest req,
-                                                      RequestType type, String dimension) {
+                                                      long packed, RequestType type, String dimension) {
         var limiter = state.getRateLimiters().forRequest(type, this.diskReadingAvailable);
         if (limiter.tryAcquire()) {
             return limiter;
         }
 
-        this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, req.requestId()));
+        this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, packed));
         this.ctx.diagnostics().incrementRateLimited(type);
         if (LSSLogger.isDebugEnabled()) {
             LSSLogger.debug("Rate-limited " + playerUuid + " (" + type + "): concurrency full"
@@ -142,10 +142,10 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
         var probe = probes.get(packed);
         if (probe == null) return false;
 
-        boolean sent = loadedSerializer.serializeAndEnqueue(state, probe, req.requestId(), cycleNow,
+        boolean sent = loadedSerializer.serializeAndEnqueue(state, probe, cycleNow,
                 this.ctx.sequence().next(), dimension);
         if (!sent) {
-            this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, req.requestId()));
+            this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed));
         }
         state.markDiskReadDone(req.cx(), req.cz());
         this.ctx.diagnostics().incrementInMemory();
@@ -163,7 +163,7 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
         long cachedTs = this.timestampCache.get(dimension, packed);
         if (cachedTs > 0 && cachedTs <= req.clientTimestamp()) {
             state.markDiskReadDone(req.cx(), req.cz());
-            this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, req.requestId()));
+            this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed));
             this.ctx.diagnostics().incrementUpToDate();
             return true;
         }
@@ -180,27 +180,27 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
 
         if (type == RequestType.SYNC || this.diskReadingAvailable) {
             // Route through disk reader (with cross-player dedup)
-            state.addPendingRequest(new PendingRequest(req.requestId(), req.cx(), req.cz(), type));
-            boolean attached = this.dedupTracker.tryAttachOrCreate(packed, dimension, playerUuid, req.requestId(), order);
-            if (!attached && !diskReadSubmitter.submit(playerUuid, req.requestId(), dimension, req.cx(), req.cz(), order)) {
+            state.addPendingRequest(new PendingRequest(req.cx(), req.cz(), type));
+            boolean attached = this.dedupTracker.tryAttachOrCreate(packed, dimension, playerUuid, order);
+            if (!attached && !diskReadSubmitter.submit(playerUuid, dimension, req.cx(), req.cz(), order)) {
                 // Submit was a no-op (e.g. the dimension's level isn't registered yet). Unwind the
                 // pending entry, dedup group, and permit we just took so they aren't leaked, and
                 // tell the client we couldn't serve this position so it re-requests later.
                 this.dedupTracker.removeGroup(packed, dimension);
-                state.removePendingByRequestId(req.requestId());
+                state.removePendingByPosition(req.cx(), req.cz());
                 limiter.release();
-                this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, req.requestId()));
+                this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed));
                 return;
             }
             this.ctx.diagnostics().incrementDiskQueued();
         } else if (type == RequestType.GENERATION && this.generationAvailable) {
             // No disk reader — direct generation
-            state.addPendingRequest(new PendingRequest(req.requestId(), req.cx(), req.cz(), type));
+            state.addPendingRequest(new PendingRequest(req.cx(), req.cz(), type));
             this.ctx.generationTicketRequests().add(
-                    new OffThreadProcessor.GenerationTicketRequest(playerUuid, req.requestId(), req.cx(), req.cz(), order));
+                    new OffThreadProcessor.GenerationTicketRequest(playerUuid, req.cx(), req.cz(), order));
         } else {
             // No disk reader AND no generation — can't serve
-            this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, req.requestId()));
+            this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed));
             limiter.release();
         }
     }

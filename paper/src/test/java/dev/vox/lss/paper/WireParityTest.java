@@ -57,13 +57,11 @@ class WireParityTest {
 
     @Test
     void batchChunkRequest() {
-        int[] ids = {0, 1234567, -7};
         long[] pos = {0L, 0x8000000000000001L, -1L};
         long[] ts = {0L, 1700000000000L, Long.MIN_VALUE};
         byte[] frame = ref(b -> {
             b.writeVarInt(3);
             for (int i = 0; i < 3; i++) {
-                b.writeVarInt(ids[i]);
                 b.writeLong(pos[i]);
                 b.writeLong(ts[i]);
             }
@@ -71,7 +69,6 @@ class WireParityTest {
         var d = PaperPayloadHandler.decodeBatchChunkRequest(frame);
         assertNotNull(d);
         assertEquals(3, d.count());
-        assertArrayEquals(ids, d.requestIds());
         assertArrayEquals(pos, d.packedPositions());
         assertArrayEquals(ts, d.clientTimestamps());
         // empty
@@ -100,15 +97,16 @@ class WireParityTest {
     void batchResponse() {
         byte[] types = {LSSConstants.RESPONSE_RATE_LIMITED, LSSConstants.RESPONSE_UP_TO_DATE,
                 LSSConstants.RESPONSE_NOT_GENERATED, (byte) 200};
-        int[] ids = {0, 1, -1, Integer.MAX_VALUE};
+        long[] positions = {0L, PositionUtil.packPosition(10, 20), -1L,
+                PositionUtil.packPosition(Integer.MIN_VALUE, Integer.MAX_VALUE)};
         byte[] expected = ref(b -> {
             b.writeVarInt(4);
             for (int i = 0; i < 4; i++) {
                 b.writeByte(types[i]);
-                b.writeVarInt(ids[i]);
+                b.writeLong(positions[i]);
             }
         });
-        assertArrayEquals(expected, PaperPayloadHandler.encodeBatchResponse(types, ids, 4));
+        assertArrayEquals(expected, PaperPayloadHandler.encodeBatchResponse(types, positions, 4));
     }
 
     @Test
@@ -128,7 +126,6 @@ class WireParityTest {
         for (String dim : new String[]{
                 "minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"}) {
             byte[] expected = ref(b -> {
-                b.writeVarInt(300);
                 b.writeInt(-5);
                 b.writeInt(Integer.MAX_VALUE);
                 b.writeUtf(dim);
@@ -136,7 +133,7 @@ class WireParityTest {
                 b.writeByteArray(sections);
             });
             assertArrayEquals(expected, PaperPayloadHandler.encodeVoxelColumnPreEncoded(
-                    300, -5, Integer.MAX_VALUE, dim, -1L, sections), "voxelColumn " + dim);
+                    -5, Integer.MAX_VALUE, dim, -1L, sections), "voxelColumn " + dim);
         }
     }
 
@@ -144,7 +141,6 @@ class WireParityTest {
     void voxelColumnCustomDimension() {
         byte[] sections = {1, 2, 3};
         byte[] expected = ref(b -> {
-            b.writeVarInt(7);
             b.writeInt(0);
             b.writeInt(0);
             b.writeUtf("lsstest:custom");
@@ -152,6 +148,6 @@ class WireParityTest {
             b.writeByteArray(sections);
         });
         assertArrayEquals(expected, PaperPayloadHandler.encodeVoxelColumnPreEncoded(
-                7, 0, 0, "lsstest:custom", 42L, sections));
+                0, 0, "lsstest:custom", 42L, sections));
     }
 }

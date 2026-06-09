@@ -33,7 +33,7 @@ public final class LSSConstants {
 
     // Wire format limits
     public static final int MAX_DIRTY_COLUMN_POSITIONS = 10240;
-    /** Estimated per-column wire overhead bytes (requestId + coord + dimension string + timestamp + framing). */
+    /** Estimated per-column wire overhead bytes (coords + dimension string + timestamp + framing). */
     public static final int ESTIMATED_COLUMN_OVERHEAD_BYTES = 45;
     /** Max serialized section bytes per column. The client decoder rejects (and disconnects on)
      *  anything larger, so the server drops oversized columns rather than send an unreadable frame. */

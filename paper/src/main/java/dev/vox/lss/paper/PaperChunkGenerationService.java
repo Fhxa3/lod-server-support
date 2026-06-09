@@ -29,7 +29,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  */
 public class PaperChunkGenerationService {
 
-    record GenerationCallback(UUID playerUuid, int requestId, long submissionOrder) {}
+    record GenerationCallback(UUID playerUuid, long submissionOrder) {}
 
     private record PendingGenerationKey(ResourceKey<Level> dimension, int cx, int cz) {}
 
@@ -68,13 +68,13 @@ public class PaperChunkGenerationService {
      * Submit a generation request. Returns true if accepted (piggyback or new active slot),
      * false if at capacity (caller should feed back a rejection result).
      */
-    public boolean submitGeneration(UUID playerUuid, int requestId, ServerLevel level, int cx, int cz, long submissionOrder) {
+    public boolean submitGeneration(UUID playerUuid, ServerLevel level, int cx, int cz, long submissionOrder) {
         var key = new PendingGenerationKey(level.dimension(), cx, cz);
 
         // Already active — piggyback on existing async load
         var existingActive = this.active.get(key);
         if (existingActive != null) {
-            existingActive.callbacks.add(new GenerationCallback(playerUuid, requestId, submissionOrder));
+            existingActive.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
             incrementCount(this.perPlayerActiveCount, playerUuid);
             return true;
         }
@@ -83,7 +83,7 @@ public class PaperChunkGenerationService {
         int playerActive = this.perPlayerActiveCount.getOrDefault(playerUuid, 0);
         if (this.active.size() < this.maxConcurrent && playerActive < this.maxPerPlayerActive) {
             var gen = new ActiveGeneration();
-            gen.callbacks.add(new GenerationCallback(playerUuid, requestId, submissionOrder));
+            gen.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
             this.active.put(key, gen);
             incrementCount(this.perPlayerActiveCount, playerUuid);
             this.totalSubmitted++;
@@ -137,7 +137,7 @@ public class PaperChunkGenerationService {
 
                     for (var cb : gen.callbacks) {
                         this.generationReadyQueue.add(new TickSnapshot.GenerationReadyData(
-                                cb.playerUuid, cb.requestId, columnData, columnTimestamp,
+                                cb.playerUuid, columnData, columnTimestamp,
                                 cb.submissionOrder));
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
@@ -159,7 +159,7 @@ public class PaperChunkGenerationService {
                                           Map<UUID, Integer> countMap) {
         for (var cb : callbacks) {
             this.addResult(cb.playerUuid, PaperChunkDiskReader.emptyResult(
-                    cb.playerUuid, cb.requestId, cx, cz, cb.submissionOrder));
+                    cb.playerUuid, cx, cz, cb.submissionOrder));
             decrementCount(countMap, cb.playerUuid);
         }
     }

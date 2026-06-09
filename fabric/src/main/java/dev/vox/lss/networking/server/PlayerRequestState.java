@@ -12,7 +12,7 @@ public class PlayerRequestState extends AbstractPlayerRequestState<PlayerRequest
     private volatile ServerPlayer player;
     private ResourceKey<Level> lastDimension;
 
-    public record QueuedPayload(CustomPacketPayload payload, int requestId,
+    public record QueuedPayload(CustomPacketPayload payload,
                                 int estimatedBytes, long submissionOrder) implements Comparable<QueuedPayload> {
         @Override
         public int compareTo(QueuedPayload other) {
@@ -26,10 +26,10 @@ public class PlayerRequestState extends AbstractPlayerRequestState<PlayerRequest
         this.lastDimension = player.level().dimension();
     }
 
-    public void addRequest(int requestId, long packedPosition, long clientTimestamp) {
+    public void addRequest(long packedPosition, long clientTimestamp) {
         int cx = PositionUtil.unpackX(packedPosition);
         int cz = PositionUtil.unpackZ(packedPosition);
-        enqueueIncomingRequest(new IncomingRequest(requestId, cx, cz, clientTimestamp));
+        enqueueIncomingRequest(new IncomingRequest(cx, cz, clientTimestamp));
     }
 
     /**

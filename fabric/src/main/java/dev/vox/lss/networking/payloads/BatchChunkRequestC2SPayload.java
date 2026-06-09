@@ -7,7 +7,6 @@ import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.Identifier;
 
 public record BatchChunkRequestC2SPayload(
-        int[] requestIds,
         long[] packedPositions,
         long[] clientTimestamps,
         int count
@@ -21,7 +20,6 @@ public record BatchChunkRequestC2SPayload(
                     (buf, payload) -> {
                         buf.writeVarInt(payload.count);
                         for (int i = 0; i < payload.count; i++) {
-                            buf.writeVarInt(payload.requestIds[i]);
                             buf.writeLong(payload.packedPositions[i]);
                             buf.writeLong(payload.clientTimestamps[i]);
                         }
@@ -31,15 +29,13 @@ public record BatchChunkRequestC2SPayload(
                         if (count < 0 || count > LSSConstants.MAX_BATCH_CHUNK_REQUESTS) {
                             throw new IllegalArgumentException("Batch chunk request count out of range: " + count);
                         }
-                        int[] requestIds = new int[count];
                         long[] packedPositions = new long[count];
                         long[] clientTimestamps = new long[count];
                         for (int i = 0; i < count; i++) {
-                            requestIds[i] = buf.readVarInt();
                             packedPositions[i] = buf.readLong();
                             clientTimestamps[i] = buf.readLong();
                         }
-                        return new BatchChunkRequestC2SPayload(requestIds, packedPositions, clientTimestamps, count);
+                        return new BatchChunkRequestC2SPayload(packedPositions, clientTimestamps, count);
                     }
             );
 

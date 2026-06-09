@@ -23,6 +23,5 @@ public interface PlayerStateAccess {
     IncomingRequest pollIncomingRequest();
     void addPendingRequest(PendingRequest pending);
     PendingRequest removePendingByPosition(int cx, int cz);
-    PendingRequest removePendingByRequestId(int requestId);
     boolean hasPendingRequest(int cx, int cz);
 }

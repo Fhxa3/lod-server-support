@@ -25,7 +25,7 @@ public class ChunkGenerationService {
     // flags=2 (LOADING) makes the chunk load/generate; timeout=0 means we manage lifetime ourselves
     private static final TicketType LSS_GEN_TICKET = new TicketType(0, 2);
 
-    record GenerationCallback(UUID playerUuid, int requestId, long submissionOrder) {}
+    record GenerationCallback(UUID playerUuid, long submissionOrder) {}
 
     private record PendingGenerationKey(ResourceKey<Level> dimension, int cx, int cz) {}
 
@@ -64,13 +64,13 @@ public class ChunkGenerationService {
      * Submit a generation request. Returns true if accepted (piggyback or new active slot),
      * false if at capacity (caller should feed back a rejection result).
      */
-    public boolean submitGeneration(UUID playerUuid, int requestId, ServerLevel level, int cx, int cz, long submissionOrder) {
+    public boolean submitGeneration(UUID playerUuid, ServerLevel level, int cx, int cz, long submissionOrder) {
         var key = new PendingGenerationKey(level.dimension(), cx, cz);
 
         // Already active — piggyback on existing entry
         var existing = this.active.get(key);
         if (existing != null) {
-            existing.callbacks.add(new GenerationCallback(playerUuid, requestId, submissionOrder));
+            existing.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
             incrementCount(this.perPlayerActiveCount, playerUuid);
             return true;
         }
@@ -82,7 +82,7 @@ public class ChunkGenerationService {
             level.getChunkSource().addTicketWithRadius(LSS_GEN_TICKET, pos, 0);
 
             var gen = new PendingGeneration(pos, level);
-            gen.callbacks.add(new GenerationCallback(playerUuid, requestId, submissionOrder));
+            gen.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
             this.active.put(key, gen);
             incrementCount(this.perPlayerActiveCount, playerUuid);
             this.totalSubmitted++;
@@ -112,7 +112,7 @@ public class ChunkGenerationService {
                         + " after " + gen.ticksWaiting + " ticks (" + gen.callbacks.size() + " callbacks)");
                 for (var cb : gen.callbacks) {
                     this.addResult(cb.playerUuid, ChunkDiskReader.emptyResult(
-                            cb.playerUuid, cb.requestId, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
+                            cb.playerUuid, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
                     decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                 }
                 gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
@@ -132,7 +132,7 @@ public class ChunkGenerationService {
                     for (var cb : gen.callbacks) {
                         if (ready == null) ready = new ArrayList<>();
                         ready.add(new TickSnapshot.GenerationReadyData(
-                                cb.playerUuid, cb.requestId, columnData, columnTimestamp,
+                                cb.playerUuid, columnData, columnTimestamp,
                                 cb.submissionOrder));
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
@@ -141,7 +141,7 @@ public class ChunkGenerationService {
                     LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), t);
                     for (var cb : gen.callbacks) {
                         this.addResult(cb.playerUuid, ChunkDiskReader.emptyResult(
-                                cb.playerUuid, cb.requestId, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
+                                cb.playerUuid, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
                 } finally {

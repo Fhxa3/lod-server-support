@@ -6,23 +6,24 @@ import java.util.UUID;
 
 /**
  * Actions produced by the processing thread, consumed by the main thread.
- * These represent packets that must be sent from the main thread.
+ * These represent packets that must be sent from the main thread. Requests are
+ * addressed by packed chunk position (the protocol's request key).
  */
 public sealed interface SendAction {
     UUID playerUuid();
-    int requestId();
+    long packedPosition();
 
     byte responseType();
 
-    record RateLimited(UUID playerUuid, int requestId) implements SendAction {
+    record RateLimited(UUID playerUuid, long packedPosition) implements SendAction {
         @Override public byte responseType() { return LSSConstants.RESPONSE_RATE_LIMITED; }
     }
 
-    record ColumnUpToDate(UUID playerUuid, int requestId) implements SendAction {
+    record ColumnUpToDate(UUID playerUuid, long packedPosition) implements SendAction {
         @Override public byte responseType() { return LSSConstants.RESPONSE_UP_TO_DATE; }
     }
 
-    record ColumnNotGenerated(UUID playerUuid, int requestId) implements SendAction {
+    record ColumnNotGenerated(UUID playerUuid, long packedPosition) implements SendAction {
         @Override public byte responseType() { return LSSConstants.RESPONSE_NOT_GENERATED; }
     }
 }

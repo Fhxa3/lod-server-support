@@ -8,7 +8,7 @@ import net.minecraft.resources.Identifier;
 
 public record BatchResponseS2CPayload(
         byte[] responseTypes,
-        int[] requestIds,
+        long[] packedPositions,
         int count
 ) implements CustomPacketPayload {
 
@@ -21,7 +21,7 @@ public record BatchResponseS2CPayload(
                         buf.writeVarInt(payload.count);
                         for (int i = 0; i < payload.count; i++) {
                             buf.writeByte(payload.responseTypes[i]);
-                            buf.writeVarInt(payload.requestIds[i]);
+                            buf.writeLong(payload.packedPositions[i]);
                         }
                     },
                     buf -> {
@@ -30,12 +30,12 @@ public record BatchResponseS2CPayload(
                             throw new IllegalArgumentException("Batch response count out of range: " + count);
                         }
                         byte[] responseTypes = new byte[count];
-                        int[] requestIds = new int[count];
+                        long[] packedPositions = new long[count];
                         for (int i = 0; i < count; i++) {
                             responseTypes[i] = buf.readByte();
-                            requestIds[i] = buf.readVarInt();
+                            packedPositions[i] = buf.readLong();
                         }
-                        return new BatchResponseS2CPayload(responseTypes, requestIds, count);
+                        return new BatchResponseS2CPayload(responseTypes, packedPositions, count);
                     }
             );
 

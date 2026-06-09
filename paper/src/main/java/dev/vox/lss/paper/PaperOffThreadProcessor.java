@@ -56,13 +56,13 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
     protected void enqueueResultPayloads(PaperPlayerRequestState state, PaperChunkDiskReader.SimpleReadResult result) {
         if (result.sectionBytes() != null) {
             buildAndEnqueueColumnPayload(state, result.chunkX(), result.chunkZ(),
-                    result.dimension(), result.requestId(), result.columnTimestamp(),
+                    result.dimension(), result.columnTimestamp(),
                     result.submissionOrder(), result.sectionBytes(), result.estimatedBytes());
         }
     }
 
     @Override
-    protected boolean submitDiskRead(UUID playerUuid, int requestId, String dimension,
+    protected boolean submitDiskRead(UUID playerUuid, String dimension,
                                     int cx, int cz,
                                     long submissionOrder) {
         if (this.diskReader == null) return false;
@@ -71,14 +71,14 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
             LSSLogger.debug("No dimension context for " + dimension + ", skipping disk read for " + cx + "," + cz);
             return false;
         }
-        this.diskReader.submitReadDirect(playerUuid, requestId, level,
+        this.diskReader.submitReadDirect(playerUuid, level,
                 cx, cz, submissionOrder);
         return true;
     }
 
     @Override
     protected void buildAndEnqueueColumnPayload(PaperPlayerRequestState state, int cx, int cz,
-                                                 String dimension, int requestId,
+                                                 String dimension,
                                                  long columnTimestamp, long submissionOrder,
                                                  byte[] sectionBytes, int estimatedBytes) {
         if (sectionBytes.length > LSSConstants.MAX_SECTIONS_SIZE) {
@@ -88,9 +88,9 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
             return;
         }
         byte[] encoded = PaperPayloadHandler.encodeVoxelColumnPreEncoded(
-                requestId, cx, cz, dimension, columnTimestamp, sectionBytes);
+                cx, cz, dimension, columnTimestamp, sectionBytes);
         state.addReadyPayload(new PaperPlayerRequestState.QueuedPayload(
-                encoded, requestId, estimatedBytes, submissionOrder));
+                encoded, estimatedBytes, submissionOrder));
     }
 
     @Override

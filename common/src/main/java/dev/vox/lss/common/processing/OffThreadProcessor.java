@@ -30,7 +30,7 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
     private static final int SAVE_INTERVAL_CYCLES = 6000; // ~5 min at 20 TPS
 
     /** Request for the main thread to submit a generation ticket (requires MC world state). */
-    public record GenerationTicketRequest(UUID playerUuid, int requestId, int cx, int cz,
+    public record GenerationTicketRequest(UUID playerUuid, int cx, int cz,
                                            long submissionOrder) {}
 
     private record TimestampInvalidation(String dimension, long[] positions) {}
@@ -150,7 +150,7 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
      * is not registered yet) so the caller can unwind the permit + dedup group instead of leaking
      * them.
      */
-    protected abstract boolean submitDiskRead(UUID playerUuid, int requestId, String dimension,
+    protected abstract boolean submitDiskRead(UUID playerUuid, String dimension,
                                             int cx, int cz,
                                             long submissionOrder);
 
@@ -158,7 +158,7 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
      * Store timestamp and enqueue pre-serialized column data as a payload.
      */
     protected boolean enqueueLoadedColumn(PlayerState state, LoadedColumnData column,
-                                          int requestId, long columnTimestamp,
+                                          long columnTimestamp,
                                           long submissionOrder,
                                           String dimension) {
         if (column.serializedSections() == null || column.serializedSections().length == 0) {
@@ -172,14 +172,14 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         this.timestampCache.put(dimension, packed, columnTimestamp, this.cycleNow);
 
         buildAndEnqueueColumnPayload(state, column.cx(), column.cz(), dimension,
-                requestId, columnTimestamp, submissionOrder,
+                columnTimestamp, submissionOrder,
                 column.serializedSections(), estimatedBytes);
         return true;
     }
 
     /** Build platform-specific payload from serialized section bytes and enqueue to the player's ready queue. */
     protected abstract void buildAndEnqueueColumnPayload(PlayerState state, int cx, int cz,
-                                                          String dimension, int requestId,
+                                                          String dimension,
                                                           long columnTimestamp, long submissionOrder,
                                                           byte[] sectionBytes, int estimatedBytes);
 
@@ -313,26 +313,25 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
                 int cx = result.chunkX();
                 int cz = result.chunkZ();
                 var pending = state.removePendingByPosition(cx, cz);
-                int requestId = pending != null ? pending.requestId() : result.requestId();
 
                 state.getRateLimiters().syncOnLoad().release();
 
                 long packed = PositionUtil.packPosition(cx, cz);
 
                 if (result.saturated()) {
-                    this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, requestId));
+                    this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, packed));
                     if (LSSLogger.isDebugEnabled()) {
                         LSSLogger.debug("Rate-limited " + playerUuid + " (disk saturated): chunk [" + cx + ", " + cz + "]");
                     }
                 } else if (result.notFound()) {
-                    handleDiskNotFound(playerUuid, state, requestId, cx, cz, pending);
+                    handleDiskNotFound(playerUuid, state, packed, cx, cz, pending);
                 } else {
                     state.markDiskReadDone(cx, cz);
                     if (result.sectionBytes() != null) {
                         this.enqueueResultPayloads(state, result);
                     } else {
                         // All-air chunk (exists on disk but no visible sections) — notify client
-                        this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, requestId));
+                        this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed));
                     }
                     // Store timestamp so reconnecting clients get up-to-date responses
                     this.timestampCache.put(entry.getValue().dimension(), packed, result.columnTimestamp(), this.cycleNow);
@@ -351,27 +350,27 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
     private void dispatchDedupGroup(DedupTracker.Group group, ReadResult result,
                                      int cx, int cz) {
         byte[] sectionBytes = result.sectionBytes();
+        long packed = PositionUtil.packPosition(cx, cz);
         for (var attachment : group.attached()) {
             var attachedState = this.players.get(attachment.playerUuid());
             if (attachedState == null) continue;
 
             var attachedPending = attachedState.removePendingByPosition(cx, cz);
             attachedState.getRateLimiters().syncOnLoad().release();
-            int attachedRequestId = attachedPending != null ? attachedPending.requestId() : attachment.requestId();
 
             if (result.saturated()) {
-                this.ctx.sendActions().add(new SendAction.RateLimited(attachment.playerUuid(), attachedRequestId));
+                this.ctx.sendActions().add(new SendAction.RateLimited(attachment.playerUuid(), packed));
             } else if (result.notFound()) {
-                handleDiskNotFound(attachment.playerUuid(), attachedState, attachedRequestId, cx, cz, attachedPending);
+                handleDiskNotFound(attachment.playerUuid(), attachedState, packed, cx, cz, attachedPending);
             } else if (sectionBytes != null) {
                 attachedState.markDiskReadDone(cx, cz);
                 buildAndEnqueueColumnPayload(attachedState, cx, cz, group.dimension(),
-                        attachedRequestId, result.columnTimestamp(), attachment.submissionOrder(),
+                        result.columnTimestamp(), attachment.submissionOrder(),
                         sectionBytes, result.estimatedBytes());
             } else {
                 // Empty column (all air) — mark done and notify client
                 attachedState.markDiskReadDone(cx, cz);
-                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(attachment.playerUuid(), attachedRequestId));
+                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(attachment.playerUuid(), packed));
             }
             this.ctx.diagnostics().incrementDiskDrained();
         }
@@ -379,18 +378,18 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
 
     /** Disk-first fallback: if the original request was GENERATION and generation is available,
      *  queue a generation ticket; otherwise send ColumnNotGenerated. */
-    private void handleDiskNotFound(UUID playerUuid, PlayerState state, int requestId,
+    private void handleDiskNotFound(UUID playerUuid, PlayerState state, long packed,
                                      int cx, int cz, PendingRequest pending) {
         if (pending != null && pending.type() == RequestType.GENERATION && this.generationAvailable) {
             if (state.getRateLimiters().generation().tryAcquire()) {
                 this.ctx.generationTicketRequests().add(new GenerationTicketRequest(
-                        playerUuid, requestId, cx, cz, this.ctx.sequence().next()));
-                state.addPendingRequest(new PendingRequest(requestId, cx, cz, RequestType.GENERATION));
+                        playerUuid, cx, cz, this.ctx.sequence().next()));
+                state.addPendingRequest(new PendingRequest(cx, cz, RequestType.GENERATION));
             } else {
-                this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, requestId));
+                this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed));
             }
         } else {
-            this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, requestId));
+            this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed));
         }
     }
 
@@ -406,17 +405,16 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
             while ((result = this.pollGenerationResult(state)) != null) {
                 int cx = result.chunkX();
                 int cz = result.chunkZ();
-                var pending = state.removePendingByPosition(cx, cz);
-                int requestId = pending != null ? pending.requestId() : result.requestId();
+                state.removePendingByPosition(cx, cz);
+                long packed = PositionUtil.packPosition(cx, cz);
 
                 state.getRateLimiters().generation().release();
 
                 if (result.notFound()) {
-                    this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, requestId));
+                    this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed));
                 } else {
                     state.markDiskReadDone(cx, cz);
                     this.enqueueResultPayloads(state, result);
-                    long packed = PositionUtil.packPosition(cx, cz);
                     this.timestampCache.put(entry.getValue().dimension(), packed, result.columnTimestamp(), this.cycleNow);
                 }
                 this.ctx.diagnostics().incrementGenDrained();
@@ -439,11 +437,12 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
             var playerData = snapshot.players().get(genReady.playerUuid());
             if (playerData == null) continue;
             String dimension = playerData.dimension();
-            boolean sent = this.enqueueLoadedColumn(state, genReady.columnData(), genReady.requestId(),
+            boolean sent = this.enqueueLoadedColumn(state, genReady.columnData(),
                     genReady.columnTimestamp(), genReady.submissionOrder(),
                     dimension);
             if (!sent) {
-                this.sendActions.add(new SendAction.ColumnUpToDate(genReady.playerUuid(), genReady.requestId()));
+                this.sendActions.add(new SendAction.ColumnUpToDate(genReady.playerUuid(),
+                        PositionUtil.packPosition(cx, cz)));
             }
             this.ctx.diagnostics().incrementGenDrained();
         }

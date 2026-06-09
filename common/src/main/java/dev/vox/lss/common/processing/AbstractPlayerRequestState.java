@@ -1,6 +1,5 @@
 package dev.vox.lss.common.processing;
 
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
@@ -41,7 +40,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
 
     // Owned by processing thread (single-threaded access)
     private final Long2ObjectOpenHashMap<PendingRequest> pendingByPosition = new Long2ObjectOpenHashMap<>();
-    private final Int2ObjectOpenHashMap<PendingRequest> pendingByRequestId = new Int2ObjectOpenHashMap<>();
     private final PriorityQueue<Q> sendQueue = new PriorityQueue<>();
     private final LongOpenHashSet diskReadDone = new LongOpenHashSet();
     private final PlayerBandwidthTracker bandwidth = new PlayerBandwidthTracker();
@@ -150,7 +148,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
      */
     public void clearProcessingState() {
         this.pendingByPosition.clear();
-        this.pendingByRequestId.clear();
         this.diskReadDone.clear();
         this.pendingSyncCount = 0;
         this.pendingGenerationCount = 0;
@@ -176,10 +173,8 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         long packed = PositionUtil.packPosition(pending.cx(), pending.cz());
         var replaced = this.pendingByPosition.put(packed, pending);
         if (replaced != null) {
-            this.pendingByRequestId.remove(replaced.requestId());
             decrementPendingCounter(replaced.type());
         }
-        this.pendingByRequestId.put(pending.requestId(), pending);
         incrementPendingCounter(pending.type());
     }
 
@@ -188,18 +183,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         long packed = PositionUtil.packPosition(cx, cz);
         var pending = this.pendingByPosition.remove(packed);
         if (pending != null) {
-            this.pendingByRequestId.remove(pending.requestId());
-            decrementPendingCounter(pending.type());
-        }
-        return pending;
-    }
-
-    @Override
-    public PendingRequest removePendingByRequestId(int requestId) {
-        var pending = this.pendingByRequestId.remove(requestId);
-        if (pending != null) {
-            long packed = PositionUtil.packPosition(pending.cx(), pending.cz());
-            this.pendingByPosition.remove(packed);
             decrementPendingCounter(pending.type());
         }
         return pending;

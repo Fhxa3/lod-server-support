@@ -14,7 +14,7 @@ public class PaperPlayerRequestState extends AbstractPlayerRequestState<PaperPla
     private volatile ServerPlayer player;
     private ResourceKey<Level> lastDimension;
 
-    public record QueuedPayload(byte[] data, int requestId,
+    public record QueuedPayload(byte[] data,
                                 int estimatedBytes, long submissionOrder) implements Comparable<QueuedPayload> {
         @Override
         public int compareTo(QueuedPayload other) {
@@ -28,8 +28,8 @@ public class PaperPlayerRequestState extends AbstractPlayerRequestState<PaperPla
         this.lastDimension = player.level().dimension();
     }
 
-    public void addRequest(int requestId, int cx, int cz, long clientTimestamp) {
-        enqueueIncomingRequest(new IncomingRequest(requestId, cx, cz, clientTimestamp));
+    public void addRequest(int cx, int cz, long clientTimestamp) {
+        enqueueIncomingRequest(new IncomingRequest(cx, cz, clientTimestamp));
     }
 
     /**

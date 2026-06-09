@@ -118,7 +118,7 @@ public class RequestProcessingService {
             int cx = PositionUtil.unpackX(packedPosition);
             int cz = PositionUtil.unpackZ(packedPosition);
             if (PositionUtil.chebyshevDistance(cx, cz, playerCx, playerCz) > maxDist) continue;
-            state.addRequest(payload.requestIds()[i], packedPosition, payload.clientTimestamps()[i]);
+            state.addRequest(packedPosition, payload.clientTimestamps()[i]);
         }
     }
 
@@ -318,11 +318,11 @@ public class RequestProcessingService {
             if (player.isRemoved()) continue;
             var level = player.level();
             boolean accepted = this.generationService.submitGeneration(
-                    req.playerUuid(), req.requestId(), level, req.cx(), req.cz(),
+                    req.playerUuid(), level, req.cx(), req.cz(),
                     req.submissionOrder());
             if (!accepted) {
                 this.generationService.addResult(req.playerUuid(), ChunkDiskReader.emptyResult(
-                        req.playerUuid(), req.requestId(), req.cx(), req.cz(), req.submissionOrder()));
+                        req.playerUuid(), req.cx(), req.cz(), req.submissionOrder()));
             }
         }
     }
@@ -338,17 +338,17 @@ public class RequestProcessingService {
         while ((action = this.offThreadProcessor.pollSendAction()) != null) {
             var state = this.players.get(action.playerUuid());
             if (state == null || !state.hasCompletedHandshake()) continue;
-            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.requestId());
+            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.packedPosition());
         }
 
         if (this.sendActionBatcher.isEmpty()) return;
 
-        this.sendActionBatcher.forEach((uuid, types, ids, count) -> {
+        this.sendActionBatcher.forEach((uuid, types, positions, count) -> {
             var state = this.players.get(uuid);
             if (state == null || !state.hasCompletedHandshake()) return;
             try {
                 ServerPlayNetworking.send(state.getPlayer(),
-                        new BatchResponseS2CPayload(types, ids, count));
+                        new BatchResponseS2CPayload(types, positions, count));
             } catch (Exception e) {
                 LSSLogger.error("Failed to send batch response to " + state.getPlayer().getName().getString(), e);
             }

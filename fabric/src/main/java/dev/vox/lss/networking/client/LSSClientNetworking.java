@@ -2,6 +2,7 @@ package dev.vox.lss.networking.client;
 
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
+import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.api.LSSApi;
 import dev.vox.lss.config.LSSClientConfig;
 import dev.vox.lss.networking.payloads.BatchResponseS2CPayload;
@@ -125,12 +126,12 @@ public class LSSClientNetworking {
                         var manager = requestManager;
                         if (manager == null) return;
                         for (int i = 0; i < payload.count(); i++) {
-                            int requestId = payload.requestIds()[i];
+                            long packed = payload.packedPositions()[i];
                             byte type = payload.responseTypes()[i];
                             switch (type) {
-                                case LSSConstants.RESPONSE_RATE_LIMITED -> manager.onRateLimited(requestId);
-                                case LSSConstants.RESPONSE_UP_TO_DATE -> manager.onColumnUpToDate(requestId);
-                                case LSSConstants.RESPONSE_NOT_GENERATED -> manager.onColumnNotGenerated(requestId);
+                                case LSSConstants.RESPONSE_RATE_LIMITED -> manager.onRateLimited(packed);
+                                case LSSConstants.RESPONSE_UP_TO_DATE -> manager.onColumnUpToDate(packed);
+                                case LSSConstants.RESPONSE_NOT_GENERATED -> manager.onColumnNotGenerated(packed);
                                 default -> LSSLogger.warn("Unknown batch response type: " + type);
                             }
                         }
@@ -159,7 +160,8 @@ public class LSSClientNetworking {
                     context.client().execute(() -> {
                         var manager = requestManager;
                         if (manager != null) {
-                            manager.onColumnReceived(payload.requestId(),
+                            manager.onColumnReceived(
+                                    PositionUtil.packPosition(payload.chunkX(), payload.chunkZ()),
                                     payload.columnTimestamp());
                         }
                         columnProcessor.offer(payload);

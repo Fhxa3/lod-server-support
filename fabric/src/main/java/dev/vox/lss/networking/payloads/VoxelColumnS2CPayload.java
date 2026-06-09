@@ -31,17 +31,15 @@ public final class VoxelColumnS2CPayload implements CustomPacketPayload {
                     VoxelColumnS2CPayload::read
             );
 
-    private final int requestId;
     private final int chunkX;
     private final int chunkZ;
     private final ResourceKey<Level> dimension;
     private final long columnTimestamp;
     private final byte[] sectionBytes;
 
-    public VoxelColumnS2CPayload(int requestId, int chunkX, int chunkZ,
+    public VoxelColumnS2CPayload(int chunkX, int chunkZ,
                                   ResourceKey<Level> dimension, long columnTimestamp,
                                   byte[] sectionBytes) {
-        this.requestId = requestId;
         this.chunkX = chunkX;
         this.chunkZ = chunkZ;
         this.dimension = dimension;
@@ -49,7 +47,6 @@ public final class VoxelColumnS2CPayload implements CustomPacketPayload {
         this.sectionBytes = sectionBytes;
     }
 
-    public int requestId() { return requestId; }
     public int chunkX() { return chunkX; }
     public int chunkZ() { return chunkZ; }
     public ResourceKey<Level> dimension() { return dimension; }
@@ -63,7 +60,6 @@ public final class VoxelColumnS2CPayload implements CustomPacketPayload {
     }
 
     private static void write(FriendlyByteBuf buf, VoxelColumnS2CPayload payload) {
-        buf.writeVarInt(payload.requestId);
         buf.writeInt(payload.chunkX);
         buf.writeInt(payload.chunkZ);
         buf.writeUtf(payload.dimension.identifier().toString());
@@ -72,7 +68,6 @@ public final class VoxelColumnS2CPayload implements CustomPacketPayload {
     }
 
     private static VoxelColumnS2CPayload read(FriendlyByteBuf buf) {
-        int requestId = buf.readVarInt();
         int cx = buf.readInt();
         int cz = buf.readInt();
         ResourceKey<Level> dim = ResourceKey.create(Registries.DIMENSION,
@@ -80,7 +75,7 @@ public final class VoxelColumnS2CPayload implements CustomPacketPayload {
         long columnTimestamp = buf.readLong();
         byte[] sectionBytes = buf.readByteArray(LSSConstants.MAX_SECTIONS_SIZE);
 
-        return new VoxelColumnS2CPayload(requestId, cx, cz, dim, columnTimestamp, sectionBytes);
+        return new VoxelColumnS2CPayload(cx, cz, dim, columnTimestamp, sectionBytes);
     }
 
     @Override

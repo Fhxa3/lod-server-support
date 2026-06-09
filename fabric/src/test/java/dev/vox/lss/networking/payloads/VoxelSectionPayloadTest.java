@@ -41,7 +41,7 @@ class VoxelSectionPayloadTest {
     void roundtripPreservesHeaderFields() {
         var dim = ResourceKey.create(Registries.DIMENSION, Identifier.parse(LSSConstants.DIM_STR_OVERWORLD));
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(1, 10, -20, dim, 99999L, sections);
+        var original = new VoxelColumnS2CPayload(10, -20, dim, 99999L, sections);
 
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
@@ -66,7 +66,7 @@ class VoxelSectionPayloadTest {
         wireBuf.readBytes(raw);
         wireBuf.release();
 
-        var original = new VoxelColumnS2CPayload(2, -5, 100, dim, 12345L, raw);
+        var original = new VoxelColumnS2CPayload(-5, 100, dim, 12345L, raw);
 
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
@@ -89,7 +89,7 @@ class VoxelSectionPayloadTest {
     void roundtripEmptyColumn() {
         var dim = ResourceKey.create(Registries.DIMENSION, Identifier.parse(LSSConstants.DIM_STR_THE_END));
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(3, 0, 0, dim, 0L, sections);
+        var original = new VoxelColumnS2CPayload(0, 0, dim, 0L, sections);
 
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
@@ -110,7 +110,7 @@ class VoxelSectionPayloadTest {
     void estimatedBytesPositive() {
         var dim = ResourceKey.create(Registries.DIMENSION, Identifier.parse(LSSConstants.DIM_STR_OVERWORLD));
         byte[] sections = emptyColumn();
-        var payload = new VoxelColumnS2CPayload(4, 0, 0, dim, 0L, sections);
+        var payload = new VoxelColumnS2CPayload(0, 0, dim, 0L, sections);
         assertTrue(payload.estimatedBytes() > 0);
     }
 
@@ -140,7 +140,7 @@ class VoxelSectionPayloadTest {
     @Test
     void dimensionOverworldRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(5, 1, 3, Level.OVERWORLD, 50000L, sections);
+        var original = new VoxelColumnS2CPayload(1, 3, Level.OVERWORLD, 50000L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);
@@ -151,7 +151,7 @@ class VoxelSectionPayloadTest {
     @Test
     void dimensionNetherRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(6, 0, 0, Level.NETHER, 0L, sections);
+        var original = new VoxelColumnS2CPayload(0, 0, Level.NETHER, 0L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);
@@ -162,7 +162,7 @@ class VoxelSectionPayloadTest {
     @Test
     void dimensionEndRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(7, 0, 0, Level.END, 0L, sections);
+        var original = new VoxelColumnS2CPayload(0, 0, Level.END, 0L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);

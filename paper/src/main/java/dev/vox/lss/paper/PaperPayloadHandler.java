@@ -60,29 +60,28 @@ public final class PaperPayloadHandler {
                 generationEnabled));
     }
 
-    public static byte[] encodeBatchResponse(byte[] responseTypes, int[] requestIds, int count) {
+    public static byte[] encodeBatchResponse(byte[] responseTypes, long[] packedPositions, int count) {
         return encodeToBytes(buf -> {
             buf.writeVarInt(count);
             for (int i = 0; i < count; i++) {
                 buf.writeByte(responseTypes[i]);
-                buf.writeVarInt(requestIds[i]);
+                buf.writeLong(packedPositions[i]);
             }
         });
     }
 
-    public static void sendBatchResponse(Player player, byte[] responseTypes, int[] requestIds, int count) {
-        sendRawNmsPayload(player, ID_BATCH_RESPONSE, encodeBatchResponse(responseTypes, requestIds, count));
+    public static void sendBatchResponse(Player player, byte[] responseTypes, long[] packedPositions, int count) {
+        sendRawNmsPayload(player, ID_BATCH_RESPONSE, encodeBatchResponse(responseTypes, packedPositions, count));
     }
 
     /**
      * Encode a column payload with serialized section bytes.
      * Writes the per-request header, then writes sectionBytes as a length-prefixed byte array.
      */
-    public static byte[] encodeVoxelColumnPreEncoded(int requestId, int chunkX, int chunkZ,
+    public static byte[] encodeVoxelColumnPreEncoded(int chunkX, int chunkZ,
                                                       String dimensionStr, long columnTimestamp,
                                                       byte[] sectionBytes) {
         return encodeToBytes(sectionBytes.length + 64, buf -> {
-            buf.writeVarInt(requestId);
             buf.writeInt(chunkX);
             buf.writeInt(chunkZ);
             buf.writeUtf(dimensionStr);
@@ -126,7 +125,7 @@ public final class PaperPayloadHandler {
         });
     }
 
-    public record DecodedBatchChunkRequest(int[] requestIds, long[] packedPositions, long[] clientTimestamps, int count) {}
+    public record DecodedBatchChunkRequest(long[] packedPositions, long[] clientTimestamps, int count) {}
 
     public static DecodedBatchChunkRequest decodeBatchChunkRequest(byte[] data) {
         if (data == null || data.length == 0) {
@@ -139,15 +138,13 @@ public final class PaperPayloadHandler {
                 LSSLogger.warn("Batch chunk request count out of range: " + count);
                 return null;
             }
-            int[] requestIds = new int[count];
             long[] packedPositions = new long[count];
             long[] clientTimestamps = new long[count];
             for (int i = 0; i < count; i++) {
-                requestIds[i] = buf.readVarInt();
                 packedPositions[i] = buf.readLong();
                 clientTimestamps[i] = buf.readLong();
             }
-            return new DecodedBatchChunkRequest(requestIds, packedPositions, clientTimestamps, count);
+            return new DecodedBatchChunkRequest(packedPositions, clientTimestamps, count);
         });
     }
 

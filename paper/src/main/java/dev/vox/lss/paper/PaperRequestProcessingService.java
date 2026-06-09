@@ -123,7 +123,7 @@ public class PaperRequestProcessingService {
             int cx = PositionUtil.unpackX(packedPosition);
             int cz = PositionUtil.unpackZ(packedPosition);
             if (PositionUtil.chebyshevDistance(cx, cz, playerCx, playerCz) > maxDist) continue;
-            state.addRequest(batch.requestIds()[i], cx, cz, batch.clientTimestamps()[i]);
+            state.addRequest(cx, cz, batch.clientTimestamps()[i]);
         }
     }
 
@@ -311,7 +311,7 @@ public class PaperRequestProcessingService {
         while ((action = this.offThreadProcessor.pollSendAction()) != null) {
             var state = this.players.get(action.playerUuid());
             if (state == null || !state.hasCompletedHandshake()) continue;
-            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.requestId());
+            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.packedPosition());
         }
 
         if (this.sendActionBatcher.isEmpty()) return;
@@ -343,11 +343,11 @@ public class PaperRequestProcessingService {
                 continue;
             var level = player.level();
             boolean accepted = this.generationService.submitGeneration(
-                    req.playerUuid(), req.requestId(), level, req.cx(), req.cz(),
+                    req.playerUuid(), level, req.cx(), req.cz(),
                     req.submissionOrder());
             if (!accepted) {
                 this.generationService.addResult(req.playerUuid(), PaperChunkDiskReader.emptyResult(
-                        req.playerUuid(), req.requestId(), req.cx(), req.cz(), req.submissionOrder()));
+                        req.playerUuid(), req.cx(), req.cz(), req.submissionOrder()));
             }
         }
     }

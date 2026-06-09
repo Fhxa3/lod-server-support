@@ -62,9 +62,11 @@ The system property `-Dlss.test.integratedServer=true` (set in fabric/build.grad
 Batch model with 6 payload types. Fabric uses `LSSNetworking` with Fabric `StreamCodec`;
 Paper uses `PaperPayloadHandler` with raw `FriendlyByteBuf` encoding. Both produce identical wire format.
 
-**C2S:** `HandshakeC2SPayload` (capabilities bitmask) → `BatchChunkRequestC2SPayload` (batch of requestId + packed position + clientTimestamp tuples)
+**C2S:** `HandshakeC2SPayload` (capabilities bitmask) → `BatchChunkRequestC2SPayload` (batch of packed position + clientTimestamp pairs)
 
-**S2C:** `SessionConfigS2CPayload` (enabled/LOD distance/concurrency limits/generation toggle) → `VoxelColumnS2CPayload` (requestId + MC-native sections + columnTimestamp) → `BatchResponseS2CPayload` (batch of responseType + requestId pairs — covers rate-limited, up-to-date, and not-generated) → `DirtyColumnsS2CPayload` (server-pushed change notifications)
+**S2C:** `SessionConfigS2CPayload` (enabled/LOD distance/concurrency limits/generation toggle) → `VoxelColumnS2CPayload` (coords + dimension + MC-native sections + columnTimestamp) → `BatchResponseS2CPayload` (batch of responseType + packed position pairs — covers rate-limited, up-to-date, and not-generated) → `DirtyColumnsS2CPayload` (server-pushed change notifications)
+
+Requests are keyed by packed chunk position end-to-end (no request ids): every response is a statement about a position, so late or duplicate responses are idempotent and a timed-out client request self-heals when the answer eventually arrives.
 
 Flow: client handshakes with capabilities bitmask (CAPABILITY_VOXEL_COLUMNS set if LSSApi has consumers) → server sends session config with concurrency limits → client scans in expanding spiral every second (20 ticks) and sends batched requests with clientTimestamp (-1 for unknown/first request, 0 for generation request, >0 for resync) → server routes by timestamp: sync-on-load path (clientTimestamp > 0 or -1) acquires a concurrency slot then reads disk, generation path (clientTimestamp == 0) acquires a slot then generates; a full limiter bounces the request with rate-limited and the client retries on a later scan → server batches lightweight responses (rate-limited, up-to-date, not-generated) per tick; column data payloads are sent individually. After initial scan, server periodically pushes `DirtyColumnsS2CPayload` listing changed columns, client re-requests only those.
 

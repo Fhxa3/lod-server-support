@@ -35,7 +35,7 @@ public class LodRequestManager {
         columnTimestamps.defaultReturnValue(-1L);
     }
 
-    // In-flight request tracking (position ↔ requestId ↔ sendTime)
+    // In-flight request tracking (position → sendTime)
     private final InFlightTracker tracker = new InFlightTracker();
 
     // Request queue — populated by scanner, consumed by drainQueue()
@@ -66,7 +66,6 @@ public class LodRequestManager {
     private int maxSendPerTick = MIN_SEND_PER_TICK;
 
     // Pre-allocated send buffers for drainQueue() to avoid per-tick allocation
-    private int[] sendRequestIdBuffer = new int[MIN_SEND_PER_TICK];
     private long[] sendPositionBuffer = new long[MIN_SEND_PER_TICK];
     private long[] sendTimestampBuffer = new long[MIN_SEND_PER_TICK];
 
@@ -226,7 +225,6 @@ public class LodRequestManager {
         if (perTick != this.maxSendPerTick) {
             this.maxSendPerTick = perTick;
             if (perTick > this.sendPositionBuffer.length) {
-                this.sendRequestIdBuffer = new int[perTick];
                 this.sendPositionBuffer = new long[perTick];
                 this.sendTimestampBuffer = new long[perTick];
             }
@@ -269,28 +267,25 @@ public class LodRequestManager {
     // --- Request sending and callbacks ---
 
     private void sendRequests(long[] positionBuffer, long[] timestampBuffer, int count) {
-        int[] requestIds = this.sendRequestIdBuffer;
-        for (int i = 0; i < count; i++) {
-            requestIds[i] = this.tracker.send(positionBuffer[i]);
-        }
         try {
-            ClientPlayNetworking.send(new BatchChunkRequestC2SPayload(requestIds, positionBuffer, timestampBuffer, count));
+            ClientPlayNetworking.send(new BatchChunkRequestC2SPayload(positionBuffer, timestampBuffer, count));
         } catch (Exception e) {
             LSSLogger.error("Failed to send batch chunk request", e);
             for (int i = 0; i < count; i++) {
-                this.tracker.removeByRequestId(requestIds[i]);
+                this.tracker.removeByPosition(positionBuffer[i]);
             }
         }
         this.metrics.recordSendCycle(count);
     }
 
-    public void onColumnReceived(int requestId, long columnTimestamp) {
-        var completion = this.tracker.removeByRequestId(requestId);
-        if (completion != null) {
-            this.dirtyColumns.remove(completion.position());
-            this.putTimestamp(completion.position(), columnTimestamp);
-            this.validatedThisSession.add(completion.position());
-        }
+    public void onColumnReceived(long packed, long columnTimestamp) {
+        // Apply even if the position is no longer tracked (e.g. it timed out client-side):
+        // the data is authoritative for the position, and stamping it prevents the
+        // timeout → silent-duplicate → second-timeout stall.
+        this.tracker.removeByPosition(packed);
+        this.dirtyColumns.remove(packed);
+        this.putTimestamp(packed, columnTimestamp);
+        this.validatedThisSession.add(packed);
         this.metrics.recordColumnReceived();
     }
 
@@ -308,33 +303,27 @@ public class LodRequestManager {
         }
     }
 
-    public void onColumnNotGenerated(int requestId) {
-        var removal = this.tracker.removeByRequestId(requestId);
-        if (removal != null) {
-            this.putTimestamp(removal.position(), 0L);
-        }
+    public void onColumnNotGenerated(long packed) {
+        this.tracker.removeByPosition(packed);
+        this.putTimestamp(packed, 0L);
         this.metrics.recordNotGenerated();
     }
 
-    public void onColumnUpToDate(int requestId) {
-        var completion = this.tracker.removeByRequestId(requestId);
-        if (completion != null) {
-            this.validatedThisSession.add(completion.position());
-            // Empty columns never get a VoxelColumn response, so columnTimestamps stays -1L.
-            // Without a positive timestamp the scanner treats the position as "never requested"
-            // and re-queues it every cycle. Stamp it now so the validatedThisSession gate works.
-            if (this.columnTimestamps.get(completion.position()) == -1L) {
-                this.putTimestamp(completion.position(), LSSConstants.epochSeconds());
-            }
+    public void onColumnUpToDate(long packed) {
+        this.tracker.removeByPosition(packed);
+        this.validatedThisSession.add(packed);
+        // Empty columns never get a VoxelColumn response, so columnTimestamps stays -1L.
+        // Without a positive timestamp the scanner treats the position as "never requested"
+        // and re-queues it every cycle. Stamp it now so the validatedThisSession gate works.
+        if (this.columnTimestamps.get(packed) == -1L) {
+            this.putTimestamp(packed, LSSConstants.epochSeconds());
         }
         this.metrics.recordUpToDate();
     }
 
-    public void onRateLimited(int requestId) {
-        var removal = this.tracker.removeByRequestId(requestId);
-        if (removal != null) {
-            this.rateLimitRetryPositions.add(removal.position());
-        }
+    public void onRateLimited(long packed) {
+        this.tracker.removeByPosition(packed);
+        this.rateLimitRetryPositions.add(packed);
         this.metrics.recordRateLimited();
         this.skipNextScan = true;
     }

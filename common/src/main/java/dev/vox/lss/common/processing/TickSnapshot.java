@@ -27,7 +27,6 @@ public record TickSnapshot(
     /** Generation service: extracted data for chunks that completed generation. */
     public record GenerationReadyData(
             UUID playerUuid,
-            int requestId,
             LoadedColumnData columnData,
             long columnTimestamp,
             long submissionOrder

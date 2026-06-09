@@ -16,9 +16,9 @@ public final class SendActionBatcher {
 
     private static final int INITIAL_CAPACITY = 64;
 
-    public void add(UUID playerUuid, byte responseType, int requestId) {
+    public void add(UUID playerUuid, byte responseType, long packedPosition) {
         var batch = batches.computeIfAbsent(playerUuid, k -> new PlayerBatch());
-        batch.add(responseType, requestId);
+        batch.add(responseType, packedPosition);
     }
 
     public boolean isEmpty() {
@@ -31,7 +31,7 @@ public final class SendActionBatcher {
             int count = batch.count;
             if (count <= 0) continue;
             if (count <= LSSConstants.MAX_BATCH_RESPONSES) {
-                consumer.accept(entry.getKey(), batch.types, batch.requestIds, count);
+                consumer.accept(entry.getKey(), batch.types, batch.positions, count);
             } else {
                 // Split oversized batches so each emitted frame stays within the decoder's
                 // MAX_BATCH_RESPONSES cap (otherwise the client rejects the whole packet).
@@ -39,7 +39,7 @@ public final class SendActionBatcher {
                     int len = Math.min(LSSConstants.MAX_BATCH_RESPONSES, count - off);
                     consumer.accept(entry.getKey(),
                             Arrays.copyOfRange(batch.types, off, off + len),
-                            Arrays.copyOfRange(batch.requestIds, off, off + len), len);
+                            Arrays.copyOfRange(batch.positions, off, off + len), len);
                 }
             }
         }
@@ -51,21 +51,21 @@ public final class SendActionBatcher {
 
     @FunctionalInterface
     public interface BatchConsumer {
-        void accept(UUID playerUuid, byte[] responseTypes, int[] requestIds, int count);
+        void accept(UUID playerUuid, byte[] responseTypes, long[] packedPositions, int count);
     }
 
     private static final class PlayerBatch {
         byte[] types = new byte[INITIAL_CAPACITY];
-        int[] requestIds = new int[INITIAL_CAPACITY];
+        long[] positions = new long[INITIAL_CAPACITY];
         int count;
 
-        void add(byte responseType, int requestId) {
+        void add(byte responseType, long packedPosition) {
             if (count >= types.length) {
                 types = Arrays.copyOf(types, types.length * 2);
-                requestIds = Arrays.copyOf(requestIds, requestIds.length * 2);
+                positions = Arrays.copyOf(positions, positions.length * 2);
             }
             types[count] = responseType;
-            requestIds[count] = requestId;
+            positions[count] = packedPosition;
             count++;
         }
     }

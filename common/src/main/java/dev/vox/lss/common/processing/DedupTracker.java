@@ -17,7 +17,7 @@ import java.util.UUID;
  */
 class DedupTracker {
 
-    record Attachment(UUID playerUuid, int requestId, long submissionOrder) {}
+    record Attachment(UUID playerUuid, long submissionOrder) {}
     record Group(UUID primaryPlayer, String dimension, ArrayList<Attachment> attached) {}
     record RemovedGroup(long packed, Group group) {}
 
@@ -32,11 +32,11 @@ class DedupTracker {
      * @return {@code true} if an existing group was found (caller should NOT submit a disk read),
      *         {@code false} if a new group was created (caller SHOULD submit a disk read)
      */
-    boolean tryAttachOrCreate(long packed, String dimension, UUID primaryPlayer, int requestId, long submissionOrder) {
+    boolean tryAttachOrCreate(long packed, String dimension, UUID primaryPlayer, long submissionOrder) {
         var dimMap = this.pending.computeIfAbsent(dimension, k -> new Long2ObjectOpenHashMap<>());
         var existing = dimMap.get(packed);
         if (existing != null) {
-            existing.attached().add(new Attachment(primaryPlayer, requestId, submissionOrder));
+            existing.attached().add(new Attachment(primaryPlayer, submissionOrder));
             return true;
         }
         dimMap.put(packed, new Group(primaryPlayer, dimension, new ArrayList<>(2)));

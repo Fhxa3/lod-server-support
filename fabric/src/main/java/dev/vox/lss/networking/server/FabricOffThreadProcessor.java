@@ -64,26 +64,26 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
     protected void enqueueResultPayloads(PlayerRequestState state, ChunkDiskReader.ReadResult result) {
         if (result.sectionBytes() != null) {
             buildAndEnqueueColumnPayload(state, result.chunkX(), result.chunkZ(),
-                    result.dimension(), result.requestId(), result.columnTimestamp(),
+                    result.dimension(), result.columnTimestamp(),
                     result.submissionOrder(), result.sectionBytes(), result.estimatedBytes());
         }
     }
 
     @Override
-    protected boolean submitDiskRead(UUID playerUuid, int requestId, String dimension,
+    protected boolean submitDiskRead(UUID playerUuid, String dimension,
                                    int cx, int cz,
                                    long submissionOrder) {
         if (this.diskReader == null) return false;
         var level = this.dimensionLevelMap.get(dimension);
         if (level == null) return false;
-        this.diskReader.submitReadDirect(playerUuid, requestId, level,
+        this.diskReader.submitReadDirect(playerUuid, level,
                 cx, cz, submissionOrder);
         return true;
     }
 
     @Override
     protected void buildAndEnqueueColumnPayload(PlayerRequestState state, int cx, int cz,
-                                                 String dimension, int requestId,
+                                                 String dimension,
                                                  long columnTimestamp, long submissionOrder,
                                                  byte[] sectionBytes, int estimatedBytes) {
         if (sectionBytes.length > LSSConstants.MAX_SECTIONS_SIZE) {
@@ -94,10 +94,10 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
         }
         var dimensionKey = this.dimensionKeyCache.computeIfAbsent(dimension,
                 d -> ResourceKey.create(Registries.DIMENSION, Identifier.parse(d)));
-        var payload = new VoxelColumnS2CPayload(requestId, cx, cz, dimensionKey, columnTimestamp,
+        var payload = new VoxelColumnS2CPayload(cx, cz, dimensionKey, columnTimestamp,
                 sectionBytes);
         state.addReadyPayload(new PlayerRequestState.QueuedPayload(
-                payload, requestId, estimatedBytes, submissionOrder));
+                payload, estimatedBytes, submissionOrder));
     }
 
     @Override
