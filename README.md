@@ -121,7 +121,6 @@ Client config is generated at `config/lss-client-config.json` on first run.
 |---------|---------|-------------|
 | `receiveServerLods` | `true` | Enable receiving LOD data from the server |
 | `lodDistanceChunks` | `0` | Max LOD request distance in chunks (0 = use server limit) |
-| `offThreadSectionProcessing` | `true` | Process received sections off the render thread |
 
 
 ## License

@@ -55,18 +55,6 @@ public class LSSConfigMenu implements ConfigEntryPoint {
         distanceGroup.addOption(distanceOption);
         page.addOptionGroup(distanceGroup);
 
-        // Off-Thread Processing
-        var offThreadGroup = builder.createOptionGroup();
-        var offThreadOption = builder.createBooleanOption(Identifier.parse("lss:off_thread_processing"));
-        offThreadOption.setName(Component.translatable("lss.config.off_thread_processing"));
-        offThreadOption.setTooltip(Component.translatable("lss.config.off_thread_processing.tooltip"));
-        offThreadOption.setDefaultValue(true);
-        offThreadOption.setBinding(v -> cfg.offThreadSectionProcessing = v, () -> cfg.offThreadSectionProcessing);
-        offThreadOption.setStorageHandler(save);
-        offThreadOption.setEnabledProvider(s -> s.readBooleanOption(enabledDep[0]), enabledDep);
-        offThreadGroup.addOption(offThreadOption);
-        page.addOptionGroup(offThreadGroup);
-
         mod.addPage(page);
     }
 }

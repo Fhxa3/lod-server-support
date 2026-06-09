@@ -1,17 +1,11 @@
 package dev.vox.lss.networking.client;
 
-import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
-
 /**
  * Tracks request/response counters and rolling rates for the LOD request manager.
  */
 class RequestMetrics {
     // EWMA smoothing factor for rolling rates
     private static final double EWMA_SMOOTHING_FACTOR = 0.3;
-
-    // Column timestamp counters
-    private int receivedCount = 0;
-    private int emptyCount = 0;
 
     // Send cycle counters
     private long totalSendCycles = 0;
@@ -29,20 +23,6 @@ class RequestMetrics {
     private int positionsRequestedInWindow = 0;
     private double receiveRate = 0;
     private double requestRate = 0;
-
-    /**
-     * Adjusts received/empty counters when a timestamp is replaced.
-     * @param oldTimestamp the previous value (-1 if absent)
-     * @param newTimestamp the new value being stored
-     */
-    void adjustCounters(long oldTimestamp, long newTimestamp) {
-        if (oldTimestamp >= 0) {
-            if (oldTimestamp > 0) this.receivedCount--;
-            else this.emptyCount--;
-        }
-        if (newTimestamp > 0) this.receivedCount++;
-        else if (newTimestamp == 0) this.emptyCount++;
-    }
 
     void recordSendCycle(int positionCount) {
         this.totalSendCycles++;
@@ -86,8 +66,6 @@ class RequestMetrics {
     }
 
     void reset() {
-        this.receivedCount = 0;
-        this.emptyCount = 0;
         this.lastRateUpdateMs = 0;
         this.columnsReceivedInWindow = 0;
         this.positionsRequestedInWindow = 0;
@@ -95,29 +73,7 @@ class RequestMetrics {
         this.requestRate = 0;
     }
 
-    /**
-     * Recount received/empty from the full timestamp map after a bulk load.
-     */
-    void bulkRecount(Long2LongOpenHashMap timestamps) {
-        this.receivedCount = 0;
-        this.emptyCount = 0;
-        for (long ts : timestamps.values()) {
-            if (ts > 0) this.receivedCount++;
-            else if (ts == 0) this.emptyCount++;
-        }
-    }
-
-    /**
-     * Called during pruning - directly decrements based on removed timestamp value.
-     */
-    void onTimestampRemoved(long timestamp) {
-        if (timestamp > 0) this.receivedCount--;
-        else if (timestamp == 0) this.emptyCount--;
-    }
-
     // --- Getters ---
-    int getReceivedCount() { return this.receivedCount; }
-    int getEmptyCount() { return this.emptyCount; }
     long getTotalSendCycles() { return this.totalSendCycles; }
     long getTotalPositionsRequested() { return this.totalPositionsRequested; }
     long getTotalColumnsReceived() { return this.totalColumnsReceived; }

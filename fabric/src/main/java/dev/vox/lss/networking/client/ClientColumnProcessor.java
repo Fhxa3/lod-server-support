@@ -17,7 +17,6 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -30,21 +29,18 @@ class ClientColumnProcessor {
     private final AtomicLong columnsDropped = new AtomicLong();
     private volatile long lastDropWarnMs = 0;
 
-    // Off-thread column processing
-    private volatile ExecutorService executor = createExecutor();
+    // Off-thread column processing: one executor for the singleton's lifetime. A session
+    // epoch (bumped on disconnect) makes any in-flight drain self-terminate instead of
+    // dispatching a stale session's payloads — no executor teardown/recreation needed.
+    private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
+        var t = new Thread(r, "LSS-ColumnProcessor");
+        t.setDaemon(true);
+        return t;
+    });
     private final AtomicBoolean processing = new AtomicBoolean();
-    private volatile boolean shuttingDown;
-
-    private static ExecutorService createExecutor() {
-        return Executors.newSingleThreadExecutor(r -> {
-            var t = new Thread(r, "LSS-ColumnProcessor");
-            t.setDaemon(true);
-            return t;
-        });
-    }
+    private volatile int sessionEpoch;
 
     void offer(VoxelColumnS2CPayload payload) {
-        if (this.shuttingDown) return;
         if (this.queueSize.get() < MAX_QUEUED_COLUMNS) {
             this.columnQueue.add(payload);
             this.queueSize.incrementAndGet();
@@ -60,7 +56,6 @@ class ClientColumnProcessor {
     }
 
     void scheduleProcessing(boolean serverEnabled) {
-        if (this.shuttingDown) return;
         if (!serverEnabled || !LSSClientConfig.CONFIG.receiveServerLods || !LSSApi.hasVoxelConsumers()) {
             this.columnQueue.clear();
             this.queueSize.set(0);
@@ -77,30 +72,27 @@ class ClientColumnProcessor {
 
         if (this.columnQueue.isEmpty()) return;
 
-        if (LSSClientConfig.CONFIG.offThreadSectionProcessing) {
-            if (this.processing.compareAndSet(false, true)) {
-                try {
-                    this.executor.execute(() -> {
-                        try {
-                            drainColumnQueue(level);
-                        } finally {
-                            this.processing.set(false);
-                        }
-                    });
-                } catch (Exception e) {
-                    this.processing.set(false);
-                }
+        int epoch = this.sessionEpoch;
+        if (this.processing.compareAndSet(false, true)) {
+            try {
+                this.executor.execute(() -> {
+                    try {
+                        drainColumnQueue(level, epoch);
+                    } finally {
+                        this.processing.set(false);
+                    }
+                });
+            } catch (Exception e) {
+                this.processing.set(false);
             }
-        } else {
-            drainColumnQueue(level);
         }
     }
 
-    private void drainColumnQueue(ClientLevel level) {
+    private void drainColumnQueue(ClientLevel level, int epoch) {
         var factory = PalettedContainerFactory.create(level.registryAccess());
 
         VoxelColumnS2CPayload payload;
-        while (!Thread.currentThread().isInterrupted() && (payload = this.columnQueue.poll()) != null) {
+        while (epoch == this.sessionEpoch && (payload = this.columnQueue.poll()) != null) {
             this.queueSize.decrementAndGet();
             if (!level.dimension().equals(payload.dimension())) continue;
 
@@ -152,20 +144,11 @@ class ClientColumnProcessor {
         }
     }
 
+    /** End the current session: any in-flight drain self-terminates at its next epoch check. */
     void shutdown() {
-        this.shuttingDown = true;
-        var old = this.executor;
-        old.shutdownNow();
+        this.sessionEpoch++;
         this.columnQueue.clear();
         this.queueSize.set(0);
-        try {
-            old.awaitTermination(2, TimeUnit.SECONDS);
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
-        this.processing.set(false);
-        this.executor = createExecutor();
-        this.shuttingDown = false;
     }
 
     int getQueuedCount() { return this.queueSize.get(); }

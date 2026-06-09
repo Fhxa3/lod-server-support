@@ -12,7 +12,6 @@ public class LSSClientConfig extends JsonConfig {
 
     public boolean receiveServerLods = true;
     public int lodDistanceChunks = 0;
-    public boolean offThreadSectionProcessing = true;
 
     @Override
     protected String getFileName() {

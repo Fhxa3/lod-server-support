@@ -134,7 +134,7 @@ LOD rendering mods register a `VoxelColumnConsumer` via `LSSApi.registerColumnCo
 
 **Fabric:** `JsonConfig` base class with GSON. Two configs auto-created in `config/`:
 - `lss-server-config.json` — bandwidth caps, LOD distance, disk reader threads, send queue limits, generation toggle, dirty broadcast interval, concurrency limits
-- `lss-client-config.json` — receive toggle (`receiveServerLods`), distance override (`lodDistanceChunks`), off-thread section processing toggle (`offThreadSectionProcessing`)
+- `lss-client-config.json` — receive toggle (`receiveServerLods`), distance override (`lodDistanceChunks`)
 
 **Paper:** `PaperConfig` with GSON. Config at `plugins/LodServerSupport/lss-server-config.json` — same fields and defaults as Fabric server config, plus an `updateEvents` list of Bukkit event class names for dirty chunk detection.
 

@@ -100,6 +100,11 @@ tasks.withType(JavaCompile).configureEach {
 jar {
     inputs.property "archivesName", project.base.archivesName
 
+    // The benchmark harness is a dev-only tool (-Dlss.benchmark); keep it out of release
+    // jars. Dev/benchmark runs execute from class directories, so they are unaffected,
+    // and BenchmarkBridge no-ops when the classes are absent.
+    exclude 'dev/vox/lss/benchmark/**'
+
     from(rootProject.file("LICENSE")) {
         rename { "${it}_${inputs.properties.archivesName}" }
     }
