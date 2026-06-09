@@ -18,8 +18,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class ChunkGenerationService {
     // flags=2 (LOADING) makes the chunk load/generate; timeout=0 means we manage lifetime ourselves
@@ -43,7 +41,6 @@ public class ChunkGenerationService {
 
     private final LinkedHashMap<PendingGenerationKey, PendingGeneration> active = new LinkedHashMap<>();
     private final Map<UUID, Integer> perPlayerActiveCount = new HashMap<>();
-    private final ConcurrentHashMap<UUID, ConcurrentLinkedQueue<ChunkDiskReader.ReadResult>> playerResults = new ConcurrentHashMap<>();
 
     private final int maxConcurrent;
     private final int maxPerPlayerActive;
@@ -95,8 +92,8 @@ public class ChunkGenerationService {
 
     /**
      * Tick the generation service. Extracts primitives for completed chunks (main thread safe),
-     * returns GenerationReadyData for the processing thread to voxelize off-thread.
-     * Timeouts produce empty results directly in the player result queue.
+     * returns one GenerationReadyData per callback for the processing thread — successes carry
+     * column data; timeouts and extraction errors carry {@code columnData == null}.
      */
     public List<TickSnapshot.GenerationReadyData> tick() {
         if (this.active.isEmpty()) return List.of();
@@ -110,11 +107,8 @@ public class ChunkGenerationService {
             if (gen.ticksWaiting > this.timeoutTicks) {
                 LSSLogger.debug("Generation timeout for chunk " + gen.pos.x() + "," + gen.pos.z()
                         + " after " + gen.ticksWaiting + " ticks (" + gen.callbacks.size() + " callbacks)");
-                for (var cb : gen.callbacks) {
-                    this.addResult(cb.playerUuid, ChunkDiskReader.emptyResult(
-                            cb.playerUuid, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
-                    decrementCount(this.perPlayerActiveCount, cb.playerUuid);
-                }
+                if (ready == null) ready = new ArrayList<>();
+                addFailures(ready, gen);
                 gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
                 iter.remove();
                 this.totalTimeouts++;
@@ -123,27 +117,24 @@ public class ChunkGenerationService {
 
             LevelChunk chunk = gen.level.getChunkSource().getChunkNow(gen.pos.x(), gen.pos.z());
             if (chunk != null) {
+                if (ready == null) ready = new ArrayList<>();
                 try {
                     long columnTimestamp = LSSConstants.epochSeconds();
                     LoadedColumnData columnData = SectionSerializer.serializeColumn(
                             gen.level, chunk, gen.pos.x(), gen.pos.z());
+                    String dimension = gen.level.dimension().identifier().toString();
 
                     // One GenerationReadyData per callback — processing thread will voxelize
                     for (var cb : gen.callbacks) {
-                        if (ready == null) ready = new ArrayList<>();
                         ready.add(new TickSnapshot.GenerationReadyData(
-                                cb.playerUuid, columnData, columnTimestamp,
-                                cb.submissionOrder));
+                                cb.playerUuid, gen.pos.x(), gen.pos.z(), dimension,
+                                columnData, columnTimestamp, cb.submissionOrder));
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
                     this.totalCompleted++;
                 } catch (Throwable t) {
                     LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), t);
-                    for (var cb : gen.callbacks) {
-                        this.addResult(cb.playerUuid, ChunkDiskReader.emptyResult(
-                                cb.playerUuid, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
-                        decrementCount(this.perPlayerActiveCount, cb.playerUuid);
-                    }
+                    addFailures(ready, gen);
                 } finally {
                     // Always release the force-load ticket and drop the active entry — even on an
                     // Error during serialization — or the chunk stays force-loaded forever and the
@@ -156,27 +147,18 @@ public class ChunkGenerationService {
         return ready != null ? ready : List.of();
     }
 
-    void registerPlayer(UUID playerUuid) {
-        this.playerResults.computeIfAbsent(playerUuid, k -> new ConcurrentLinkedQueue<>());
-    }
-
-    void addResult(UUID playerUuid, ChunkDiskReader.ReadResult result) {
-        var queue = this.playerResults.get(playerUuid);
-        if (queue != null) {
-            queue.add(result);
+    /** Add a failure outcome (columnData == null) for every callback of the entry. */
+    private void addFailures(List<TickSnapshot.GenerationReadyData> ready, PendingGeneration gen) {
+        String dimension = gen.level.dimension().identifier().toString();
+        for (var cb : gen.callbacks) {
+            ready.add(new TickSnapshot.GenerationReadyData(
+                    cb.playerUuid, gen.pos.x(), gen.pos.z(), dimension,
+                    null, 0L, cb.submissionOrder));
+            decrementCount(this.perPlayerActiveCount, cb.playerUuid);
         }
     }
 
-    public ConcurrentLinkedQueue<ChunkDiskReader.ReadResult> getPlayerQueue(UUID playerUuid) {
-        return this.playerResults.get(playerUuid);
-    }
-
-    public void removePlayerResults(UUID playerUuid) {
-        this.playerResults.remove(playerUuid);
-    }
-
     public void removePlayer(UUID playerUuid) {
-        this.removePlayerResults(playerUuid);
         this.perPlayerActiveCount.remove(playerUuid);
 
         // Clean up active entries
@@ -197,7 +179,6 @@ public class ChunkGenerationService {
         }
         this.active.clear();
         this.perPlayerActiveCount.clear();
-        this.playerResults.clear();
     }
 
     public String getDiagnostics() {

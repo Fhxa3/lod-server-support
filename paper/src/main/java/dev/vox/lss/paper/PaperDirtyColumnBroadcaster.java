@@ -76,7 +76,7 @@ class PaperDirtyColumnBroadcaster {
                 if (count > 0) {
                     long[] result = new long[count];
                     System.arraycopy(this.positionFilterBuffer, 0, result, 0, count);
-                    state.clearDiskReadDoneForPositions(result);
+                    this.offThreadProcessor.clearDiskReadDone(player.getUUID(), result);
                     try {
                         PaperPayloadHandler.sendDirtyColumns(player.getBukkitEntity(), result);
                     } catch (Exception e) {

@@ -12,7 +12,7 @@ import java.util.UUID;
 /**
  * Routes incoming chunk requests through the resolution pipeline for all players:
  * duplicate check → queue-full check → timestamp check → loaded-probe check →
- * concurrency acquire (or rate-limit bounce) → disk/generation submit.
+ * slot admission (or rate-limit bounce) → disk/generation submit.
  *
  * @param <PS> the platform-specific player state type
  */
@@ -52,8 +52,7 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
                   DiskReadSubmitter diskReadSubmitter,
                   LoadedColumnSerializer<PS> loadedSerializer,
                   long cycleNow) {
-        for (var entry : snapshot.players().entrySet()) {
-            if (entry.getValue().dimensionChanged()) continue;
+        for (var entry : snapshot.playerDimensions().entrySet()) {
             var state = players.get(entry.getKey());
             if (state == null) continue;
             if (!state.supportsVoxelColumns()) continue;
@@ -63,13 +62,11 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
         }
     }
 
-    private void processIncomingRequests(PS state, UUID playerUuid,
-                                          TickSnapshot.PlayerTickData playerData,
+    private void processIncomingRequests(PS state, UUID playerUuid, String dimension,
                                           TickSnapshot snapshot,
                                           DiskReadSubmitter diskReadSubmitter,
                                           LoadedColumnSerializer<PS> loadedSerializer,
                                           long cycleNow) {
-        String dimension = playerData.dimension();
         var loadedProbes = snapshot.loadedChunkProbes().getOrDefault(playerUuid, Long2ObjectMaps.emptyMap());
 
         IncomingRequest req;
@@ -80,14 +77,11 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
 
             if (resolvedFromTimestamp(state, playerUuid, req, packed, dimension)) continue;
 
-            // Check loaded probes before acquiring concurrency — in-memory hits don't need a disk/gen slot
+            // Check loaded probes before admission — in-memory hits don't need a disk/gen slot
             if (resolvedFromLoadedProbe(state, playerUuid, req, packed, loadedProbes, dimension, loadedSerializer, cycleNow)) continue;
 
             RequestType type = req.clientTimestamp() == 0 ? RequestType.GENERATION : RequestType.SYNC;
-            var limiter = tryAcquireOrRateLimit(state, playerUuid, req, packed, type, dimension);
-            if (limiter == null) continue;
-
-            submitToDiskOrGeneration(state, playerUuid, req, packed, dimension, type, limiter, diskReadSubmitter);
+            submitToDiskOrGeneration(state, playerUuid, req, packed, dimension, type, diskReadSubmitter);
         }
     }
 
@@ -112,26 +106,6 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
             return true;
         }
         return false;
-    }
-
-    /**
-     * Try to acquire a concurrency slot. Returns the limiter on success; on a full limiter,
-     * sends RateLimited (the client retries on its next scan) and returns null.
-     */
-    private ConcurrencyLimiter tryAcquireOrRateLimit(PS state, UUID playerUuid, IncomingRequest req,
-                                                      long packed, RequestType type, String dimension) {
-        var limiter = state.getRateLimiters().forRequest(type, this.diskReadingAvailable);
-        if (limiter.tryAcquire()) {
-            return limiter;
-        }
-
-        this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, packed));
-        this.ctx.diagnostics().incrementRateLimited(type);
-        if (LSSLogger.isDebugEnabled()) {
-            LSSLogger.debug("Rate-limited " + playerUuid + " (" + type + "): concurrency full"
-                    + " for chunk [" + req.cx() + ", " + req.cz() + "] in " + dimension);
-        }
-        return null;
     }
 
     /** Returns true if resolved from an in-memory loaded chunk probe. */
@@ -171,37 +145,52 @@ class IncomingRequestRouter<PS extends PlayerStateAccess> {
         return false;
     }
 
-    /** Submit to disk reader (disk-first for both SYNC and GENERATION when disk available) or generation service. */
+    /** Admit into the slot for the route and submit to disk reader (disk-first for both SYNC and
+     *  GENERATION when disk is available) or to the generation service. A full slot bounces the
+     *  request with RateLimited; the client retries on a later scan. */
     private void submitToDiskOrGeneration(PS state, UUID playerUuid, IncomingRequest req,
                                            long packed, String dimension, RequestType type,
-                                           ConcurrencyLimiter limiter,
                                            DiskReadSubmitter diskReadSubmitter) {
-        long order = this.ctx.sequence().next();
-
         if (type == RequestType.SYNC || this.diskReadingAvailable) {
             // Route through disk reader (with cross-player dedup)
-            state.addPendingRequest(new PendingRequest(req.cx(), req.cz(), type));
+            if (!state.tryAdmit(new PendingRequest(req.cx(), req.cz(), type, SlotType.SYNC_ON_LOAD))) {
+                rateLimit(state, playerUuid, req, packed, type, dimension);
+                return;
+            }
+            long order = this.ctx.sequence().next();
             boolean attached = this.dedupTracker.tryAttachOrCreate(packed, dimension, playerUuid, order);
             if (!attached && !diskReadSubmitter.submit(playerUuid, dimension, req.cx(), req.cz(), order)) {
                 // Submit was a no-op (e.g. the dimension's level isn't registered yet). Unwind the
-                // pending entry, dedup group, and permit we just took so they aren't leaked, and
-                // tell the client we couldn't serve this position so it re-requests later.
+                // pending entry (which frees the slot) and the dedup group so they aren't leaked,
+                // and tell the client we couldn't serve this position so it re-requests later.
                 this.dedupTracker.removeGroup(packed, dimension);
                 state.removePendingByPosition(req.cx(), req.cz());
-                limiter.release();
                 this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed));
                 return;
             }
             this.ctx.diagnostics().incrementDiskQueued();
-        } else if (type == RequestType.GENERATION && this.generationAvailable) {
-            // No disk reader — direct generation
-            state.addPendingRequest(new PendingRequest(req.cx(), req.cz(), type));
+        } else if (this.generationAvailable) {
+            // No disk reader — direct generation (type is GENERATION here by the branch above)
+            if (!state.tryAdmit(new PendingRequest(req.cx(), req.cz(), type, SlotType.GENERATION))) {
+                rateLimit(state, playerUuid, req, packed, type, dimension);
+                return;
+            }
             this.ctx.generationTicketRequests().add(
-                    new OffThreadProcessor.GenerationTicketRequest(playerUuid, req.cx(), req.cz(), order));
+                    new OffThreadProcessor.GenerationTicketRequest(playerUuid, req.cx(), req.cz(),
+                            this.ctx.sequence().next()));
         } else {
             // No disk reader AND no generation — can't serve
             this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed));
-            limiter.release();
+        }
+    }
+
+    private void rateLimit(PS state, UUID playerUuid, IncomingRequest req, long packed,
+                            RequestType type, String dimension) {
+        this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, packed));
+        this.ctx.diagnostics().incrementRateLimited(type);
+        if (LSSLogger.isDebugEnabled()) {
+            LSSLogger.debug("Rate-limited " + playerUuid + " (" + type + "): slot full"
+                    + " for chunk [" + req.cx() + ", " + req.cz() + "] in " + dimension);
         }
     }
 }

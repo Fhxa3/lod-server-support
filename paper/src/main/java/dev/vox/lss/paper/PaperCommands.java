@@ -60,8 +60,8 @@ public class PaperCommands implements CommandExecutor, TabCompleter {
                     state.hasCompletedHandshake() ? "yes" : "no",
                     state.getTotalSectionsSent(),
                     DiagnosticsFormatter.formatBytes(state.getTotalBytesSent()),
-                    state.getPendingSyncCount(),
-                    state.getPendingGenerationCount(),
+                    state.getHeldSyncSlots(),
+                    state.getHeldGenSlots(),
                     state.getSendQueueSize(),
                     state.getTotalRequestsReceived()
             );
@@ -88,7 +88,7 @@ public class PaperCommands implements CommandExecutor, TabCompleter {
             players.add(new DiagnosticsFormatter.PlayerDiag(
                     state.getPlayer().getName().getString(),
                     state.getSendQueueSize(), config.sendQueueLimitPerPlayer,
-                    state.getPendingSyncCount(), state.getPendingGenerationCount(),
+                    state.getHeldSyncSlots(), state.getHeldGenSlots(),
                     state.getTotalSectionsSent(), state.getTotalBytesSent()
             ));
         }

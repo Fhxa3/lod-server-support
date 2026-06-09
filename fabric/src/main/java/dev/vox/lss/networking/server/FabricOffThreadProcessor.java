@@ -21,7 +21,6 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestState, ChunkDiskReader.ReadResult> {
     private final ChunkDiskReader diskReader;
-    private final ChunkGenerationService generationService;
 
     // Stored references for disk read submission. Grows but never prunes — acceptable because
     // vanilla only has 3 permanent dimensions, and the map is cleared on shutdown.
@@ -32,11 +31,10 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
 
     public FabricOffThreadProcessor(Map<UUID, PlayerRequestState> players,
                                      ChunkDiskReader diskReader,
-                                     ChunkGenerationService generationService,
+                                     boolean generationAvailable,
                                      Path dataDir, int perDimensionTimestampCacheSizeMB) {
-        super(players, diskReader != null, generationService != null, dataDir, perDimensionTimestampCacheSizeMB);
+        super(players, diskReader != null, generationAvailable, dataDir, perDimensionTimestampCacheSizeMB);
         this.diskReader = diskReader;
-        this.generationService = generationService;
     }
 
     /** Register a dimension context for disk read submission (called from main thread). */
@@ -48,14 +46,6 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
     protected ChunkDiskReader.ReadResult pollDiskResult(PlayerRequestState state) {
         if (this.diskReader == null) return null;
         var queue = this.diskReader.getPlayerQueue(state.getPlayerUUID());
-        if (queue == null) return null;
-        return queue.poll();
-    }
-
-    @Override
-    protected ChunkDiskReader.ReadResult pollGenerationResult(PlayerRequestState state) {
-        if (this.generationService == null) return null;
-        var queue = this.generationService.getPlayerQueue(state.getPlayerUUID());
         if (queue == null) return null;
         return queue.poll();
     }

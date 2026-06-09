@@ -17,6 +17,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * Contains all shared fields and logic; platform subclasses provide the
  * {@code QueuedPayload} type and any MC-dependent behavior.
  *
+ * <p>Admission is derived: a request occupies its {@link SlotType} slot exactly while its
+ * {@link PendingRequest} entry exists in the pending map, so the slot counters cannot drift
+ * from the map (the structural fix for the permit-leak bugs of earlier review rounds).
+ *
  * @param <Q> the queued payload type (must be {@link Comparable} for priority queue ordering)
  */
 public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implements PlayerStateAccess {
@@ -25,7 +29,7 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     private volatile boolean hasHandshake = false;
     private volatile int capabilities = 0;
 
-    // Bound on the per-player incoming queues: a flooding client must not grow them without
+    // Bound on the per-player incoming queue: a flooding client must not grow it without
     // limit (heap OOM / main-thread DoS). Dropped entries are harmless — the client re-requests
     // un-acked positions on its next scan. Counts are approximate (best-effort under races).
     private static final int MAX_INCOMING_QUEUE = 16384;
@@ -33,8 +37,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     // Network handler → processing thread (thread-safe intermediaries)
     private final ConcurrentLinkedQueue<IncomingRequest> incomingRequests = new ConcurrentLinkedQueue<>();
     private final AtomicInteger incomingRequestCount = new AtomicInteger();
-    // Main thread → processing thread (dirty column clear requests)
-    private final ConcurrentLinkedQueue<long[]> pendingDirtyClear = new ConcurrentLinkedQueue<>();
     // Processing thread → main thread (thread-safe output)
     private final ConcurrentLinkedQueue<Q> readyPayloads = new ConcurrentLinkedQueue<>();
 
@@ -43,17 +45,21 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     private final PriorityQueue<Q> sendQueue = new PriorityQueue<>();
     private final LongOpenHashSet diskReadDone = new LongOpenHashSet();
     private final PlayerBandwidthTracker bandwidth = new PlayerBandwidthTracker();
-    private final RateLimiterSet rateLimiters;
     private final AtomicLong totalRequestsReceived = new AtomicLong();
     // Single-writer (main thread) — volatile for cross-thread visibility to processing thread
     private volatile int sendQueueSizeSnapshot = 0;
-    // Single-writer (processing thread only) — volatile sufficient for cross-thread visibility
-    private volatile int pendingSyncCount = 0;
-    private volatile int pendingGenerationCount = 0;
+
+    // Admission slots: caps are immutable; held counts are derived from the pending map
+    // (single-writer: processing thread; volatile for /lsslod command reads).
+    private final int syncSlotCap;
+    private final int genSlotCap;
+    private volatile int heldSyncSlots = 0;
+    private volatile int heldGenSlots = 0;
 
     protected AbstractPlayerRequestState(UUID playerUuid, int syncConcurrency, int genConcurrency) {
         this.playerUuid = playerUuid;
-        this.rateLimiters = new RateLimiterSet(syncConcurrency, genConcurrency);
+        this.syncSlotCap = syncConcurrency;
+        this.genSlotCap = genConcurrency;
     }
 
     // ---- Handshake / Capability ----
@@ -111,54 +117,6 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         this.bandwidth.recordSend(bytes);
     }
 
-    /**
-     * Drain dirty column clear requests from main thread.
-     * Called by the processing thread at the start of each cycle.
-     */
-    @Override
-    public void drainDirtyClearRequests() {
-        long[] dirtyPositions;
-        while ((dirtyPositions = this.pendingDirtyClear.poll()) != null) {
-            for (long pos : dirtyPositions) {
-                getDiskReadDonePositions().remove(pos);
-            }
-        }
-    }
-
-    /** Queue positions for clearing from diskReadDone (called from main thread). */
-    public void clearDiskReadDoneForPositions(long[] positions) {
-        this.pendingDirtyClear.add(positions);
-    }
-
-    /**
-     * Clear shared concurrent queues on dimension change.
-     * Subclasses should call this from their own onDimensionChange() and may add
-     * additional platform-specific clearing.
-     */
-    protected void onDimensionChangeBase() {
-        this.incomingRequests.clear();
-        this.incomingRequestCount.set(0);
-        this.readyPayloads.clear();
-        this.sendQueue.clear();
-        this.pendingDirtyClear.clear();
-    }
-
-    /**
-     * Clear processing-thread-owned state on dimension change.
-     */
-    public void clearProcessingState() {
-        this.pendingByPosition.clear();
-        this.diskReadDone.clear();
-        this.pendingSyncCount = 0;
-        this.pendingGenerationCount = 0;
-        // A dimension change abandons all in-flight requests (pending cleared above, and the disk/
-        // generation result queues are discarded by cleanupPlayerServices), so reset the
-        // concurrency limiters. Otherwise the permits held by those discarded requests leak and
-        // the player's effective concurrency erodes across repeated dimension changes.
-        this.rateLimiters.syncOnLoad().reset();
-        this.rateLimiters.generation().reset();
-    }
-
     // ---- PlayerStateAccess per-request methods ----
 
     @Override
@@ -169,13 +127,21 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     }
 
     @Override
-    public void addPendingRequest(PendingRequest pending) {
+    public boolean tryAdmit(PendingRequest pending) {
+        int cap = pending.heldSlot() == SlotType.SYNC_ON_LOAD ? this.syncSlotCap : this.genSlotCap;
+        int held = pending.heldSlot() == SlotType.SYNC_ON_LOAD ? this.heldSyncSlots : this.heldGenSlots;
+        if (held >= cap) return false;
+        addPendingRequest(pending);
+        return true;
+    }
+
+    private void addPendingRequest(PendingRequest pending) {
         long packed = PositionUtil.packPosition(pending.cx(), pending.cz());
         var replaced = this.pendingByPosition.put(packed, pending);
         if (replaced != null) {
-            decrementPendingCounter(replaced.type());
+            adjustSlot(replaced.heldSlot(), -1);
         }
-        incrementPendingCounter(pending.type());
+        adjustSlot(pending.heldSlot(), +1);
     }
 
     @Override
@@ -183,7 +149,7 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         long packed = PositionUtil.packPosition(cx, cz);
         var pending = this.pendingByPosition.remove(packed);
         if (pending != null) {
-            decrementPendingCounter(pending.type());
+            adjustSlot(pending.heldSlot(), -1);
         }
         return pending;
     }
@@ -193,14 +159,9 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         return this.pendingByPosition.containsKey(PositionUtil.packPosition(cx, cz));
     }
 
-    private void incrementPendingCounter(RequestType type) {
-        if (type == RequestType.SYNC) this.pendingSyncCount++;
-        else this.pendingGenerationCount++;
-    }
-
-    private void decrementPendingCounter(RequestType type) {
-        if (type == RequestType.SYNC) this.pendingSyncCount--;
-        else this.pendingGenerationCount--;
+    private void adjustSlot(SlotType slot, int delta) {
+        if (slot == SlotType.SYNC_ON_LOAD) this.heldSyncSlots += delta;
+        else this.heldGenSlots += delta;
     }
 
     public boolean hasDiskReadDone(int cx, int cz) {
@@ -209,6 +170,14 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
 
     public void markDiskReadDone(int cx, int cz) {
         this.diskReadDone.add(PositionUtil.packPosition(cx, cz));
+    }
+
+    /** Clear dirty positions from diskReadDone (processing thread, from dirty-clear events). */
+    @Override
+    public void clearDiskReadDone(long[] positions) {
+        for (long pos : positions) {
+            this.diskReadDone.remove(pos);
+        }
     }
 
     // ---- Accessors for concurrent queues (used by sibling classes) ----
@@ -221,21 +190,17 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         this.readyPayloads.add(payload);
     }
 
-    protected LongOpenHashSet getDiskReadDonePositions() {
-        return this.diskReadDone;
-    }
-
     // ---- Getters ----
 
-    @Override
-    public RateLimiterSet getRateLimiters() { return this.rateLimiters; }
     @Override
     public UUID getPlayerUUID() { return this.playerUuid; }
     public PriorityQueue<Q> getSendQueue() { return this.sendQueue; }
     /** Returns a volatile snapshot of the send queue size, safe for cross-thread reads. */
     public int getSendQueueSize() { return this.sendQueueSizeSnapshot; }
-    public int getPendingSyncCount() { return this.pendingSyncCount; }
-    public int getPendingGenerationCount() { return this.pendingGenerationCount; }
+    public int getHeldSyncSlots() { return this.heldSyncSlots; }
+    public int getHeldGenSlots() { return this.heldGenSlots; }
+    public int getSyncSlotCap() { return this.syncSlotCap; }
+    public int getGenSlotCap() { return this.genSlotCap; }
     public long getTotalSectionsSent() { return this.bandwidth.getTotalSectionsSent(); }
     public long getTotalBytesSent() { return this.bandwidth.getTotalBytesSent(); }
     public long getTotalRequestsReceived() { return this.totalRequestsReceived.get(); }

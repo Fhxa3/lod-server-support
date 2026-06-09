@@ -19,8 +19,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Manages chunk generation requests for the Paper plugin.
@@ -44,8 +42,8 @@ public class PaperChunkGenerationService {
 
     private final LinkedHashMap<PendingGenerationKey, ActiveGeneration> active = new LinkedHashMap<>();
     private final Map<UUID, Integer> perPlayerActiveCount = new HashMap<>();
-    private final ConcurrentHashMap<UUID, ConcurrentLinkedQueue<PaperChunkDiskReader.SimpleReadResult>> playerResults = new ConcurrentHashMap<>();
-    private final ConcurrentLinkedQueue<TickSnapshot.GenerationReadyData> generationReadyQueue = new ConcurrentLinkedQueue<>();
+    // Main-thread-owned (onChunkReady is scheduled to the main thread via runTask; tick() swaps it out)
+    private List<TickSnapshot.GenerationReadyData> mainReady = new ArrayList<>();
 
     private final Plugin plugin;
     private final int maxConcurrent;
@@ -134,33 +132,35 @@ public class PaperChunkGenerationService {
                     long columnTimestamp = LSSConstants.epochSeconds();
                     LoadedColumnData columnData = PaperSectionSerializer.serializeColumn(
                             level, nmsChunk, cx, cz);
+                    String dimension = key.dimension().identifier().toString();
 
                     for (var cb : gen.callbacks) {
-                        this.generationReadyQueue.add(new TickSnapshot.GenerationReadyData(
-                                cb.playerUuid, columnData, columnTimestamp,
-                                cb.submissionOrder));
+                        this.mainReady.add(new TickSnapshot.GenerationReadyData(
+                                cb.playerUuid, cx, cz, dimension,
+                                columnData, columnTimestamp, cb.submissionOrder));
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
                     this.totalCompleted++;
                 } else {
                     LSSLogger.warn("Chunk at " + cx + "," + cz + " was null after async load completed");
-                    emptyResultForCallbacks(gen.callbacks, cx, cz, this.perPlayerActiveCount);
+                    addFailures(gen.callbacks, key, cx, cz);
                 }
             } catch (Exception e) {
                 LSSLogger.error("Failed to extract primitives for generated chunk at " + cx + ", " + cz, e);
-                emptyResultForCallbacks(gen.callbacks, cx, cz, this.perPlayerActiveCount);
+                addFailures(gen.callbacks, key, cx, cz);
             }
         } else {
-            emptyResultForCallbacks(gen.callbacks, cx, cz, this.perPlayerActiveCount);
+            addFailures(gen.callbacks, key, cx, cz);
         }
     }
 
-    private void emptyResultForCallbacks(List<GenerationCallback> callbacks, int cx, int cz,
-                                          Map<UUID, Integer> countMap) {
+    /** Add a failure outcome (columnData == null) for every callback. Main thread only. */
+    private void addFailures(List<GenerationCallback> callbacks, PendingGenerationKey key, int cx, int cz) {
+        String dimension = key.dimension().identifier().toString();
         for (var cb : callbacks) {
-            this.addResult(cb.playerUuid, PaperChunkDiskReader.emptyResult(
-                    cb.playerUuid, cx, cz, cb.submissionOrder));
-            decrementCount(countMap, cb.playerUuid);
+            this.mainReady.add(new TickSnapshot.GenerationReadyData(
+                    cb.playerUuid, cx, cz, dimension, null, 0L, cb.submissionOrder));
+            decrementCount(this.perPlayerActiveCount, cb.playerUuid);
         }
     }
 
@@ -170,14 +170,10 @@ public class PaperChunkGenerationService {
     public List<TickSnapshot.GenerationReadyData> tick() {
         this.tickActiveTimeouts();
 
-        // Drain generation-ready data from async callbacks
-        List<TickSnapshot.GenerationReadyData> ready = null;
-        TickSnapshot.GenerationReadyData grd;
-        while ((grd = this.generationReadyQueue.poll()) != null) {
-            if (ready == null) ready = new ArrayList<>();
-            ready.add(grd);
-        }
-        return ready != null ? ready : List.of();
+        if (this.mainReady.isEmpty()) return List.of();
+        var ready = this.mainReady;
+        this.mainReady = new ArrayList<>();
+        return ready;
     }
 
     /**
@@ -193,36 +189,14 @@ public class PaperChunkGenerationService {
             gen.ticksWaiting++;
 
             if (gen.ticksWaiting > this.timeoutTicks) {
-                emptyResultForCallbacks(gen.callbacks, entry.getKey().cx, entry.getKey().cz,
-                        this.perPlayerActiveCount);
+                addFailures(gen.callbacks, entry.getKey(), entry.getKey().cx, entry.getKey().cz);
                 iter.remove();
                 this.totalTimeouts++;
             }
         }
     }
 
-    void registerPlayer(UUID playerUuid) {
-        this.playerResults.computeIfAbsent(playerUuid, k -> new ConcurrentLinkedQueue<>());
-    }
-
-    void addResult(UUID playerUuid, PaperChunkDiskReader.SimpleReadResult result) {
-        var queue = this.playerResults.get(playerUuid);
-        if (queue != null) {
-            queue.add(result);
-        }
-    }
-
-    public ConcurrentLinkedQueue<PaperChunkDiskReader.SimpleReadResult> getPlayerQueue(UUID playerUuid) {
-        return this.playerResults.get(playerUuid);
-    }
-
-    public void removePlayerResults(UUID playerUuid) {
-        this.playerResults.remove(playerUuid);
-    }
-
     public void removePlayer(UUID playerUuid) {
-        this.removePlayerResults(playerUuid);
-
         // Clean active callbacks first — if onChunkReady fires between these steps,
         // decrementCount needs perPlayerActiveCount to still exist
         var activeIter = this.active.entrySet().iterator();
@@ -242,7 +216,7 @@ public class PaperChunkGenerationService {
         // Active async futures will complete but onChunkReady will find empty active map.
         this.active.clear();
         this.perPlayerActiveCount.clear();
-        this.playerResults.clear();
+        this.mainReady.clear();
     }
 
     public String getDiagnostics() {

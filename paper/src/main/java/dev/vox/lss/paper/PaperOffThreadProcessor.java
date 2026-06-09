@@ -16,7 +16,6 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerRequestState, PaperChunkDiskReader.SimpleReadResult> {
     private final PaperChunkDiskReader diskReader;
-    private final PaperChunkGenerationService generationService;
 
     // Stored dimension strings for disk read submission. Grows but never prunes — acceptable because
     // vanilla only has 3 permanent dimensions, and the map is cleared on shutdown.
@@ -24,12 +23,11 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
 
     public PaperOffThreadProcessor(Map<UUID, PaperPlayerRequestState> players,
                                     PaperChunkDiskReader diskReader,
-                                    PaperChunkGenerationService generationService,
+                                    boolean generationAvailable,
                                     Path dataDir, int perDimensionTimestampCacheSizeMB) {
         super(players,
-                diskReader != null, generationService != null, dataDir, perDimensionTimestampCacheSizeMB);
+                diskReader != null, generationAvailable, dataDir, perDimensionTimestampCacheSizeMB);
         this.diskReader = diskReader;
-        this.generationService = generationService;
     }
 
     public void updateDimensionContext(String dimension, ServerLevel level) {
@@ -40,14 +38,6 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
     protected PaperChunkDiskReader.SimpleReadResult pollDiskResult(PaperPlayerRequestState state) {
         if (this.diskReader == null) return null;
         var queue = this.diskReader.getPlayerQueue(state.getPlayerUUID());
-        if (queue == null) return null;
-        return queue.poll();
-    }
-
-    @Override
-    protected PaperChunkDiskReader.SimpleReadResult pollGenerationResult(PaperPlayerRequestState state) {
-        if (this.generationService == null) return null;
-        var queue = this.generationService.getPlayerQueue(state.getPlayerUUID());
         if (queue == null) return null;
         return queue.poll();
     }

@@ -32,13 +32,6 @@ public class PlayerRequestState extends AbstractPlayerRequestState<PlayerRequest
         enqueueIncomingRequest(new IncomingRequest(cx, cz, clientTimestamp));
     }
 
-    /**
-     * Clear concurrent queues on dimension change (called from main thread).
-     */
-    public void onDimensionChange() {
-        onDimensionChangeBase();
-    }
-
     public void updatePlayer(ServerPlayer newPlayer) {
         this.player = newPlayer;
     }

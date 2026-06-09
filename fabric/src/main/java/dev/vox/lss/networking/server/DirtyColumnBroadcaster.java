@@ -77,7 +77,7 @@ class DirtyColumnBroadcaster {
                 if (count > 0) {
                     long[] result = new long[count];
                     System.arraycopy(this.positionFilterBuffer, 0, result, 0, count);
-                    state.clearDiskReadDoneForPositions(result);
+                    this.offThreadProcessor.clearDiskReadDone(player.getUUID(), result);
                     try {
                         ServerPlayNetworking.send(player, new DirtyColumnsS2CPayload(result));
                     } catch (Exception e) {

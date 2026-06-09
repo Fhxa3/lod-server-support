@@ -52,9 +52,6 @@ public class PaperRequestProcessingService {
 
     private final TickDiagnostics diag = new TickDiagnostics();
 
-    // Reused per-tick maps (single-threaded on server thread)
-    private final Map<UUID, TickSnapshot.PlayerTickData> reusablePlayerTickData = new HashMap<>();
-    private final Map<UUID, Long2ObjectMap<LoadedColumnData>> reusableLoadedChunkProbes = new HashMap<>();
     private final SendActionBatcher sendActionBatcher = new SendActionBatcher();
 
     private static final int DIAG_LOG_INTERVAL_TICKS = 100;
@@ -75,7 +72,7 @@ public class PaperRequestProcessingService {
         var dataDir = server.getWorldPath(LevelResource.ROOT).resolve("data");
         this.offThreadProcessor = new PaperOffThreadProcessor(
                 this.players,
-                this.diskReader, this.generationService, dataDir,
+                this.diskReader, this.generationService != null, dataDir,
                 config.perDimensionTimestampCacheSizeMB);
         this.offThreadProcessor.start();
 
@@ -92,7 +89,6 @@ public class PaperRequestProcessingService {
         var state = this.players.computeIfAbsent(player.getUUID(), uuid -> new PaperPlayerRequestState(
                 player, this.config.syncOnLoadConcurrencyLimitPerPlayer, this.config.generationConcurrencyLimitPerPlayer));
         this.diskReader.registerPlayer(player.getUUID());
-        if (this.generationService != null) this.generationService.registerPlayer(player.getUUID());
         state.setCapabilities(capabilities);
         state.markHandshakeComplete();
         return state;
@@ -156,7 +152,7 @@ public class PaperRequestProcessingService {
     }
 
     private record LifecycleResult(
-            Map<UUID, TickSnapshot.PlayerTickData> playerTickData,
+            Map<UUID, String> playerDimensions,
             Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes,
             int activeCount,
             List<UUID> toRemove) {
@@ -164,10 +160,10 @@ public class PaperRequestProcessingService {
 
     private LifecycleResult processPlayerLifecycle(
             List<TickSnapshot.GenerationReadyData> generationReady) {
-        this.reusablePlayerTickData.clear();
-        this.reusableLoadedChunkProbes.clear();
-        Map<UUID, TickSnapshot.PlayerTickData> playerTickData = this.reusablePlayerTickData;
-        Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes = this.reusableLoadedChunkProbes;
+        // Allocated fresh each tick: the snapshot owns these maps after postSnapshot, so the
+        // processing thread can iterate them without racing the next tick's lifecycle pass.
+        Map<UUID, String> playerDimensions = new HashMap<>();
+        Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes = new HashMap<>();
 
         // Build per-player set of generation-ready packed positions to skip in probeLoadedChunks
         Map<UUID, LongOpenHashSet> genReadyPositions = null;
@@ -189,7 +185,6 @@ public class PaperRequestProcessingService {
             this.diag.updateQueuePeak(state.getSendQueueSize());
 
             boolean removed = false;
-            boolean dimensionChanged = false;
 
             if (state.getPlayer().isRemoved()) {
                 var current = this.server.getPlayerList().getPlayer(state.getPlayer().getUUID());
@@ -203,18 +198,20 @@ public class PaperRequestProcessingService {
                 }
             }
 
-            if (!removed && state.checkDimensionChange()) {
-                state.onDimensionChange();
-                cleanupPlayerServices(state.getPlayer().getUUID());
-                // Re-create result queues so disk reads and generation results
-                // are not silently dropped after dimension change
-                this.diskReader.registerPlayer(state.getPlayer().getUUID());
-                if (this.generationService != null) this.generationService.registerPlayer(state.getPlayer().getUUID());
-                dimensionChanged = true;
-            }
-
             if (removed)
                 continue;
+
+            if (state.checkDimensionChange()) {
+                // A dimension change abandons all in-flight work. Reuse the (well-tested)
+                // disconnect teardown + a fresh registration instead of a second, hand-rolled
+                // partial-reset protocol: the processing thread unwinds the old state's dedup
+                // groups via the removal event, and the fresh state starts clean next tick.
+                var changed = state.getPlayer();
+                int capabilities = state.getCapabilities();
+                removePlayer(changed.getUUID());
+                registerPlayer(changed, capabilities);
+                continue;
+            }
 
             var player = state.getPlayer();
             var level = player.level();
@@ -223,29 +220,25 @@ public class PaperRequestProcessingService {
 
             this.offThreadProcessor.updateDimensionContext(dimension, level);
 
-            playerTickData.put(player.getUUID(), new TickSnapshot.PlayerTickData(
-                    dimension, dimensionChanged));
+            playerDimensions.put(player.getUUID(), dimension);
 
-            if (!dimensionChanged) {
-                var skipPositions = genReadyPositions != null
-                        ? genReadyPositions.get(player.getUUID()) : null;
-                var probes = this.probeLoadedChunks(state, level, skipPositions);
-                if (!probes.isEmpty()) {
-                    loadedChunkProbes.put(player.getUUID(), probes);
-                }
+            var skipPositions = genReadyPositions != null
+                    ? genReadyPositions.get(player.getUUID()) : null;
+            var probes = this.probeLoadedChunks(state, level, skipPositions);
+            if (!probes.isEmpty()) {
+                loadedChunkProbes.put(player.getUUID(), probes);
             }
         }
 
-        return new LifecycleResult(playerTickData, loadedChunkProbes, activeCount, toRemove);
+        return new LifecycleResult(playerDimensions, loadedChunkProbes, activeCount, toRemove);
     }
 
     private void postSnapshot(LifecycleResult lifecycle,
             List<TickSnapshot.GenerationReadyData> generationReady) {
-        var removed = lifecycle.toRemove != null ? lifecycle.toRemove : List.<UUID>of();
         var snapshot = new TickSnapshot(
-                lifecycle.playerTickData, lifecycle.loadedChunkProbes, generationReady,
-                removed, this.config.sendQueueLimitPerPlayer, false);
-        this.offThreadProcessor.postSnapshot(snapshot);
+                lifecycle.playerDimensions, lifecycle.loadedChunkProbes,
+                this.config.sendQueueLimitPerPlayer, false);
+        this.offThreadProcessor.postSnapshot(snapshot, generationReady);
     }
 
     private void flushSendQueues(int activeCount) {
@@ -268,12 +261,10 @@ public class PaperRequestProcessingService {
                 LSSLogger.debug(this.diag.formatSummary(bwRate, this.config.bytesPerSecondLimitGlobal));
                 for (var state : this.players.values()) {
                     if (!state.hasCompletedHandshake()) continue;
-                    var rl = state.getRateLimiters();
-                    LSSLogger.debug(String.format("  %s: sq=%d, psync=%d, pgen=%d, syncCC=%d/%d, genCC=%d/%d",
+                    LSSLogger.debug(String.format("  %s: sq=%d, syncSlots=%d/%d, genSlots=%d/%d",
                             state.getPlayer().getName().getString(), state.getSendQueueSize(),
-                            state.getPendingSyncCount(), state.getPendingGenerationCount(),
-                            rl.syncOnLoad().getCurrentConcurrency(), rl.syncOnLoad().getMaxConcurrency(),
-                            rl.generation().getCurrentConcurrency(), rl.generation().getMaxConcurrency()));
+                            state.getHeldSyncSlots(), state.getSyncSlotCap(),
+                            state.getHeldGenSlots(), state.getGenSlotCap()));
                 }
             }
         }
@@ -346,8 +337,12 @@ public class PaperRequestProcessingService {
                     req.playerUuid(), level, req.cx(), req.cz(),
                     req.submissionOrder());
             if (!accepted) {
-                this.generationService.addResult(req.playerUuid(), PaperChunkDiskReader.emptyResult(
-                        req.playerUuid(), req.cx(), req.cz(), req.submissionOrder()));
+                // Capacity rejection: feed a failure outcome so the processing thread
+                // frees the pending slot and tells the client ColumnNotGenerated.
+                String dimension = this.dimensionStringCache.computeIfAbsent(level,
+                        l -> l.dimension().identifier().toString());
+                this.offThreadProcessor.feedGenerationFailure(
+                        req.playerUuid(), req.cx(), req.cz(), dimension, req.submissionOrder());
             }
         }
     }
