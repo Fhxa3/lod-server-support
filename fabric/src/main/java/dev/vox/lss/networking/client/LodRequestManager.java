@@ -226,22 +226,29 @@ public class LodRequestManager {
     }
 
     public void onColumnNotGenerated(long packed) {
+        // BatchResponse carries no dimension, so unlike onColumnReceived this cannot be
+        // dimension-guarded. Gate on tracking instead: the tracker is cleared on dimension
+        // change / timeout / prune, so a late status can never stamp the fresh map
+        // (matches the pre-v16 requestId gate).
+        if (!this.tracker.isInFlight(packed)) { this.metrics.recordNotGenerated(); return; }
         this.tracker.removeByPosition(packed);
         this.columns.onNotGenerated(packed);
         this.metrics.recordNotGenerated();
     }
 
     public void onColumnUpToDate(long packed) {
+        if (!this.tracker.isInFlight(packed)) { this.metrics.recordUpToDate(); return; }
         this.tracker.removeByPosition(packed);
         this.columns.onUpToDate(packed);
         this.metrics.recordUpToDate();
     }
 
     public void onRateLimited(long packed) {
+        this.scanner.noteRateLimited(); // backoff regardless of tracking (pre-v16 set skipNextScan outside the gate)
+        if (!this.tracker.isInFlight(packed)) { this.metrics.recordRateLimited(); return; }
         this.tracker.removeByPosition(packed);
         this.columns.markRetry(packed);
         this.metrics.recordRateLimited();
-        this.scanner.noteRateLimited();
     }
 
     private void onDimensionChange(ResourceKey<Level> newDimension) {
@@ -249,6 +256,7 @@ public class LodRequestManager {
         resetRequestState();
         this.queue.clear();
         this.scanner.resetScanCounter();
+        this.scanner.clearSkipNextScan();
         this.cacheLoaded = true;
         startAsyncCacheLoad(newDimension);
     }

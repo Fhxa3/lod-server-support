@@ -201,6 +201,15 @@ class SpiralScanner {
         this.scanTickCounter = 0;
     }
 
+    /**
+     * A dimension change discards any pending rate-limit backoff — it belonged to the old
+     * dimension's load. Deliberately NOT part of resetScanCounter(): the movement and
+     * dirty-broadcast paths call that too and must preserve the backoff.
+     */
+    void clearSkipNextScan() {
+        this.skipNextScan = false;
+    }
+
     int getEffectiveLodDistance() {
         int serverDistance = this.sessionConfig.lodDistanceChunks();
         int clientDistance = LSSClientConfig.CONFIG.lodDistanceChunks;
