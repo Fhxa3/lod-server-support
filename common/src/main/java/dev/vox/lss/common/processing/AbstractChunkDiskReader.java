@@ -121,6 +121,7 @@ public abstract class AbstractChunkDiskReader {
 
         int estimatedBytes = serializedSections.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES;
 
+        this.diag.recordSuccess();
         this.diag.recordCompleted(System.nanoTime() - startNs);
         addResult(playerUuid, new ChunkReadResult(playerUuid, chunkX, chunkZ,
                 serializedSections, dimension, estimatedBytes, columnTimestamp,

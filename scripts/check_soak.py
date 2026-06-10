@@ -845,7 +845,12 @@ def run_checker(results_dir, scenario):
 
     ends = server["ends"]
     if not ends:
-        warnings.append("server.jsonl has no end event (server may have died mid-run)")
+        # The driver writes an end row on EVERY controlled exit (timeline-complete or
+        # join-timeout), so absence means the server JVM died mid-run — the central
+        # failure a soak harness must catch. As a warning this let a post-convergence
+        # crash produce a clean PASS.
+        violations.append(Violation("run-completion", "server.jsonl",
+                                    "no end event — server died mid-run (uncontrolled exit)", {}))
     elif ends[-1]["reason"] != "timeline-complete":
         violations.append(Violation("run-completion", "end event",
                                     "run did not complete its timeline",

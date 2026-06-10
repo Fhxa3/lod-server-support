@@ -11,6 +11,7 @@ public class DiskReaderDiagnostics {
     private final AtomicLong allAirCount = new AtomicLong();
     private final AtomicLong errorCount = new AtomicLong();
     private final AtomicLong saturationCount = new AtomicLong();
+    private final AtomicLong successCount = new AtomicLong();
     private final AtomicLong totalReadTimeNanos = new AtomicLong();
 
     public void recordSubmitted() { this.submittedCount.incrementAndGet(); }
@@ -22,6 +23,7 @@ public class DiskReaderDiagnostics {
     public void recordAllAir() { this.allAirCount.incrementAndGet(); }
     public void recordError() { this.errorCount.incrementAndGet(); }
     public void recordSaturation() { this.saturationCount.incrementAndGet(); }
+    public void recordSuccess() { this.successCount.incrementAndGet(); }
 
     public String formatDiagnostics(int pendingCount) {
         long completed = this.completedCount.get();
@@ -33,13 +35,14 @@ public class DiskReaderDiagnostics {
     }
 
     /**
-     * Returns the count of disk reads that successfully produced section data.
-     * Every completion is exactly one of {successful, notFound, allAir, error, saturated} —
-     * the saturation and error paths record a completion too, so they must be subtracted.
+     * Count of disk reads that successfully produced section data. An explicit counter,
+     * not derived from the others: outcome and completion counters increment in two steps,
+     * so a derived value read mid-update can transiently DECREASE between snapshots and
+     * trip monotonicity checks. At rest, completed == success + notFound + allAir + errors
+     * + saturated still holds (unit-tested).
      */
     public long getSuccessfulReadCount() {
-        return this.completedCount.get() - this.notFoundCount.get() - this.allAirCount.get()
-                - this.errorCount.get() - this.saturationCount.get();
+        return this.successCount.get();
     }
 
     public long getSubmittedCount() { return this.submittedCount.get(); }

@@ -267,10 +267,12 @@ public class RequestProcessingService {
 
             LevelChunk chunk = level.getChunkSource().getChunkNow(req.cx(), req.cz());
             if (chunk != null) {
-                var column = SectionSerializer.serializeColumn(level, chunk, req.cx(), req.cz());
-                probes.put(packed, column);
-                this.dirtyContentFilter.seed(level.dimension().identifier().toString(),
-                        req.cx(), req.cz(), column.serializedSections());
+                // Deliberately NOT seeded into the DirtyContentFilter: a probe serve can land
+                // between another player's edit and the chunk's cooldown save, and a seed here
+                // would make that save hash equal — silencing the dirty broadcast every OTHER
+                // client holding the old column needs. Only generation serves seed (freshly
+                // generated content cannot be stale-held by anyone).
+                probes.put(packed, SectionSerializer.serializeColumn(level, chunk, req.cx(), req.cz()));
             }
             probed++;
         }

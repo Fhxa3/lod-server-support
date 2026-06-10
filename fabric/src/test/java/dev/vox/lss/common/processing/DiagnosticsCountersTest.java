@@ -17,6 +17,7 @@ class DiagnosticsCountersTest {
         var d = new DiskReaderDiagnostics();
         // 2 successful, 3 not-found, 1 all-air, 1 error, 1 saturated — 8 completions
         for (int i = 0; i < 8; i++) d.recordCompleted(1_000_000);
+        d.recordSuccess(); d.recordSuccess();
         d.recordNotFound(); d.recordNotFound(); d.recordNotFound();
         d.recordAllAir();
         d.recordError();
@@ -24,6 +25,7 @@ class DiagnosticsCountersTest {
 
         assertEquals(8, d.getCompletedCount());
         assertEquals(2, d.getSuccessfulReadCount());
+        // The at-rest partition the soak checker's A5 law relies on
         assertEquals(d.getCompletedCount(),
                 d.getSuccessfulReadCount() + d.getNotFoundCount() + d.getAllAirCount()
                         + d.getErrorCount() + d.getSaturationCount());

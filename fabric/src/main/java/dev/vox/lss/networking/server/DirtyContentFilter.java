@@ -24,8 +24,9 @@ import java.util.Map;
  * harmless, a missed update is not. Paper needs no twin: its dirty detection is
  * Bukkit-event-driven (block changes), not save-driven.
  *
- * <p>Thread safety via synchronization — saves and shutdown may run on different threads,
- * and the per-save cost is dominated by serialization, not the lock.
+ * <p>All callers run on the main server thread (ChunkMap.save call sites are main-thread-only
+ * in 26.1.2 — verified through saveChunkIfNeeded/scheduleUnload/saveAllChunks roots); the
+ * synchronization is cheap insurance against future call sites, not a present need.
  */
 public class DirtyContentFilter {
     /** Per-dimension cap; on overflow the map is cleared (chunks re-mark dirty once — self-heals). */
