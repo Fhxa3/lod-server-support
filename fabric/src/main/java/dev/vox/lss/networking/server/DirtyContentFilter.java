@@ -32,6 +32,9 @@ public class DirtyContentFilter {
     private static final int MAX_ENTRIES_PER_DIMENSION = 512 * 1024;
     private static final long FNV_OFFSET = 0xcbf29ce484222325L;
     private static final long FNV_PRIME = 0x100000001b3L;
+    /** All-air columns serialize to null bytes — valid content, hashed as this sentinel
+     *  so air-to-air saves stay quiet and air-to-built transitions mark dirty. */
+    private static final long ALL_AIR_HASH = 0x9E3779B97F4A7C15L;
 
     private final Map<String, Long2LongOpenHashMap> hashesByDimension = new HashMap<>();
 
@@ -42,7 +45,7 @@ public class DirtyContentFilter {
      * which otherwise re-sends every generated column a second time for nothing.
      */
     public synchronized void seed(String dimension, int cx, int cz, byte[] serializedSections) {
-        storeHash(dimension, PositionUtil.packPosition(cx, cz), fnv1a64(serializedSections));
+        storeHash(dimension, PositionUtil.packPosition(cx, cz), hashContent(serializedSections));
     }
 
     /**
@@ -56,8 +59,8 @@ public class DirtyContentFilter {
         int lastLen;
         try {
             var column = SectionSerializer.serializeColumn(level, chunk, cx, cz);
-            hash = fnv1a64(column.serializedSections());
-            lastLen = column.serializedSections().length;
+            hash = hashContent(column.serializedSections());
+            lastLen = column.serializedSections() == null ? 0 : column.serializedSections().length;
         } catch (Exception e) {
             LSSLogger.debug("Dirty-content hash failed for chunk " + cx + "," + cz + ": " + e);
             return true;
@@ -84,6 +87,10 @@ public class DirtyContentFilter {
         }
         long previous = hashes.put(packed, hash);
         return previous != hash;
+    }
+
+    private static long hashContent(byte[] bytes) {
+        return bytes == null || bytes.length == 0 ? ALL_AIR_HASH : fnv1a64(bytes);
     }
 
     private static long fnv1a64(byte[] bytes) {

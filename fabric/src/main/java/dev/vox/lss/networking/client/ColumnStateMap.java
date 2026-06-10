@@ -94,10 +94,14 @@ class ColumnStateMap {
     /** Server confirmed the column is current. */
     void onUpToDate(long packed) {
         this.validated.add(packed);
-        // Empty columns never get a VoxelColumn response, so the timestamp stays -1L.
-        // Without a positive timestamp the scanner treats the position as "never requested"
-        // and re-queues it every cycle. Stamp it now so the validated gate works.
-        if (this.timestamps.get(packed) == -1L) {
+        // Up-to-date is the server affirming this position is current, so it must satisfy
+        // BOTH unsatisfied states: -1 (all-air columns never get a VoxelColumn response)
+        // and 0 (a not-generated stamp whose chunk has since resolved as all-air on the
+        // server). Leaving 0 in place re-classifies the position as generation-needed
+        // every scan — in the End this looped ~50 req/s forever AND starved the scan
+        // budget on the nearest rings so the outer disc was never requested.
+        long stored = this.timestamps.get(packed);
+        if (stored == -1L || stored == 0L) {
             put(packed, LSSConstants.epochSeconds());
         }
     }

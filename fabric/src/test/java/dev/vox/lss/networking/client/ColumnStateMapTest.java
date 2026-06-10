@@ -119,6 +119,15 @@ class ColumnStateMapTest {
         assertEquals(1, map.receivedCount());
     }
 
+    @Test
+    void onUpToDateResolvesNotGeneratedStamp() {
+        map.onNotGenerated(POS);
+        assertEquals(0L, map.classify(POS, true), "not-generated stamp retries as generation");
+        map.onUpToDate(POS);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "server affirming up-to-date must end the generation retry loop (End void storm)");
+    }
+
     // ---- derived counts ----
 
     @Test

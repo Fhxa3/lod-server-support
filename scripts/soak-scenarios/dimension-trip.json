@@ -2,13 +2,44 @@
   "snapshotIntervalSeconds": 5,
   "joinTimeoutSeconds": 240,
   "steps": [
-    { "anchor": 1, "at": 2, "cmd": "gamerule randomTickSpeed 0" },
-    { "anchor": 1, "at": 2, "cmd": "gamerule doMobSpawning false" },
-    { "anchor": 1, "at": 3, "cmd": "gamerule doFireTick false" },
-    { "anchor": 1, "at": 3, "cmd": "gamerule doDaylightCycle false" },
-    { "anchor": 1, "at": 4, "cmd": "tp @a 0 150 0" },
-    { "anchor": 1, "at": 60, "cmd": "execute in minecraft:the_nether run tp @a 0 150 0" },
-    { "anchor": 1, "at": 240, "cmd": "execute in minecraft:overworld run tp @a 0 150 0" }
+    {
+      "anchor": 1,
+      "at": 2,
+      "cmd": "gamerule randomTickSpeed 0"
+    },
+    {
+      "anchor": 1,
+      "at": 2,
+      "cmd": "gamerule doMobSpawning false"
+    },
+    {
+      "anchor": 1,
+      "at": 3,
+      "cmd": "gamerule doFireTick false"
+    },
+    {
+      "anchor": 1,
+      "at": 3,
+      "cmd": "gamerule doDaylightCycle false"
+    },
+    {
+      "anchor": 1,
+      "at": 4,
+      "cmd": "tp @a 0 150 0"
+    },
+    {
+      "anchor": 1,
+      "at": 60,
+      "cmd": "execute in minecraft:the_end run tp @a 100 52 0"
+    },
+    {
+      "anchor": 1,
+      "at": 240,
+      "cmd": "execute in minecraft:overworld run tp @a 0 150 0"
+    }
   ],
-  "end": { "anchor": 1, "at": 330 }
+  "end": {
+    "anchor": 1,
+    "at": 330
+  }
 }
