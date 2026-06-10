@@ -53,11 +53,13 @@ case "$SCENARIO" in
         ;;
 esac
 
-# Step 4a: Write client options.txt to bypass first-launch screens
+# Step 4a: Write client options.txt to bypass first-launch screens (muted — these
+# clients run on a dev machine)
 cat > "$CLIENT_RUN_DIR/options.txt" <<'OPTS'
 onboardAccessibility:false
 skipMultiplayerWarning:true
 joinedFirstServer:true
+soundCategory_master:0.0
 OPTS
 
 # Step 4b: Clear stale server log from previous runs

@@ -45,6 +45,7 @@ public class ChunkGenerationService {
     private final int maxConcurrent;
     private final int maxPerPlayerActive;
     private final int timeoutTicks;
+    private DirtyContentFilter dirtyContentFilter;
 
     // Volatile is sufficient — only written from the main tick thread, read by /stats commands.
     private volatile long totalSubmitted = 0;
@@ -56,6 +57,11 @@ public class ChunkGenerationService {
         this.maxConcurrent = config.generationConcurrencyLimitGlobal;
         this.maxPerPlayerActive = config.generationConcurrencyLimitPerPlayer;
         this.timeoutTicks = config.generationTimeoutSeconds * LSSConstants.TICKS_PER_SECOND;
+    }
+
+    /** Wired by RequestProcessingService after construction (it owns the filter). */
+    public void setDirtyContentFilter(DirtyContentFilter filter) {
+        this.dirtyContentFilter = filter;
     }
 
     /**
@@ -124,6 +130,14 @@ public class ChunkGenerationService {
                     LoadedColumnData columnData = SectionSerializer.serializeColumn(
                             gen.level, chunk, gen.pos.x(), gen.pos.z());
                     String dimension = gen.level.dimension().identifier().toString();
+
+                    // Seed the dirty filter with the served bytes: the chunk's imminent
+                    // unload-save would otherwise count as "first observed save" and
+                    // trigger a pointless second send of the identical column.
+                    if (this.dirtyContentFilter != null) {
+                        this.dirtyContentFilter.seed(dimension, gen.pos.x(), gen.pos.z(),
+                                columnData.serializedSections());
+                    }
 
                     // One GenerationReadyData per callback — processing thread will voxelize
                     for (var cb : gen.callbacks) {

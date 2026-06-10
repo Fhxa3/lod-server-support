@@ -103,17 +103,25 @@ public final class BenchmarkHook {
         // Register a no-op consumer so the handshake includes CAPABILITY_VOXEL_COLUMNS.
         LSSApi.registerColumnConsumer((level, dimension, chunkX, chunkZ, columnData) -> {});
 
+        // Snapshot every second (like the benchmark hook) but only WRITE every 5s — the
+        // LSS disconnect handler clears all counters before ours runs, so the disconnect
+        // row must re-emit the last live snapshot instead of reading zeroed state.
+        var latest = new java.util.concurrent.atomic.AtomicReference<Map<String, Object>>();
         final int[] clientTick = {0};
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             clientTick[0]++;
-            if (clientTick[0] % (5 * LSSConstants.TICKS_PER_SECOND) == 0 && LSSClientNetworking.isServerEnabled()) {
-                appendSoakClientRow(outputFile, "snapshot");
+            if (!LSSClientNetworking.isServerEnabled()) return;
+            if (clientTick[0] % LSSConstants.TICKS_PER_SECOND != 0) return;
+            latest.set(BenchmarkMetricsExporter.buildClientSnapshot());
+            if (clientTick[0] % (5 * LSSConstants.TICKS_PER_SECOND) == 0) {
+                appendSoakClientRow(outputFile, "snapshot", latest.get());
             }
         });
 
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             LSSLogger.info("[Soak] Client disconnected, writing final snapshot");
-            appendSoakClientRow(outputFile, "disconnect");
+            var snapshot = latest.get() != null ? latest.get() : BenchmarkMetricsExporter.buildClientSnapshot();
+            appendSoakClientRow(outputFile, "disconnect", snapshot);
             // The LSS disconnect handler queued the cache save before us in registration
             // order; this drains the single-threaded IO executor so the write lands.
             dev.vox.lss.networking.client.ColumnCacheStore.flushPendingIo();
@@ -122,11 +130,11 @@ public final class BenchmarkHook {
         });
     }
 
-    private static void appendSoakClientRow(Path outputFile, String event) {
+    private static void appendSoakClientRow(Path outputFile, String event, Map<String, Object> snapshot) {
         var row = new java.util.LinkedHashMap<String, Object>();
         row.put("event", event);
         row.put("wallMs", System.currentTimeMillis());
-        row.putAll(BenchmarkMetricsExporter.buildClientSnapshot());
+        row.putAll(snapshot);
         BenchmarkMetricsExporter.appendJsonLine(outputFile, row);
     }
 }

@@ -110,7 +110,6 @@ class SpiralScanner {
 
         int genCap = this.sessionConfig.generationConcurrencyLimitPerPlayer() * BUDGET_MULTIPLIER;
 
-        int exclusionDistSq = exclusionRadius * exclusionRadius;
         int[] chunkCoords = new int[2];
         int localScanRing = -1;
         int syncQueued = 0;
@@ -124,8 +123,11 @@ class SpiralScanner {
 
         outer:
         for (int r = localConfirmedRing; r <= lodDistance; r++) {
-            if (2 * r * r <= exclusionDistSq) { localConfirmedRing = r + 1; continue; }
-            if (r == 0) { localConfirmedRing = 1; continue; }
+            // Chebyshev exclusion to match vanilla's loaded-chunk square. A Euclidean circle
+            // leaves the square's corner chunks eligible for LOD requests while they are
+            // loaded and continuously re-saving (inhabitedTime), which turns the dirty
+            // broadcast into a permanent re-request/re-serve loop on those corners.
+            if (r <= exclusionRadius) { localConfirmedRing = r + 1; continue; }
 
             boolean ringFullySatisfied = true;
             int ringSize = 8 * r;
@@ -135,10 +137,6 @@ class SpiralScanner {
                 ringIndexToCoord(r, i, playerCx, playerCz, chunkCoords);
                 int cx = chunkCoords[0];
                 int cz = chunkCoords[1];
-
-                int pdx = cx - playerCx;
-                int pdz = cz - playerCz;
-                if (pdx * pdx + pdz * pdz <= exclusionDistSq) continue;
 
                 long packed = PositionUtil.packPosition(cx, cz);
 

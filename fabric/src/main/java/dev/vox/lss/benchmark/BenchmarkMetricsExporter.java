@@ -47,6 +47,8 @@ public final class BenchmarkMetricsExporter {
         serviceMap.put("up_to_date", diag.getTotalUpToDate());
         serviceMap.put("in_memory", diag.getTotalInMemory());
         serviceMap.put("gen_drained", diag.getTotalGenDrained());
+        var reader = service.getDiskReader();
+        serviceMap.put("disk_resolved", reader != null ? reader.getDiag().getSuccessfulReadCount() : 0L);
         serviceMap.put("sync_rate_limited", diag.getTotalSyncRateLimited());
         serviceMap.put("gen_rate_limited", diag.getTotalGenRateLimited());
         result.put("service", serviceMap);

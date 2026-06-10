@@ -77,6 +77,7 @@ loom {
             server()
             runDir "build/run/soak-server"
             vmArg "-Dlss.soak.scenario=${findProperty('soak.scenario') ?: ''}"
+            vmArg "-Dlss.soak.dirtydebug=${findProperty('soak.dirtydebug') ?: 'false'}"
             programArg "--nogui"
         }
         register("soakClient") {

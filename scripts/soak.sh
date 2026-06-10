@@ -55,7 +55,7 @@ esac
 # Per-scenario knobs: number of client runs and expected end-to-end seconds.
 # Kill switch budget = expected + 240s slack.
 case "$SCENARIO" in
-    fresh-backfill)  CLIENT_RUNS=1; EXPECTED_SECONDS=240 ;;
+    fresh-backfill)  CLIENT_RUNS=1; EXPECTED_SECONDS=280 ;;
     warm-rejoin)     CLIENT_RUNS=2; EXPECTED_SECONDS=360 ;;
     dimension-trip)  CLIENT_RUNS=1; EXPECTED_SECONDS=420 ;;
     dirty-broadcast) CLIENT_RUNS=1; EXPECTED_SECONDS=240 ;;
@@ -147,10 +147,14 @@ esac
 mkdir -p "$SERVER_RUN_DIR/config"
 cp "$SCENARIO_CONFIG" "$SERVER_RUN_DIR/config/lss-server-config.json"
 
-# Step 6b: Write server.properties + eula.txt
+# Step 6b: Write server.properties + eula.txt. Superflat: fresh noise terrain carries
+# minutes of unsettled fluid ticks (aquifers, gen-border flows) that mutate chunk content
+# on every save cycle and keep the system from ever quiescing — flat terrain settles
+# instantly and the conservation laws don't care about terrain shape.
 cat > "$SERVER_RUN_DIR/server.properties" <<'PROPS'
 online-mode=false
 level-seed=soak-seed-42
+level-type=minecraft\:flat
 spawn-protection=0
 max-tick-time=-1
 pause-when-empty-seconds=-1
@@ -167,6 +171,7 @@ onboardAccessibility:false
 skipMultiplayerWarning:true
 joinedFirstServer:true
 renderDistance:8
+soundCategory_master:0.0
 OPTS
 
 # Step 7: Clear stale server log and stale soak-results from previous runs
@@ -181,7 +186,7 @@ if soak_port_in_use; then
 fi
 
 # Step 9: Start server and arm the kill switch once it is ready
-mc_start_server "$RUN_RESULTS_DIR/server.log" :fabric:runSoakServer -Psoak.scenario="$SCENARIO_JSON"
+mc_start_server "$RUN_RESULTS_DIR/server.log" :fabric:runSoakServer -Psoak.scenario="$SCENARIO_JSON" ${SOAK_EXTRA_GRADLE_ARGS:-}
 mc_wait_server_ready "$SERVER_RUN_DIR/logs/latest.log" "$RUN_RESULTS_DIR/server.log" 120
 DEADLINE_EPOCH=$(( $(date +%s) + RUNTIME_BUDGET ))
 

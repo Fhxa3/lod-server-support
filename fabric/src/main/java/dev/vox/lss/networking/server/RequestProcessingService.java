@@ -40,6 +40,7 @@ public class RequestProcessingService {
     private final SharedBandwidthLimiter bandwidthLimiter;
     private final FabricOffThreadProcessor offThreadProcessor;
     private final DirtyColumnTracker dirtyTracker;
+    private final DirtyContentFilter dirtyContentFilter = new DirtyContentFilter();
 
     private final long startTimeNanos = System.nanoTime();
 
@@ -61,6 +62,7 @@ public class RequestProcessingService {
         this.diskReader = new ChunkDiskReader(config.diskReaderThreads);
         if (config.enableChunkGeneration) {
             this.generationService = new ChunkGenerationService(config);
+            this.generationService.setDirtyContentFilter(this.dirtyContentFilter);
         } else {
             this.generationService = null;
         }
@@ -265,7 +267,10 @@ public class RequestProcessingService {
 
             LevelChunk chunk = level.getChunkSource().getChunkNow(req.cx(), req.cz());
             if (chunk != null) {
-                probes.put(packed, SectionSerializer.serializeColumn(level, chunk, req.cx(), req.cz()));
+                var column = SectionSerializer.serializeColumn(level, chunk, req.cx(), req.cz());
+                probes.put(packed, column);
+                this.dirtyContentFilter.seed(level.dimension().identifier().toString(),
+                        req.cx(), req.cz(), column.serializedSections());
             }
             probed++;
         }
@@ -337,6 +342,10 @@ public class RequestProcessingService {
 
     public DirtyColumnTracker getDirtyTracker() {
         return this.dirtyTracker;
+    }
+
+    public DirtyContentFilter getDirtyContentFilter() {
+        return this.dirtyContentFilter;
     }
 
     public String getTickDiagnostics() {
