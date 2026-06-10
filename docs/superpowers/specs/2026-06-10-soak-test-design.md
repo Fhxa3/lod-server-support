@@ -1,0 +1,236 @@
+# Soak Test Harness — Design
+
+Date: 2026-06-10. Status: approved (adversarial-reviewed, all amendments folded in).
+
+## Purpose
+
+A dev-loop tool Claude runs via bash after significant changes: a real dedicated server +
+real headless client execute scripted scenarios; both sides emit periodic diagnostic
+snapshots; a checker enforces exact conservation invariants and per-scenario expectations;
+Claude reads the verdict + time series and reports. Explicitly NOT a CI gate. Perf
+baselines and multi-client are out of scope.
+
+## Architecture
+
+```
+scripts/soak.sh <scenario>|all          bash orchestrator (sources scripts/lib/mc-run.sh)
+scripts/soak-scenarios/<name>.json      timeline for the Java driver (ONLY driver concerns)
+scripts/soak-scenarios/<name>-config.json  sparse lss-server-config.json overrides (GSON fills defaults)
+scripts/check_soak.py                   stdlib python checker (--validate pre-flight + post-run laws)
+fabric: dev.vox.lss.benchmark.SoakScenarioDriver   server-side timeline executor + jsonl snapshots
+fabric: BenchmarkHook/BenchmarkBridge soak branches; client jsonl appender + sync cache flush
+soak-worlds/base/                       produced by fresh-backfill only (never shared with benchmark-worlds/)
+soak-results/<scenario>-<timestamp>/    server.jsonl, client-run<N>.jsonl, logs, verdict.json
+```
+
+Key separations (from adversarial review):
+- Scenario JSON contains ONLY what the Java driver consumes (timeline + end + intervals).
+  Staging lives in bash case branches; config overrides are sparse JSON files; checks are a
+  python dict keyed by scenario name. No phase labels — the driver appends command/join
+  event rows to `server.jsonl` and the checker anchors on those.
+- Soak has its own gates and run configs: `-Dlss.soak.scenario=<path>` (server),
+  `-Dlss.soak=true` (client), loom runs `soakServer`/`soakClient` with NO JFR. The
+  benchmark 60s auto-halt must not arm in soak mode. `BenchmarkBridge.invoke` fires when
+  either benchmark or soak properties are set.
+
+## Scenario JSON (driver contract)
+
+```json
+{
+  "snapshotIntervalSeconds": 5,
+  "joinTimeoutSeconds": 240,
+  "steps": [
+    { "anchor": 1, "at": 2,   "cmd": "gamerule randomTickSpeed 0" },
+    { "anchor": 1, "at": 120, "cmd": "kick @a soak-phase-end" },
+    { "anchor": 2, "at": 60,  "cmd": "tp @a 400 150 0" }
+  ],
+  "end": { "anchor": 2, "at": 170 }
+}
+```
+
+- `anchor: N` = the Nth player JOIN event (`ServerPlayConnectionEvents.JOIN`); `at` =
+  seconds since that join. Post-kick steps re-anchor on the NEXT join (a fresh client takes
+  30–90 s of Gradle boot; absolute offsets would race it).
+- Driver counts ticks (`END_SERVER_TICK`); a step fires when its anchor exists and elapsed
+  ≥ `at`. `pause-when-empty-seconds=-1` is load-bearing: ticks (and the scheduler) stop on
+  an empty paused server.
+- Commands run via `server.getCommands().performPrefixedCommand(source, cmd)` with the
+  server console source. The call returns void — failures are invisible — hence
+  `--validate` + named checks must catch missing effects.
+- Join timeout: if a referenced anchor N hasn't occurred `joinTimeoutSeconds` after it
+  became the next expected join, append `{"event":"end","reason":"join-timeout"}` and halt.
+- At `end`: final snapshot, `{"event":"end","reason":"timeline-complete"}`, `halt(false)`.
+
+## JSONL row schemas (checker contract)
+
+Compact GSON (NOT the pretty-printing instance). All rows carry `"wallMs"` =
+`System.currentTimeMillis()` (same host on both sides; immune to the WSL2 monotonic-clock
+lag we measured). Field names below are the contract.
+
+`server.jsonl` events: `snapshot`, `command` (`cmd`, `anchor`, `at`), `join` (`player`,
+`joinIndex`), `end` (`reason`). Snapshot payload:
+
+```json
+{"event":"snapshot","wallMs":0,"tick":0,
+ "service":{"requests_received":0,"columns_sent":0,"bytes_sent":0,"duplicate_skips":0,
+            "queue_full":0,"up_to_date":0,"in_memory":0,"disk_resolved":0,"gen_drained":0},
+ "disk":{"submitted":0,"completed":0,"not_found":0,"all_air":0,"errors":0,"saturated":0,
+         "successful":0,"pending":0},
+ "generation":{"submitted":0,"completed":0,"timeouts":0,"removed_in_flight":0,"active":0},
+ "dirty":{"pending":0,"broadcast_positions":0},
+ "bandwidth":{"total_bytes":0},
+ "players":[{"name":"","held_sync":0,"held_gen":0,"send_queue":0,"sent":0,"bytes":0,
+             "requests":0}]}
+```
+
+`client.jsonl` events: `snapshot` (every 5 s), `disconnect` (final snapshot inline).
+
+```json
+{"event":"snapshot","wallMs":0,"dimension":"minecraft:overworld",
+ "received_columns":0,"received_bytes":0,"dropped":0,
+ "responses":{"columns":0,"up_to_date":0,"not_generated":0,"rate_limited":0},
+ "requested_total":0,"send_cycles":0,
+ "columns":{"known":0,"empty":0,"dirty":0},
+ "scan":{"confirmed":0,"ring":0,"missing_vanilla":0},
+ "tracker_in_flight":0,"queued":0}
+```
+
+`service.*` are NEW cumulative service-level counters (see below) — per-player rows reset
+on kick AND on dimension change (removePlayer+registerPlayer) and are diagnostic color
+only. Client counters are per-process-run and reset on dimension change → the checker
+segments windows accordingly.
+
+## Production diagnostics additions (common/, parity via shared formatter; Paper free except gen service)
+
+1. `DiskReaderDiagnostics`: replace `empty` with `notFound` + `allAir`; fix
+   `getSuccessfulReadCount()` to `completed − notFound − allAir − errors − saturated`
+   (the saturation path records a completion today, so the current partition is already
+   false whenever saturated > 0). Update the `DiskReader:` diag line.
+2. `ProcessingDiagnostics`: cumulative `totalDuplicateSkips` (today per-tick only — the
+   server SILENTLY drops duplicate-while-pending requests and the client legitimately
+   produces them: 10 s client retry vs up-to-60 s server gen pending), cumulative
+   `totalRequestsReceived`, cumulative `totalColumnsSent`/`totalBytesSent` (incremented at
+   actual send; the existing "sent" sums live player states and resets at boundaries).
+3. Generation services (Fabric `ChunkGenerationService` + Paper twin): cumulative
+   `totalRemovedInFlight`, incremented when `removePlayer` drops active entries (fires on
+   kick AND dimension change; today those vanish unaccounted and `submitted == completed`
+   can never re-balance).
+4. Dirty: expose dirty-tracker pending size + cumulative broadcast-positions counter.
+5. `DiagnosticsFormatter`: surface the new counters (`/lsslod diag` parity on both
+   platforms comes free through the shared formatter).
+
+No wire/protocol changes. Unit tests for each new counter path.
+
+## Soak client mode (`-Dlss.soak=true`)
+
+- Registers the no-op column consumer (capability bit), appends a snapshot row every 5 s
+  (100 client ticks) to `soak-results/client.jsonl` under the client run dir.
+- On DISCONNECT: append final snapshot, then **synchronously flush the column cache**
+  (new `ColumnCacheStore` drain method with timeout) BEFORE `Runtime.halt(0)` — the
+  disconnect save is async on a daemon IO thread and `halt` loses it, which would
+  silently turn warm-rejoin run 2 into a cold run.
+
+## Orchestrator (`scripts/soak.sh`)
+
+- `scripts/lib/mc-run.sh` extracts the shared lifecycle from benchmark.sh (~70 lines:
+  cleanup/trap, start server + wait-ready "Done" grep, wait-client-exit); benchmark.sh is
+  refactored to source it with byte-identical behavior. soak.sh and benchmark.sh stay
+  separate tools.
+- Staging per scenario (bash case): world (`fresh` | copy `soak-worlds/base`), client cache
+  (`clear` = delete `<client run dir>/config/lss/cache/`, else keep), copy
+  `<name>-config.json` → `<server run dir>/config/lss-server-config.json`, write
+  server.properties (`online-mode=false`, fixed seed, `pause-when-empty-seconds=-1`,
+  `view-distance=8`, `gamemode=creative`, `force-gamemode=true`, `spawn-protection=0`,
+  `max-tick-time=-1`) and options.txt (onboarding skips + `renderDistance:8` — the
+  exclusion circle is min(client option, server view distance) and must be deterministic).
+- Pre-flight: port 25565 free (pkill stale game JVMs with a clear message), then
+  `python3 scripts/check_soak.py --validate <scenario>` BEFORE the server boots (check
+  names resolve, timeline ordering sane, end after last step).
+- Client-run loop: scenario→runs map in bash (warm-rejoin=2, others=1). After each client
+  exit, move `client.jsonl` → `client-run<N>.jsonl`. Total-runtime kill switch =
+  scenario end estimate + 240 s slack.
+- `all`: fresh-backfill → warm-rejoin → dimension-trip → dirty-broadcast; any scenario
+  needing `soak-worlds/base` auto-runs fresh-backfill first if missing.
+- fresh-backfill saves its world to `soak-worlds/base/` at the end.
+- `.gitignore`: add `soak-results/`, `soak-worlds/`.
+- Collect into `soak-results/<scenario>-<timestamp>/`, run checker, propagate exit code.
+
+## Checker (`scripts/check_soak.py`, python3 stdlib)
+
+**Quiescence predicate** (all laws evaluate as deltas between verified-quiescent
+snapshots): across ≥2 consecutive server snapshots, `service.requests_received`,
+`service.columns_sent`, `disk.submitted`, `generation.submitted/completed` unchanged AND
+`players[].held_sync/held_gen/send_queue == 0`, `disk.pending == 0`,
+`generation.active == 0`, `dirty.pending == 0`; client mirror: `tracker_in_flight == 0`,
+`queued == 0`. Worlds run with `randomTickSpeed 0`, `doMobSpawning false`,
+`doFireTick false` (timeline steps — they're gamerules, not server.properties), otherwise
+ambient chunk churn re-dirties every broadcast interval and quiescence never arrives.
+Client `columns.dirty` may legitimately stay > 0 (in-exclusion parked marks) — it is NOT
+part of global quiescence.
+
+**Laws** (within same-dimension, same-client-run windows bounded by quiescent snapshots;
+dimension boundaries get drain+anomaly checks only — the boundary intentionally drops
+in-flight tracking):
+
+- A1 requests: `Δclient.requested_total == Δresponses(columns+up_to_date+not_generated+rate_limited) + Δserver.duplicate_skips + Δserver.queue_full`
+- A2 delivery: `Δserver.service.columns_sent == Δclient.received_columns` and
+  `Δserver.service.bytes_sent == Δclient.received_bytes`; `dropped == 0`
+- A3 sources (sanity bound, not exact — resolution counters increment on failure paths
+  too): `Δcolumns_sent ≤ Δ(in_memory + disk.successful + gen.completed)`
+- A4 generation: `Δsubmitted == Δcompleted + Δtimeouts + Δremoved_in_flight`
+- A5 disk triage: `Δnot_found == Δgen.submitted_via_escalation…` stated practically:
+  `Δdisk.not_found == Δgeneration.submitted + Δnot_generated_responses` (valid only when
+  timeouts == 0 in window, single client; gen-capacity bounces don't bump submitted)
+  and `Δdisk.successful == Δdisk.completed − Δnot_found − Δall_air − Δerrors − Δsaturated`
+- A6 monotonic whitelist: disk.*, generation totals, service.* cumulatives,
+  bandwidth.total_bytes (server, process lifetime); client counters within one run only
+  and only within one dimension window
+- A7 anomalies: `errors, timeouts, dropped > 0` always fail; `saturated`/`rate_limited`
+  fail unless the scenario opts in (saturation surfaces as rate-limited BY DESIGN when the
+  reader pool (threads×32 queue) is smaller than the sync cap)
+
+**Scenario preconditions encoded as data:** teleports ≤ 512 blocks (beyond
+lodDistance+32 the server silently drops), setblock targets inside client LOD distance,
+outside render distance, on a column the client received.
+
+**Named checks** — python dict `CHECKS = {"warm-rejoin": [...], ...}`; each check declares
+`required_fields` validated against the first row (loud failure on schema drift; direct
+indexing, `.get()` defaults banned):
+- fresh-backfill: gen completed > 500; converges (final window quiescent; scan.confirmed >
+  lod distance)
+- warm-rejoin: run-2 `up_to_date` ≫ 0 and run-2 `columns` ≪ run-1 `columns` (cache
+  actually warm); run-2 `requested_total` ≈ disc size (full revalidation is expected shape)
+- dimension-trip: dimension field changes twice; drains hold at each boundary; per-window
+  A-laws hold inside each dimension segment
+- dirty-broadcast: after the setblock command event, client `columns.dirty` rises above its
+  pre-event baseline within 2× broadcast interval, then returns to ≤ baseline, and
+  `received_columns` increments (real re-send). Baseline-relative because parked
+  in-exclusion marks are legitimate.
+
+**Modes:** `--validate <scenario>` (pre-boot, seconds) and
+`check_soak.py <results-dir> <scenario>` → `verdict.json` + human-readable violations,
+exit 1 on any failure. Unrecognized new fields → one-line warning, never a failure.
+
+## Scenarios (lodDistanceChunks=24, genPerPlayer=40, genGlobal=64, dirtyBroadcast=5s)
+
+| Scenario | World/cache | Timeline sketch | ~Runtime |
+|---|---|---|---|
+| fresh-backfill | fresh, clear | gamerules → backfill → quiesce → end; saves soak-worlds/base | ~4 min |
+| warm-rejoin | base, keep run-1 cache | backfill→quiesce→kick @120; join2: resync→quiesce→tp 400→quiesce→end | ~6 min |
+| dimension-trip | base, clear | quiesce → `execute in minecraft:the_nether run tp @a 0 150 0` → nether quiesce → return tp → quiesce | ~7 min |
+| dirty-broadcast | base, keep | quiesce → `forceload add` → `setblock 320 100 0 stone` → `save-all` → `forceload remove` → drain window → end | ~4 min |
+
+Creative + safe-y teleports: a dead headless client never respawns (`tick()` early-returns
+on `isDeadOrDying`) and would silently stall the run.
+
+## Validation of the harness itself
+
+1. `./gradlew :fabric:test -x runGameTest -x runClientGameTest` + `:paper:shadowJar` green.
+2. All four scenarios green end-to-end.
+3. Prove the checker can fail: doctor a jsonl copy (decrement `generation.completed`),
+   expect violation + exit 1.
+
+## Out of scope
+
+Multi-client/dedup scenarios, perf baselines, CI gametest distillation (possible follow-up
+once scenarios stabilize).
