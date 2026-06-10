@@ -343,6 +343,10 @@ public class RequestProcessingService {
         return this.diag.format(LSSServerConfig.CONFIG.sendQueueLimitPerPlayer);
     }
 
+    public TickDiagnostics getTickDiag() {
+        return this.diag;
+    }
+
     public long getWindowBandwidthRate() {
         return this.diag.getWindowBytesPerSecond();
     }

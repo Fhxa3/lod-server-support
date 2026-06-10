@@ -293,6 +293,12 @@ public class LodRequestManager {
 
     // --- Public getters ---
 
+    /** Dimension id of the level this manager is currently scanning, or "none" before the first tick. */
+    public String getCurrentDimensionId() {
+        var dim = this.lastDimension;
+        return dim != null ? dim.identifier().toString() : "none";
+    }
+
     public int getReceivedColumnCount() { return this.columns.receivedCount(); }
     public int getEmptyColumnCount() { return this.columns.emptyCount(); }
     public int getEffectiveLodDistanceChunks() { return this.sessionConfig != null ? this.scanner.getEffectiveLodDistance() : 0; }

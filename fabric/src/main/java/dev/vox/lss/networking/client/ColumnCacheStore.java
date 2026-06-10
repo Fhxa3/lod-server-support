@@ -148,6 +148,17 @@ public class ColumnCacheStore {
         });
     }
 
+    /**
+     * Block until all currently queued cache IO (saves/loads/clears) has completed.
+     * The IO executor is a single FIFO thread, so an empty task draining through it
+     * proves everything submitted before this call has finished. Needed by harnesses
+     * that halt the JVM right after disconnect — the async disconnect save would
+     * otherwise be lost with the daemon IO thread.
+     */
+    public static void flushPendingIo() {
+        runIoAndWait(() -> {});
+    }
+
     /** Run a cache IO task on the single IO thread and wait for it (serializes with saves/loads). */
     private static void runIoAndWait(Runnable task) {
         try {

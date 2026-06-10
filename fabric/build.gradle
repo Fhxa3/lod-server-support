@@ -71,6 +71,21 @@ loom {
             programArg "--quickPlayMultiplayer"
             programArg "localhost:25565"
         }
+        // Soak harness runs (scripts/soak.sh) — no JFR: profiling overhead would skew the
+        // long-run behavior the soak observes
+        register("soakServer") {
+            server()
+            runDir "build/run/soak-server"
+            vmArg "-Dlss.soak.scenario=${findProperty('soak.scenario') ?: ''}"
+            programArg "--nogui"
+        }
+        register("soakClient") {
+            client()
+            runDir "build/run/soak-client"
+            vmArg "-Dlss.soak=true"
+            programArg "--quickPlayMultiplayer"
+            programArg "localhost:25565"
+        }
     }
 }
 

@@ -13,6 +13,7 @@ import java.util.Map;
  */
 public class DirtyColumnTracker {
     private final Map<String, LongOpenHashSet> dirtyColumns = new HashMap<>();
+    private long totalDrained;
 
     public synchronized void markDirty(String dimension, int cx, int cz) {
         long packed = PositionUtil.packPosition(cx, cz);
@@ -24,6 +25,17 @@ public class DirtyColumnTracker {
         if (set == null || set.isEmpty()) return null;
         long[] result = set.toLongArray();
         set.clear();
+        totalDrained += result.length;
         return result;
     }
+
+    /** Dirty positions accumulated and not yet drained, across all dimensions. */
+    public synchronized int pendingCount() {
+        int total = 0;
+        for (var set : dirtyColumns.values()) total += set.size();
+        return total;
+    }
+
+    /** Cumulative count of positions handed to broadcasters across the tracker's lifetime. */
+    public synchronized long getTotalDrained() { return totalDrained; }
 }

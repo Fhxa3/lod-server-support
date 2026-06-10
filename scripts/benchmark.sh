@@ -13,23 +13,10 @@ SERVER_RUN_DIR="$PROJECT_ROOT/fabric/build/run/benchmark-server"
 CLIENT_RUN_DIR="$PROJECT_ROOT/fabric/build/run/benchmark-client"
 RESULTS_DIR="$PROJECT_ROOT/benchmark-results"
 WORLDS_DIR="$PROJECT_ROOT/benchmark-worlds"
-SERVER_PID=""
-CLIENT_PID=""
+LOG_PREFIX="benchmark"
 
-cleanup() {
-    echo "[benchmark] Cleaning up..."
-    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "[benchmark] Killing server (PID $SERVER_PID)"
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$CLIENT_PID" ]] && kill -0 "$CLIENT_PID" 2>/dev/null; then
-        echo "[benchmark] Killing client (PID $CLIENT_PID)"
-        kill "$CLIENT_PID" 2>/dev/null || true
-        wait "$CLIENT_PID" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
+source "$PROJECT_ROOT/scripts/lib/mc-run.sh"
+trap mc_cleanup EXIT
 
 echo "========================================="
 echo " LSS Benchmark: scenario=$SCENARIO, duration=${DURATION}s"
@@ -88,46 +75,13 @@ PROPS
 echo "eula=true" > "$SERVER_RUN_DIR/eula.txt"
 
 # Step 5: Start server
-echo "[benchmark] Starting server..."
-cd "$PROJECT_ROOT"
-./gradlew :fabric:runBenchmarkServer \
-    -Pbenchmark.duration="$DURATION" \
-    > "$RESULTS_DIR/server.log" 2>&1 &
-SERVER_PID=$!
-echo "[benchmark] Server PID: $SERVER_PID"
+mc_start_server "$RESULTS_DIR/server.log" :fabric:runBenchmarkServer -Pbenchmark.duration="$DURATION"
 
 # Step 6: Wait for server ready
-echo "[benchmark] Waiting for server to be ready..."
-SERVER_LOG="$SERVER_RUN_DIR/logs/latest.log"
-TIMEOUT=120
-ELAPSED=0
-while [[ $ELAPSED -lt $TIMEOUT ]]; do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "[benchmark] ERROR: Server process exited before becoming ready"
-        echo "[benchmark] Last 20 lines of server log:"
-        tail -20 "$RESULTS_DIR/server.log" 2>/dev/null || true
-        exit 1
-    fi
-    if [[ -f "$SERVER_LOG" ]] && grep -q "Done" "$SERVER_LOG" 2>/dev/null; then
-        echo "[benchmark] Server ready after ${ELAPSED}s"
-        break
-    fi
-    sleep 1
-    ELAPSED=$((ELAPSED + 1))
-done
-
-if [[ $ELAPSED -ge $TIMEOUT ]]; then
-    echo "[benchmark] ERROR: Server did not start within ${TIMEOUT}s"
-    exit 1
-fi
+mc_wait_server_ready "$SERVER_RUN_DIR/logs/latest.log" "$RESULTS_DIR/server.log" 120
 
 # Step 7: Start client
-echo "[benchmark] Starting client..."
-cd "$PROJECT_ROOT"
-./gradlew :fabric:runBenchmarkClient \
-    > "$RESULTS_DIR/client.log" 2>&1 &
-CLIENT_PID=$!
-echo "[benchmark] Client PID: $CLIENT_PID"
+mc_start_client "$RESULTS_DIR/client.log" :fabric:runBenchmarkClient
 
 # Step 8: Wait for server to exit (auto-stops after duration)
 TOTAL_TIMEOUT=$((DURATION + 120))
@@ -140,22 +94,7 @@ fi
 SERVER_PID=""
 
 # Step 9: Wait for client to exit (auto-stops on disconnect)
-CLIENT_TIMEOUT=30
-ELAPSED=0
-while [[ $ELAPSED -lt $CLIENT_TIMEOUT ]]; do
-    if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
-        echo "[benchmark] Client exited"
-        break
-    fi
-    sleep 1
-    ELAPSED=$((ELAPSED + 1))
-done
-if kill -0 "$CLIENT_PID" 2>/dev/null; then
-    echo "[benchmark] Client did not exit within ${CLIENT_TIMEOUT}s, killing"
-    kill "$CLIENT_PID" 2>/dev/null || true
-    wait "$CLIENT_PID" 2>/dev/null || true
-fi
-CLIENT_PID=""
+mc_wait_client_exit 30
 
 # Step 10: Collect results
 echo "[benchmark] Collecting results..."

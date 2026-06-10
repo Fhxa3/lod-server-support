@@ -6,10 +6,11 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 
 /**
- * Reflective bridge to the benchmark harness. The dev.vox.lss.benchmark package is
- * excluded from the production jar (it is a dev-only tool gated behind -Dlss.benchmark),
- * so the entrypoints must not reference it directly — dev runs execute from class
- * directories where it is present, production jars simply no-op here.
+ * Reflective bridge to the dev-only harness package (benchmark + soak). The
+ * dev.vox.lss.benchmark package is excluded from the production jar, so the entrypoints
+ * must not reference it directly — dev runs execute from class directories where it is
+ * present, production jars simply no-op here. Gates: -Dlss.benchmark (benchmark),
+ * -Dlss.soak.scenario (soak server), -Dlss.soak (soak client).
  */
 final class BenchmarkBridge {
     private BenchmarkBridge() {}
@@ -22,8 +23,14 @@ final class BenchmarkBridge {
         invoke("initClient");
     }
 
+    private static boolean anyHarnessEnabled() {
+        if (Boolean.getBoolean("lss.benchmark") || Boolean.getBoolean("lss.soak")) return true;
+        String scenario = System.getProperty("lss.soak.scenario");
+        return scenario != null && !scenario.isBlank();
+    }
+
     private static void invoke(String method) {
-        if (!Boolean.getBoolean("lss.benchmark")) return;
+        if (!anyHarnessEnabled()) return;
         try {
             var hook = Class.forName("dev.vox.lss.benchmark.BenchmarkHook");
             MethodHandles.lookup()

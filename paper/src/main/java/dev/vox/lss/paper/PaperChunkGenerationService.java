@@ -54,6 +54,7 @@ public class PaperChunkGenerationService {
     private volatile long totalSubmitted = 0;
     private volatile long totalCompleted = 0;
     private volatile long totalTimeouts = 0;
+    private volatile long totalRemovedInFlight = 0;
 
     public PaperChunkGenerationService(PaperConfig config, Plugin plugin) {
         this.plugin = plugin;
@@ -205,6 +206,9 @@ public class PaperChunkGenerationService {
             gen.callbacks.removeIf(cb -> cb.playerUuid.equals(playerUuid));
             if (gen.callbacks.isEmpty()) {
                 activeIter.remove();
+                // Submitted but neither completed nor timed out — without this counter the
+                // submitted/completed books can never re-balance after a kick or dimension change
+                this.totalRemovedInFlight++;
             }
         }
 
@@ -220,8 +224,8 @@ public class PaperChunkGenerationService {
     }
 
     public String getDiagnostics() {
-        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d",
-                totalSubmitted, totalCompleted, active.size(), totalTimeouts);
+        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d, removed=%d",
+                totalSubmitted, totalCompleted, active.size(), totalTimeouts, totalRemovedInFlight);
     }
 
     private static void incrementCount(Map<UUID, Integer> map, UUID uuid) {

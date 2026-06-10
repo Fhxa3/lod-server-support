@@ -50,6 +50,7 @@ public class ChunkGenerationService {
     private volatile long totalSubmitted = 0;
     private volatile long totalCompleted = 0;
     private volatile long totalTimeouts = 0;
+    private volatile long totalRemovedInFlight = 0;
 
     public ChunkGenerationService(LSSServerConfig config) {
         this.maxConcurrent = config.generationConcurrencyLimitGlobal;
@@ -169,6 +170,9 @@ public class ChunkGenerationService {
             if (gen.callbacks.isEmpty()) {
                 gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
                 iter.remove();
+                // Submitted but neither completed nor timed out — without this counter the
+                // submitted/completed books can never re-balance after a kick or dimension change
+                this.totalRemovedInFlight++;
             }
         }
     }
@@ -182,13 +186,15 @@ public class ChunkGenerationService {
     }
 
     public String getDiagnostics() {
-        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d",
-                totalSubmitted, totalCompleted, active.size(), totalTimeouts);
+        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d, removed=%d",
+                totalSubmitted, totalCompleted, active.size(), totalTimeouts, totalRemovedInFlight);
     }
 
     public long getTotalSubmitted() { return totalSubmitted; }
     public long getTotalCompleted() { return totalCompleted; }
     public long getTotalTimeouts() { return totalTimeouts; }
+    public long getTotalRemovedInFlight() { return totalRemovedInFlight; }
+    public int getActiveCount() { return active.size(); }
 
     private static void incrementCount(Map<UUID, Integer> map, UUID uuid) {
         map.merge(uuid, 1, Integer::sum);

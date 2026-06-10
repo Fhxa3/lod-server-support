@@ -26,6 +26,11 @@ public class TickDiagnostics {
     private int curTickBytesFlushed;
     private int curTickQueuePeak;
 
+    // Cumulative send counters — service-scoped, so they survive the per-player state
+    // teardown on kick and dimension change (single-writer: main thread)
+    private long totalSectionsSent;
+    private long totalBytesSent;
+
     // Sliding window bandwidth rate (~5s at 20 TPS)
     private static final int WINDOW_TICKS = 100;
     private final int[] byteRing = new int[WINDOW_TICKS];
@@ -73,7 +78,12 @@ public class TickDiagnostics {
     public void recordSectionSent(int estimatedBytes) {
         this.curTickSectionsSent++;
         this.curTickBytesFlushed += estimatedBytes;
+        this.totalSectionsSent++;
+        this.totalBytesSent += estimatedBytes;
     }
+
+    public long getTotalSectionsSent() { return this.totalSectionsSent; }
+    public long getTotalBytesSent() { return this.totalBytesSent; }
 
     public void updateQueuePeak(int queueSize) {
         this.curTickQueuePeak = Math.max(this.curTickQueuePeak, queueSize);

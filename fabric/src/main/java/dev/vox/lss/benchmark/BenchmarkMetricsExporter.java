@@ -19,9 +19,152 @@ import java.util.Map;
 
 public final class BenchmarkMetricsExporter {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    // JSONL rows must be one line each — the pretty-printing instance is unusable for them
+    private static final Gson COMPACT_GSON = new Gson();
     private static final double BYTES_PER_MB = 1024.0 * 1024.0;
 
     private BenchmarkMetricsExporter() {}
+
+    /**
+     * Full server diagnostic snapshot keyed by the soak checker contract
+     * (docs/superpowers/specs/2026-06-10-soak-test-design.md). Cumulative counters here are
+     * service-scoped so they survive per-player state teardown on kick/dimension change.
+     * Returns null when the processing service isn't running yet.
+     */
+    public static Map<String, Object> buildServerMetrics() {
+        var service = LSSServerNetworking.getRequestService();
+        if (service == null) return null;
+
+        var result = new LinkedHashMap<String, Object>();
+
+        var diag = service.getOffThreadProcessor().getDiagnostics();
+        var serviceMap = new LinkedHashMap<String, Object>();
+        serviceMap.put("requests_received", diag.getTotalRequestsRouted());
+        serviceMap.put("columns_sent", service.getTickDiag().getTotalSectionsSent());
+        serviceMap.put("bytes_sent", service.getTickDiag().getTotalBytesSent());
+        serviceMap.put("duplicate_skips", diag.getTotalDuplicateSkips());
+        serviceMap.put("queue_full", diag.getTotalQueueFull());
+        serviceMap.put("up_to_date", diag.getTotalUpToDate());
+        serviceMap.put("in_memory", diag.getTotalInMemory());
+        serviceMap.put("gen_drained", diag.getTotalGenDrained());
+        serviceMap.put("sync_rate_limited", diag.getTotalSyncRateLimited());
+        serviceMap.put("gen_rate_limited", diag.getTotalGenRateLimited());
+        result.put("service", serviceMap);
+
+        var diskMap = new LinkedHashMap<String, Object>();
+        var diskReader = service.getDiskReader();
+        if (diskReader != null) {
+            var dd = diskReader.getDiag();
+            diskMap.put("submitted", dd.getSubmittedCount());
+            diskMap.put("completed", dd.getCompletedCount());
+            diskMap.put("not_found", dd.getNotFoundCount());
+            diskMap.put("all_air", dd.getAllAirCount());
+            diskMap.put("errors", dd.getErrorCount());
+            diskMap.put("saturated", dd.getSaturationCount());
+            diskMap.put("successful", dd.getSuccessfulReadCount());
+            diskMap.put("pending", diskReader.getPendingResultCount());
+        }
+        result.put("disk", diskMap);
+
+        var genMap = new LinkedHashMap<String, Object>();
+        var genService = service.getGenerationService();
+        if (genService != null) {
+            genMap.put("submitted", genService.getTotalSubmitted());
+            genMap.put("completed", genService.getTotalCompleted());
+            genMap.put("timeouts", genService.getTotalTimeouts());
+            genMap.put("removed_in_flight", genService.getTotalRemovedInFlight());
+            genMap.put("active", genService.getActiveCount());
+        }
+        result.put("generation", genMap);
+
+        var dirtyMap = new LinkedHashMap<String, Object>();
+        var dirtyTracker = service.getDirtyTracker();
+        dirtyMap.put("pending", dirtyTracker.pendingCount());
+        dirtyMap.put("broadcast_positions", dirtyTracker.getTotalDrained());
+        result.put("dirty", dirtyMap);
+
+        var bandwidthMap = new LinkedHashMap<String, Object>();
+        bandwidthMap.put("total_bytes", service.getBandwidthLimiter().getTotalBytesSent());
+        result.put("bandwidth", bandwidthMap);
+
+        var players = new java.util.ArrayList<Map<String, Object>>();
+        for (var state : service.getPlayers().values()) {
+            var p = new LinkedHashMap<String, Object>();
+            p.put("name", state.getPlayerName());
+            p.put("held_sync", state.getHeldSyncSlots());
+            p.put("held_gen", state.getHeldGenSlots());
+            p.put("send_queue", state.getSendQueueSize());
+            p.put("sent", state.getTotalSectionsSent());
+            p.put("bytes", state.getTotalBytesSent());
+            p.put("requests", state.getTotalRequestsReceived());
+            p.put("incoming_dropped", state.getTotalIncomingDropped());
+            players.add(p);
+        }
+        result.put("players", players);
+
+        return result;
+    }
+
+    /**
+     * Client diagnostic snapshot keyed by the soak checker contract. `received_columns`
+     * and `received_bytes` are the wire-level (pre-dimension-guard) counters used by
+     * delivery conservation; `responses.*` are the post-guard request metrics used by
+     * request conservation.
+     */
+    public static Map<String, Object> buildClientSnapshot() {
+        var result = new LinkedHashMap<String, Object>();
+        result.put("received_columns", LSSClientNetworking.getColumnsReceived());
+        result.put("received_bytes", LSSClientNetworking.getBytesReceived());
+        result.put("dropped", LSSClientNetworking.getColumnsDropped());
+        result.put("queued", LSSClientNetworking.getQueuedColumnCount());
+
+        LodRequestManager manager = LSSClientNetworking.getRequestManager();
+        if (manager != null) {
+            result.put("dimension", manager.getCurrentDimensionId());
+
+            var responses = new LinkedHashMap<String, Object>();
+            responses.put("columns", manager.getTotalColumnsReceived());
+            responses.put("up_to_date", manager.getTotalUpToDate());
+            responses.put("not_generated", manager.getTotalNotGenerated());
+            responses.put("rate_limited", manager.getTotalRateLimited());
+            result.put("responses", responses);
+
+            result.put("requested_total", manager.getTotalPositionsRequested());
+            result.put("send_cycles", manager.getTotalSendCycles());
+
+            var columns = new LinkedHashMap<String, Object>();
+            columns.put("known", manager.getReceivedColumnCount());
+            columns.put("empty", manager.getEmptyColumnCount());
+            columns.put("dirty", manager.getDirtyColumnCount());
+            result.put("columns", columns);
+
+            var scan = new LinkedHashMap<String, Object>();
+            scan.put("confirmed", manager.getConfirmedRing());
+            scan.put("ring", manager.getScanRing());
+            scan.put("missing_vanilla", manager.getMissingVanillaChunks());
+            result.put("scan", scan);
+
+            result.put("tracker_in_flight", manager.getPendingCount());
+        } else {
+            result.put("dimension", "none");
+        }
+
+        return result;
+    }
+
+    /** Append one event row to a JSONL file, creating parent directories on first use. */
+    public static void appendJsonLine(Path outputFile, Map<String, Object> row) {
+        try {
+            var parent = outputFile.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.writeString(outputFile, COMPACT_GSON.toJson(row) + "\n",
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            LSSLogger.error("[Soak] Failed to append metrics row to " + outputFile, e);
+        }
+    }
 
     public static void exportServer(Path outputFile, long durationSeconds) {
         var service = LSSServerNetworking.getRequestService();
@@ -68,7 +211,8 @@ public final class BenchmarkMetricsExporter {
             var dd = diskReader.getDiag();
             diskReaderMap.put("submitted", dd.getSubmittedCount());
             diskReaderMap.put("completed", dd.getCompletedCount());
-            diskReaderMap.put("empty", dd.getEmptyCount());
+            diskReaderMap.put("not_found", dd.getNotFoundCount());
+            diskReaderMap.put("all_air", dd.getAllAirCount());
             diskReaderMap.put("errors", dd.getErrorCount());
             long completed = dd.getCompletedCount();
             double avgMs = completed > 0 ? (dd.getTotalReadTimeNanos() / (double) completed) / LSSConstants.NANOS_PER_MS : 0;

@@ -49,6 +49,7 @@ public abstract class AbstractPlayerRequestState<T> {
     private final LongOpenHashSet diskReadDone = new LongOpenHashSet();
     private final PlayerBandwidthTracker bandwidth = new PlayerBandwidthTracker();
     private final AtomicLong totalRequestsReceived = new AtomicLong();
+    private final AtomicLong totalIncomingDropped = new AtomicLong();
     // Single-writer (main thread) — volatile for cross-thread visibility to processing thread
     private volatile int sendQueueSizeSnapshot = 0;
 
@@ -91,6 +92,7 @@ public abstract class AbstractPlayerRequestState<T> {
 
     protected void enqueueIncomingRequest(IncomingRequest request) {
         if (this.incomingRequestCount.get() >= MAX_INCOMING_QUEUE) {
+            this.totalIncomingDropped.incrementAndGet();
             return;
         }
         this.incomingRequests.add(request);
@@ -223,4 +225,5 @@ public abstract class AbstractPlayerRequestState<T> {
     public long getTotalSectionsSent() { return this.bandwidth.getTotalSectionsSent(); }
     public long getTotalBytesSent() { return this.bandwidth.getTotalBytesSent(); }
     public long getTotalRequestsReceived() { return this.totalRequestsReceived.get(); }
+    public long getTotalIncomingDropped() { return this.totalIncomingDropped.get(); }
 }

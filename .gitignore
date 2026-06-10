@@ -24,6 +24,8 @@ bin/
 
 benchmark-results/
 benchmark-worlds/
+soak-results/
+soak-worlds/
 
 # Oracle mod (standalone, never committed to main)
 oracle/

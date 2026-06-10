@@ -23,6 +23,8 @@ public class ProcessingDiagnostics {
     private volatile long totalGenDrained;
     private volatile long totalSyncRateLimited;
     private volatile long totalGenRateLimited;
+    private volatile long totalDuplicateSkips;
+    private volatile long totalRequestsRouted;
 
     public void resetTickCounters() {
         procTickDiskQueued = 0;
@@ -36,7 +38,14 @@ public class ProcessingDiagnostics {
     // Per-tick increment methods
     public void incrementDiskQueued() { procTickDiskQueued++; }
     public void incrementDiskDrained() { procTickDiskDrained++; }
-    public void incrementSkippedDuplicate() { procTickSkippedDuplicate++; }
+
+    public void incrementSkippedDuplicate() {
+        procTickSkippedDuplicate++;
+        totalDuplicateSkips++;
+    }
+
+    /** One increment per request polled off a player's incoming queue (whether answered or dropped). */
+    public void incrementRequestRouted() { totalRequestsRouted++; }
 
     public void incrementGenDrained() {
         procTickGenDrained++;
@@ -87,4 +96,6 @@ public class ProcessingDiagnostics {
     public long getTotalSyncRateLimited() { return totalSyncRateLimited; }
     public long getTotalGenRateLimited() { return totalGenRateLimited; }
     public long getTotalQueueFull() { return totalQueueFull; }
+    public long getTotalDuplicateSkips() { return totalDuplicateSkips; }
+    public long getTotalRequestsRouted() { return totalRequestsRouted; }
 }

@@ -64,6 +64,7 @@ class IncomingRequestRouter<PS extends AbstractPlayerRequestState<?>> {
 
         IncomingRequest req;
         while ((req = state.pollIncomingRequest()) != null) {
+            this.ctx.diagnostics().incrementRequestRouted();
             long packed = PositionUtil.packPosition(req.cx(), req.cz());
             if (resolvedAsDuplicate(state, playerUuid, req, packed)) continue;
             if (sendQueueFull(state, snapshot)) break;

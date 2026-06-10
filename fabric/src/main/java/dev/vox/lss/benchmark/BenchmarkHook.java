@@ -22,6 +22,13 @@ public final class BenchmarkHook {
     private BenchmarkHook() {}
 
     public static void initServer() {
+        String soakScenario = System.getProperty("lss.soak.scenario");
+        if (soakScenario != null && !soakScenario.isBlank()) {
+            // Soak mode: the scenario timeline owns the server lifetime — the benchmark
+            // tick-halt below must not arm or it would kill a multi-minute scenario at 60s.
+            SoakScenarioDriver.init(soakScenario);
+            return;
+        }
         if (!ENABLED) return;
         LSSLogger.info("[Benchmark] Server hook active, duration=" + DURATION_SECONDS + "s");
 
@@ -46,6 +53,10 @@ public final class BenchmarkHook {
     }
 
     public static void initClient() {
+        if (Boolean.getBoolean("lss.soak")) {
+            initSoakClient();
+            return;
+        }
         if (!ENABLED) return;
         LSSLogger.info("[Benchmark] Client hook active");
 
@@ -76,5 +87,46 @@ public final class BenchmarkHook {
             // halt(0) instead of exit(0): skip MC shutdown hooks for fast benchmark teardown
             Runtime.getRuntime().halt(0);
         });
+    }
+
+    /**
+     * Soak client mode (-Dlss.soak): append a snapshot row to soak-results/client.jsonl
+     * every 5 seconds, and on disconnect write a final row, then synchronously flush the
+     * column-cache IO queue BEFORE halting — the disconnect save runs async on a daemon
+     * thread and halt(0) would otherwise lose it, silently turning a warm-rejoin scenario
+     * into a cold one.
+     */
+    private static void initSoakClient() {
+        LSSLogger.info("[Soak] Client hook active");
+        Path outputFile = Path.of("soak-results", "client.jsonl");
+
+        // Register a no-op consumer so the handshake includes CAPABILITY_VOXEL_COLUMNS.
+        LSSApi.registerColumnConsumer((level, dimension, chunkX, chunkZ, columnData) -> {});
+
+        final int[] clientTick = {0};
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            clientTick[0]++;
+            if (clientTick[0] % (5 * LSSConstants.TICKS_PER_SECOND) == 0 && LSSClientNetworking.isServerEnabled()) {
+                appendSoakClientRow(outputFile, "snapshot");
+            }
+        });
+
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            LSSLogger.info("[Soak] Client disconnected, writing final snapshot");
+            appendSoakClientRow(outputFile, "disconnect");
+            // The LSS disconnect handler queued the cache save before us in registration
+            // order; this drains the single-threaded IO executor so the write lands.
+            dev.vox.lss.networking.client.ColumnCacheStore.flushPendingIo();
+            LSSLogger.info("[Soak] Cache flushed, exiting client");
+            Runtime.getRuntime().halt(0);
+        });
+    }
+
+    private static void appendSoakClientRow(Path outputFile, String event) {
+        var row = new java.util.LinkedHashMap<String, Object>();
+        row.put("event", event);
+        row.put("wallMs", System.currentTimeMillis());
+        row.putAll(BenchmarkMetricsExporter.buildClientSnapshot());
+        BenchmarkMetricsExporter.appendJsonLine(outputFile, row);
     }
 }

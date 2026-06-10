@@ -102,7 +102,7 @@ public abstract class AbstractChunkDiskReader {
         }
 
         if (serializedSections == null) {
-            this.diag.recordEmpty();
+            this.diag.recordNotFound();
             this.diag.recordCompleted(System.nanoTime() - startNs);
             addResult(playerUuid, ChunkReadResult.empty(playerUuid, chunkX, chunkZ, dimension, submissionOrder));
             return;
@@ -112,7 +112,7 @@ public abstract class AbstractChunkDiskReader {
 
         if (serializedSections.length == 0) {
             // Chunk exists on disk (FULL status) but is all air — resolve as found, not "not found"
-            this.diag.recordEmpty();
+            this.diag.recordAllAir();
             this.diag.recordCompleted(System.nanoTime() - startNs);
             addResult(playerUuid, new ChunkReadResult(playerUuid, chunkX, chunkZ,
                     null, dimension, 0, columnTimestamp, false, false, submissionOrder));
@@ -147,11 +147,16 @@ public abstract class AbstractChunkDiskReader {
     }
 
     public String getDiagnostics() {
+        return this.diag.formatDiagnostics(getPendingResultCount());
+    }
+
+    /** Read results delivered but not yet drained by the processing thread, across all players. */
+    public int getPendingResultCount() {
         int pending = 0;
         for (var queue : this.playerResults.values()) {
             pending += queue.size();
         }
-        return this.diag.formatDiagnostics(pending);
+        return pending;
     }
 
     public DiskReaderDiagnostics getDiag() { return this.diag; }
