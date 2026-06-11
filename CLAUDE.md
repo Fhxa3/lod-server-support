@@ -29,6 +29,8 @@ Output JARs:
 - `fabric/build/libs/lod-server-support-fabric.jar` — Fabric mod (client + server)
 - `paper/build/libs/lod-server-support-paper.jar` — Paper plugin (server only, shadow JAR)
 
+CI builds (env `CI=true`) name the jars `lod-server-support-<platform>-<mod_version>+<minecraft_version>.jar` (e.g. `lod-server-support-fabric-0.4.0+26.1.2.jar`); the release workflow feeds `mod_version` from the tag. Local dev builds keep the stable unversioned names.
+
 ## Test Commands
 
 ```bash

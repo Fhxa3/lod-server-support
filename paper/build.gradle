@@ -33,7 +33,10 @@ processResources {
 shadowJar {
     archiveBaseName = 'lod-server-support-paper'
     archiveClassifier = ''
-    archiveVersion = ''
+    // CI builds carry the full version in the filename (lod-server-support-paper-0.4.0+26.1.2.jar);
+    // local dev builds keep the stable unversioned name (mirrors fabric/build.gradle).
+    archiveVersion = providers.environmentVariable('CI').map { it == 'true' }.getOrElse(false)
+            ? "${project.mod_version}+${project.minecraft_version}" : ''
     configurations = [project.configurations.runtimeClasspath]
     exclude 'org/slf4j/**'
     exclude 'META-INF/maven/org.slf4j/**'

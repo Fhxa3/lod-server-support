@@ -9,8 +9,13 @@ base {
     archivesName = project.archives_base_name
 }
 
+// CI builds carry the full version in the filename (lod-server-support-fabric-0.4.0+26.1.2.jar),
+// derived from mod_version (overridden from the tag by release.yml) + minecraft_version.
+// Local dev builds keep the stable unversioned name so run configs and scripts never chase it.
+def ciArchiveVersion = providers.environmentVariable('CI').map { it == 'true' }.getOrElse(false)
+        ? "${project.mod_version}+${project.minecraft_version}" : ''
 tasks.withType(AbstractArchiveTask).configureEach {
-    archiveVersion = ''
+    archiveVersion = ciArchiveVersion
 }
 
 repositories {
