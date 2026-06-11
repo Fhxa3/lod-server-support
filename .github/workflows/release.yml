@@ -69,6 +69,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           body: ${{ steps.release_notes.outputs.notes }}
+          # Without this, a glob matching nothing publishes an empty release silently;
+          # failing here also stops the Modrinth steps from running against missing jars.
+          fail_on_unmatched_files: true
           files: |
             fabric/build/libs/lod-server-support-fabric-*.jar
             paper/build/libs/lod-server-support-paper-*.jar
