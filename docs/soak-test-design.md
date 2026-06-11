@@ -126,7 +126,9 @@ No wire/protocol changes. Unit tests for each new counter path.
 - Registers the no-op column consumer (capability bit), appends a snapshot row every 5 s
   (100 client ticks) to `soak-results/client.jsonl` under the client run dir.
 - On DISCONNECT: append final snapshot, then **synchronously flush the column cache**
-  (new `ColumnCacheStore` drain method with timeout) BEFORE `Runtime.halt(0)` — the
+  (new `ColumnCacheStore.flushPendingIo()` drain method — submits a no-op to the
+  single-threaded cache IO executor and waits for it, serializing behind the queued save;
+  no timeout, the soak.sh runtime budget is the backstop) BEFORE `Runtime.halt(0)` — the
   disconnect save is async on a daemon IO thread and `halt` loses it, which would
   silently turn warm-rejoin run 2 into a cold run.
 
@@ -139,9 +141,11 @@ No wire/protocol changes. Unit tests for each new counter path.
 - Staging per scenario (bash case): world (`fresh` | copy `soak-worlds/base`), client cache
   (`clear` = delete `<client run dir>/config/lss/cache/`, else keep), copy
   `<name>-config.json` → `<server run dir>/config/lss-server-config.json`, write
-  server.properties (`online-mode=false`, fixed seed, `pause-when-empty-seconds=-1`,
-  `view-distance=8`, `gamemode=creative`, `force-gamemode=true`, `spawn-protection=0`,
-  `max-tick-time=-1`) and options.txt (onboarding skips + `renderDistance:8` — the
+  server.properties (`online-mode=false`, fixed seed, `level-type=minecraft\:flat` —
+  fresh noise terrain carries minutes of unsettled fluid ticks that re-dirty chunks on
+  every save and block quiescence, `pause-when-empty-seconds=-1`, `view-distance=8`,
+  `gamemode=creative`, `force-gamemode=true`, `spawn-protection=0`, `max-tick-time=-1`)
+  and options.txt (onboarding skips + `renderDistance:8` — the
   exclusion circle is min(client option, server view distance) and must be deterministic).
 - Pre-flight: port 25565 free (pkill stale game JVMs with a clear message), then
   `python3 scripts/check_soak.py --validate <scenario>` BEFORE the server boots (check
@@ -165,6 +169,12 @@ snapshots): across ≥2 consecutive server snapshots, `service.requests_received
 `queued == 0`. Worlds run with `randomTickSpeed 0`, `doMobSpawning false`,
 `doFireTick false` (timeline steps — they're gamerules, not server.properties), otherwise
 ambient chunk churn re-dirties every broadcast interval and quiescence never arrives.
+Scenarios also set `doDaylightCycle false`. Gamerules alone proved insufficient: vanilla
+re-saves loaded chunks every ~10 s for metadata-only changes (inhabitedTime), so the
+Fabric save hook is additionally gated by `DirtyContentFilter` — an FNV-1a hash of the
+served section bytes that lets a save mark a column dirty only when LOD-visible content
+actually changed. This is a production change (Fabric only; Paper's dirty detection is
+event-driven), motivated by the soak harness but shipped generally.
 Client `columns.dirty` may legitimately stay > 0 (in-exclusion parked marks) — it is NOT
 part of global quiescence.
 
@@ -198,14 +208,20 @@ outside render distance, on a column the client received.
 indexing, `.get()` defaults banned):
 - fresh-backfill: gen completed > 500; converges (final window quiescent; scan.confirmed >
   lod distance)
-- warm-rejoin: run-2 `up_to_date` ≫ 0 and run-2 `columns` ≪ run-1 `columns` (cache
-  actually warm); run-2 `requested_total` ≈ disc size (full revalidation is expected shape)
+- warm-rejoin: run-2 `up_to_date` ≥ 500 and ≥ 0.5 × run-1 `columns`; run-2 `columns` <
+  run-1 `columns` — NOT near-zero: the kick unload-saves the whole disc and disk-served
+  columns have no content-filter baseline (only live serves seed it), so one bounded
+  re-send wave follows the rejoin; run-2 `requested_total` ≥ 1000 (full revalidation is
+  expected shape)
 - dimension-trip: dimension field changes twice; drains hold at each boundary; per-window
   A-laws hold inside each dimension segment
-- dirty-broadcast: after the setblock command event, client `columns.dirty` rises above its
-  pre-event baseline within 2× broadcast interval, then returns to ≤ baseline, and
-  `received_columns` increments (real re-send). Baseline-relative because parked
-  in-exclusion marks are legitimate.
+- dirty-broadcast: after the setblock command event, the server's cumulative
+  `broadcast_positions` rises within 2× broadcast interval (+5 s slack), the client's
+  final `columns.dirty` returns to ≤ its pre-event baseline, and `received_columns`
+  increments (real re-send). No 'dirty visibly rises' assertion: the
+  mark→re-request→clear transient (~1-2 s, one scan cycle) is shorter than the 5 s
+  snapshot cadence, so missing it is the normal fast-drain case. Baseline-relative
+  because parked in-exclusion marks are legitimate.
 
 **Modes:** `--validate <scenario>` (pre-boot, seconds) and
 `check_soak.py <results-dir> <scenario>` → `verdict.json` + human-readable violations,
@@ -216,9 +232,13 @@ exit 1 on any failure. Unrecognized new fields → one-line warning, never a fai
 | Scenario | World/cache | Timeline sketch | ~Runtime |
 |---|---|---|---|
 | fresh-backfill | fresh, clear | gamerules → backfill → quiesce → end; saves soak-worlds/base | ~4 min |
-| warm-rejoin | base, keep run-1 cache | backfill→quiesce→kick @120; join2: resync→quiesce→tp 400→quiesce→end | ~6 min |
-| dimension-trip | base, clear | quiesce → `execute in minecraft:the_nether run tp @a 0 150 0` → nether quiesce → return tp → quiesce | ~7 min |
+| warm-rejoin | base, clear (run 1 populates the cache; run 2 rejoins warm — under `all` ordering a kept cache would leave the run1-vs-run2 check nothing to compare) | backfill→quiesce→kick @160; join2: resync→quiesce→tp 400→quiesce→end | ~6 min |
+| dimension-trip | base, clear | quiesce → `execute in minecraft:the_end run tp @a 100 52 0` → End quiesce → return tp → quiesce | ~7 min |
 | dirty-broadcast | base, keep | quiesce → `forceload add` → `setblock 320 100 0 stone` → `save-all` → `forceload remove` → drain window → end | ~4 min |
+
+dimension-trip routes via the End, not the Nether: the End is the only second dimension
+whose terrain settles (no fluids — nether lava-ocean gen borders churn content forever),
+and its void columns exercise the all-air generation path.
 
 Creative + safe-y teleports: a dead headless client never respawns (`tick()` early-returns
 on `isDeadOrDying`) and would silently stall the run.

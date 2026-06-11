@@ -154,7 +154,10 @@ class SpiralScanner {
                 if (localScanRing < r) localScanRing = r;
             }
 
-            if (ringFullySatisfied) {
+            // Contiguous prefix only: confirming a satisfied OUTER ring while an inner ring
+            // still has unsatisfied positions (e.g. gen-cap skips) would start every later
+            // scan past the inner ring — a permanent LOD hole for a stationary player.
+            if (ringFullySatisfied && localConfirmedRing == r) {
                 localConfirmedRing = r + 1;
             }
         }

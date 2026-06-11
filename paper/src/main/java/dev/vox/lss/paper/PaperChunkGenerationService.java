@@ -146,9 +146,13 @@ public class PaperChunkGenerationService {
                     LSSLogger.warn("Chunk at " + cx + "," + cz + " was null after async load completed");
                     addFailures(gen.callbacks, key, cx, cz);
                 }
-            } catch (Exception e) {
-                LSSLogger.error("Failed to extract primitives for generated chunk at " + cx + ", " + cz, e);
+            } catch (Throwable t) {
+                // Throwable, not Exception (mirrors the Fabric twin): an Error here would
+                // otherwise skip addFailures and leak every callback's generation slot and
+                // per-player count until disconnect.
+                LSSLogger.error("Failed to extract primitives for generated chunk at " + cx + ", " + cz, t);
                 addFailures(gen.callbacks, key, cx, cz);
+                if (t instanceof Error err) throw err;
             }
         } else {
             addFailures(gen.callbacks, key, cx, cz);

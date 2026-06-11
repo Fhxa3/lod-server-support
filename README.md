@@ -12,7 +12,7 @@ Supports both **Fabric** and **Paper** servers. The client is always a Fabric mo
 | v0.3.x | 26.1.x | Server + Client | — | 0.2.14-alpha+ | 25+ |
 | v0.2.x | 1.21.11 | Server + Client | Server | 0.2.13-alpha | 21+ |
 
-Paper server support is available again as of v0.4.0, built against Paper 26.1.2 (and Purpur). Paper server admins on the older 1.21.11 line should continue using [v0.2.2](https://modrinth.com/plugin/lod-server-support/versions).
+Paper server support is available again as of v0.4.0, built against Paper 26.1.2 (and Purpur). Paper server admins on the older 1.21.11 line should continue using [v0.2.3](https://modrinth.com/plugin/lod-server-support/versions).
 
 https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 
@@ -21,7 +21,7 @@ https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 Without LSS, Voxy can only build LOD data from chunks the client has already loaded — limiting distant terrain rendering to areas the player has personally visited. LSS moves this work to the server:
 
 1. Client connects and performs a handshake with the server
-2. Server sends session config (distance limits, rate limits, generation settings)
+2. Server sends session config (distance limits, concurrency limits, generation settings)
 3. Client scans outward in an expanding spiral, batch-requesting chunks it doesn't have cached
 4. Server reads chunks from disk (or generates them on demand), serializes the raw MC section data (block states, biomes, lighting), and streams it back
 5. Client receives the section data and feeds it directly into Voxy's rendering engine via `rawIngest`
@@ -86,6 +86,7 @@ Requires Paper (or Purpur) for Minecraft 26.1.2.
 ### Client (Fabric only)
 
 - `/lss clearcache` - Clear the local column cache, forcing all chunks to be re-requested from the server
+- `/lss diag` - Show client-side diagnostics (connection, throughput, scan progress, request budget)
 
 ## Configuration
 

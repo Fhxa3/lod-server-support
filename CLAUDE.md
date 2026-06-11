@@ -37,14 +37,15 @@ Output JARs:
 ./gradlew :fabric:test -x runClientGameTest                  # Tier 1 + 2 combined
 ./gradlew :fabric:runClientGameTest                          # Tier 3: client gametests (starts integrated server + client)
 ./gradlew :fabric:build -x runClientGameTest                 # Full build + Tier 1 + 2 tests
+./gradlew :paper:test                                       # Paper JUnit tests (wire parity, NBT serialization, config)
 ```
 
-Tests only exist for the Fabric module. Paper is compile-only (manual testing required).
+Most tests live in the Fabric module. Paper has Tier 1 JUnit tests as well (`./gradlew :paper:test`) — Fabric/Paper wire parity, NBT section serialization, and config validation; Paper runtime behavior still requires manual testing.
 
 ### Test Architecture
 
-- **Tier 1** (`fabric/src/test/java/dev/vox/lss/`): JUnit 5 tests via `fabric-loader-junit`. Tests position packing, bandwidth limiter, config validation, column cache store, column timestamp cache, payload codecs, and negative/oversized payload edge cases.
-- **Tier 2** (`fabric/src/gametest/java/dev/vox/lss/test/LSSGameTests.java`): 11 Fabric server gametests. Validates `RequestProcessingService` activation, diagnostics, command registration, and config loading inside a real dedicated server.
+- **Tier 1** (`fabric/src/test/java/dev/vox/lss/`): JUnit 5 tests via `fabric-loader-junit`. Tests position packing, bandwidth limiter, config validation, column cache store, column state map, in-flight tracker, request queue, column timestamp cache, dirty tracking and content filtering, slot admission and the off-thread processor mailbox, payload codecs, Fabric/Paper wire parity, NBT section serialization, and negative/oversized payload edge cases.
+- **Tier 2** (`fabric/src/gametest/java/dev/vox/lss/test/LSSGameTests.java`): 9 Fabric server gametests. Validates `RequestProcessingService` activation, diagnostics, command registration, and config loading inside a real dedicated server.
 - **Tier 3** (`fabric/src/gametest/java/dev/vox/lss/test/LSSClientGameTests.java`): End-to-end client-server flow test. Validates handshake, session config, spiral scanning, chunk section receipt. Fabric Loom handles headless rendering automatically.
 
 The system property `-Dlss.test.integratedServer=true` (set in fabric/build.gradle for gametest JVMs) allows `RequestProcessingService` to activate on integrated servers during testing.
@@ -85,6 +86,7 @@ Chunk coordinates are packed as `((long)chunkX << 32) | (chunkZ & 0xFFFFFFFFL)`.
 - `PendingRequest` / `SlotType` — derived admission: a pending-map entry IS the held sync/generation slot (no separate limiter object)
 - `DirtyColumnTracker` — thread-safe tracker of per-dimension dirty chunk positions, drained by broadcasters
 - `SendActionBatcher` — reusable per-tick accumulator for batching `SendAction` responses by player
+- `JsonConfig` / `ServerConfigBase` — GSON config base classes; `ServerConfigBase` holds the server config fields, defaults, and clamps shared verbatim by Fabric and Paper
 
 ### Fabric Server-Side (`fabric/`)
 
@@ -96,10 +98,12 @@ Chunk coordinates are packed as `((long)chunkX << 32) | (chunkZ & 0xFFFFFFFFL)`.
 - `NbtSectionSerializer` — parses region file NBT into `LevelChunkSection` objects, then serializes them (used by `ChunkDiskReader`)
 - `ChunkGenerationService` — ticket-based chunk generation, auto-triggered on disk-read "not found"
 - `DirtyColumnBroadcaster` — periodically pushes dirty column notifications to connected players
+- `DirtyContentFilter` — FNV-1a hash of served column bytes per position; chunk saves mark a column dirty only when LOD-visible content actually changed (filters vanilla's ~10s metadata-only re-saves, e.g. inhabitedTime). Fabric only — Paper's dirty detection is event-driven.
 - `LSSNetworking` — `PayloadTypeRegistry` registration for all C2S and S2C payload types
 - `LSSServerNetworking` — server-side event listeners, `RequestProcessingService` lifecycle (started via `ServerLifecycleEvents.SERVER_STARTED`)
 - `AccessorServerChunkCache` (mixin) — exposes `ChunkMap` for disk reads
 - `AccessorChunkMap` / `ChunkMapSaveHook` (mixins) — hooks chunk saves to feed `DirtyColumnTracker`
+- `IntegratedServerLanHook` (client mixin) — starts `RequestProcessingService` when an integrated server is published to LAN
 
 ### Paper Server-Side (`paper/`)
 
@@ -118,7 +122,11 @@ Chunk coordinates are packed as `((long)chunkX << 32) | (chunkZ & 0xFFFFFFFFL)`.
 
 ### Client-Side
 
-- `LodRequestManager` — expanding spiral scan with 1-second (20-tick) scan interval, per-request tracking, rate-limit retry, dirty column re-requests, timestamp pruning on movement
+- `LodRequestManager` — orchestrates the client request loop: drip-feeds queued requests each tick, applies in-flight timeouts and rate-limit retries, handles dirty column re-requests and pruning on movement
+- `SpiralScanner` — expanding Chebyshev ring scan (20-tick cadence); owns scan policy: request budget, queue-pressure scaling, rate-limit backoff
+- `ColumnStateMap` — single owner of per-column client state (timestamps + dirty/retry/validated marks); its `classify` ladder decides whether a position needs a request
+- `InFlightTracker` / `RequestQueue` — pending requests keyed by packed position; accepted-position queue between scanner and sender
+- `ClientColumnProcessor` — off-render-thread decode of received column payloads before dispatch to consumers
 - `ColumnCacheStore` — per-server per-dimension binary cache of column positions and timestamps (enables resync across sessions)
 - `LSSClientNetworking` — packet handlers, dispatches sections to `LSSApi` consumers
 
@@ -132,11 +140,11 @@ LOD rendering mods register a `VoxelColumnConsumer` via `LSSApi.registerColumnCo
 
 ### Configuration
 
-**Fabric:** `JsonConfig` base class with GSON. Two configs auto-created in `config/`:
+**Fabric:** GSON configs built on the shared `common/` base classes (`JsonConfig` loader + `ServerConfigBase`, which holds the server fields/defaults/clamps verbatim for both platforms). Two configs auto-created in `config/`:
 - `lss-server-config.json` — bandwidth caps, LOD distance, disk reader threads, send queue limits, generation toggle, dirty broadcast interval, concurrency limits
 - `lss-client-config.json` — receive toggle (`receiveServerLods`), distance override (`lodDistanceChunks`)
 
-**Paper:** `PaperConfig` with GSON. Config at `plugins/LodServerSupport/lss-server-config.json` — same fields and defaults as Fabric server config, plus an `updateEvents` list of Bukkit event class names for dirty chunk detection.
+**Paper:** `PaperConfig` extends the same `ServerConfigBase` — identical fields, defaults, and clamps as Fabric. Config at `plugins/LodServerSupport/lss-server-config.json`, plus an `updateEvents` list of Bukkit event class names for dirty chunk detection.
 
 All config values are clamped to safe ranges (min and max) on load.
 
@@ -173,9 +181,10 @@ The shell script builds the mod, starts a dedicated server (`runBenchmarkServer`
 
 ### Key Files
 
+- `fabric/src/main/java/dev/vox/lss/BenchmarkBridge.java` — reflective gate from the entrypoints into the dev-only harness (the `dev.vox.lss.benchmark` package is excluded from release jars; production no-ops)
 - `fabric/src/main/java/dev/vox/lss/benchmark/BenchmarkHook.java` — tick counter, auto-shutdown, metric dump
 - `fabric/src/main/java/dev/vox/lss/benchmark/BenchmarkMetricsExporter.java` — JSON serialization of all diagnostic + JVM data
-- `scripts/benchmark.sh` — orchestrator (build → start server → start client → wait → collect)
+- `scripts/benchmark.sh` — orchestrator (build → start server → start client → wait → collect); sources `scripts/lib/mc-run.sh` for the shared server/client lifecycle helpers
 
 ### Scenarios Explained
 
@@ -197,6 +206,41 @@ The shell script builds the mod, starts a dedicated server (`runBenchmarkServer`
 - `avg_rtt_ms` — round-trip time for chunk requests
 - `total_not_generated` — chunks the server couldn't serve (fresh world only)
 - `total_rate_limited` — client-observed rate limiting
+
+## Soak Testing
+
+Scenario-driven correctness harness: a real dedicated server + headless client execute a scripted timeline, both sides append JSONL diagnostic snapshots, and a Python checker enforces conservation invariants (request/delivery/generation/disk accounting) plus per-scenario expectations. Gated behind `-Dlss.soak.scenario=<path>` (server) and `-Dlss.soak=true` (client) — never activates in production. Design spec: `docs/soak-test-design.md`.
+
+### Quick Start
+
+```bash
+./scripts/soak.sh fresh-backfill    # Fresh superflat world — generation backfill; saves soak-worlds/base
+./scripts/soak.sh warm-rejoin       # Two client runs — warm cache resync after a kick
+./scripts/soak.sh dimension-trip    # Overworld → End → Overworld dimension boundaries
+./scripts/soak.sh dirty-broadcast   # setblock → dirty broadcast → client re-request
+./scripts/soak.sh all               # All four in order; stops at first failure
+```
+
+Scenarios needing a base world auto-run `fresh-backfill` first. Exit code = checker exit code.
+
+### Output Files
+
+- `soak-results/<scenario>-<timestamp>/server.jsonl` — server snapshot/command/join/end event rows
+- `soak-results/<scenario>-<timestamp>/client-run<N>.jsonl` — client snapshot/disconnect rows per run
+- `soak-results/<scenario>-<timestamp>/verdict.json` — checker verdict (conservation laws + named checks)
+
+### How It Works
+
+`soak.sh` stages world/cache/config per scenario, pre-validates the timeline (`check_soak.py --validate`), then starts `runSoakServer` and `runSoakClient` (no JFR). `SoakScenarioDriver` fires timeline commands at join-anchored offsets, snapshots every 5 s, and halts the server at scenario end; the soak client synchronously flushes its column cache before exiting. The checker evaluates deltas between verified-quiescent snapshots and writes `verdict.json`; any violation exits nonzero.
+
+### Key Files
+
+- `scripts/soak.sh` — orchestrator (stage → validate → run → collect → check)
+- `scripts/soak-scenarios/<name>.json` + `<name>-config.json` — driver timeline + sparse server-config overrides
+- `scripts/check_soak.py` — stdlib Python invariant checker (`--validate` pre-flight, post-run laws, `--selftest`)
+- `scripts/lib/mc-run.sh` — shared server/client lifecycle helpers (sourced by soak.sh and benchmark.sh)
+- `fabric/src/main/java/dev/vox/lss/benchmark/SoakScenarioDriver.java` — server-side timeline executor + JSONL snapshots
+- `fabric/src/main/java/dev/vox/lss/BenchmarkBridge.java` — reflective gate to the dev-only harness package (excluded from release jars)
 
 ## Key Patterns
 

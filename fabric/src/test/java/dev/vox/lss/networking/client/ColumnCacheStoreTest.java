@@ -56,6 +56,38 @@ class ColumnCacheStoreTest {
     }
 
     @Test
+    void clearForServerRunsAfterQueuedAsyncSave() {
+        var dim = testDimension("fifo_clear");
+        var map = new Long2LongOpenHashMap();
+        map.defaultReturnValue(-1L);
+        map.put(7L, 700L);
+
+        ColumnCacheStore.saveAsync("test-fifo-clear", dim, map);
+        // clearForServer runs on the same FIFO IO thread and waits, so it must execute
+        // AFTER the queued save — the save cannot resurrect the files we just cleared.
+        ColumnCacheStore.clearForServer("test-fifo-clear");
+
+        assertTrue(ColumnCacheStore.load("test-fifo-clear", dim).isEmpty(),
+                "a queued async save must not survive a subsequent synchronous clear");
+    }
+
+    @Test
+    void flushPendingIoWaitsForQueuedAsyncSave() {
+        var dim = testDimension("flush_wait");
+        var map = new Long2LongOpenHashMap();
+        map.defaultReturnValue(-1L);
+        map.put(9L, 900L);
+
+        ColumnCacheStore.saveAsync("test-flush-wait", dim, map);
+        // The soak/benchmark harness halts the JVM right after this call — it must
+        // guarantee the queued save has landed on disk.
+        ColumnCacheStore.flushPendingIo();
+
+        assertEquals(900L, ColumnCacheStore.load("test-flush-wait", dim).get(9L));
+        ColumnCacheStore.clearForServer("test-flush-wait");
+    }
+
+    @Test
     void missingFileReturnsEmpty() {
         var dim = testDimension("missing");
         var loaded = ColumnCacheStore.load("nonexistent-server", dim);

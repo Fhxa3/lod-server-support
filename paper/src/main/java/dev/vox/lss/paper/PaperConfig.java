@@ -29,8 +29,12 @@ public class PaperConfig extends ServerConfigBase {
             "org.bukkit.event.block.BlockPistonExtendEvent",
             "org.bukkit.event.block.BlockPistonRetractEvent",
             "org.bukkit.event.entity.EntityChangeBlockEvent",
-            "org.bukkit.event.world.StructureGrowEvent",
-            "org.bukkit.event.world.ChunkPopulateEvent"
+            "org.bukkit.event.world.StructureGrowEvent"
+            // ChunkPopulateEvent is deliberately NOT a default: it fires for every chunk LSS
+            // itself generates, and the resulting dirty mark re-sends the identical column on
+            // the next broadcast (every generated column delivered twice — the same waste
+            // Fabric's DirtyContentFilter generation-seed eliminates). Clients that need a
+            // freshly populated chunk request it through the normal scan path anyway.
     );
 
     @Override

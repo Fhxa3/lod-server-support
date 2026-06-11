@@ -31,4 +31,6 @@ soak-worlds/
 oracle/
 
 # Git worktrees
-.worktrees/__pycache__/
+.worktrees/
+
+__pycache__/
