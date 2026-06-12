@@ -141,10 +141,7 @@ public class LodRequestManager {
                 updateSendPerTick(scanned);
             }
             // Timeout sweep: evict stale requests on the scan cadence (even if scan skipped).
-            // Evictions are marked for retry — in-flight counts as satisfied for ring
-            // confirmation, so an unmarked eviction inside a confirmed ring would never be
-            // rescanned (permanent hole; see InFlightTracker.timeoutSweep).
-            this.tracker.timeoutSweep(TIMEOUT_NANOS, this.columns::markRetry);
+            sweepTimeouts();
         }
 
         // --- Every tick: drain queue through concurrency limits ---
@@ -191,6 +188,17 @@ public class LodRequestManager {
         }
 
         return count;
+    }
+
+    /**
+     * Evict timed-out in-flight requests and mark each eviction for retry — in-flight
+     * counts as satisfied for ring confirmation, so an unmarked eviction inside a
+     * confirmed ring would never be rescanned (permanent hole; the bandwidth-throttle
+     * soak found 161 such orphans; see InFlightTracker.timeoutSweep).
+     * Package-private for direct test coverage — tick() needs a running Minecraft client.
+     */
+    void sweepTimeouts() {
+        this.tracker.timeoutSweep(TIMEOUT_NANOS, this.columns::markRetry);
     }
 
     // --- Request sending and callbacks ---

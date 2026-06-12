@@ -30,7 +30,11 @@ import java.util.Map;
  * anchors, a 1-tick repeating task for the tick clock — both main thread); commands run
  * through the identical NMS console path Fabric uses, and the end halt is vanilla
  * {@code MinecraftServer.halt(false)} (what /stop does), so the world save-on-exit
- * semantics match. Dev-only: gated behind -Dlss.soak.scenario via PaperSoakBridge and
+ * semantics match. One deliberate divergence: CraftBukkit makes gamerules per-world
+ * (vanilla's are global), so a console {@code gamerule} would only reach the overworld —
+ * the driver fans gamerule steps out to every loaded dimension via {@code execute in}
+ * so the End/nether inherit the timeline's rules exactly as they do under Fabric.
+ * Dev-only: gated behind -Dlss.soak.scenario via PaperSoakBridge and
  * excluded from the release shadowJar (runSoakServer feeds the soakShadowJar variant).
  */
 public final class PaperSoakScenarioDriver implements Listener {
@@ -150,12 +154,32 @@ public final class PaperSoakScenarioDriver implements Listener {
             row.put("at", step.at);
             PaperSoakMetricsExporter.appendJsonLine(OUTPUT, row);
             try {
-                this.server.getCommands().performPrefixedCommand(
-                        this.server.createCommandSourceStack(), step.cmd);
+                executeStepCommand(step.cmd);
             } catch (RuntimeException e) {
                 LSSLogger.error("[Soak] Step command failed: " + step.cmd, e);
             }
         }
+    }
+
+    /**
+     * Run one timeline command through the NMS console path. Gamerule steps are fanned out
+     * to every loaded world: CraftBukkit stores gamerules per-world (vanilla's are global),
+     * so a plain console {@code gamerule} would apply to the overworld only and e.g.
+     * dimension-trip's quiescence rules (randomTickSpeed 0, doMobSpawning false, ...) would
+     * never reach the End — the shared Fabric timelines assume global gamerule semantics.
+     */
+    private void executeStepCommand(String cmd) {
+        String bare = cmd.startsWith("/") ? cmd.substring(1) : cmd;
+        if (bare.startsWith("gamerule ")) {
+            for (var level : this.server.getAllLevels()) {
+                String scoped = "execute in " + level.dimension().identifier() + " run " + bare;
+                this.server.getCommands().performPrefixedCommand(
+                        this.server.createCommandSourceStack(), scoped);
+            }
+            return;
+        }
+        this.server.getCommands().performPrefixedCommand(
+                this.server.createCommandSourceStack(), cmd);
     }
 
     private boolean endReached() {

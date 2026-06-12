@@ -19,8 +19,9 @@ set -euo pipefail
 # SOAK_PLATFORM=paper runs the identical scenario against a real Paper server
 # (:paper:runSoakServer + PaperSoakScenarioDriver) with the UNCHANGED Fabric soak
 # client and checker. Paper keeps its own base-world snapshot (soak-worlds/base-paper);
-# Paper stores the End in world_the_end/, which is not part of the snapshot, so the
-# staged End regenerates from the fixed seed (acceptable — the laws are delta-based).
+# on MC 26.1.2 Paper uses the vanilla unified layout (world/dimensions/minecraft/<dim>,
+# no split world_nether/world_the_end dirs), so the snapshot carries every dimension —
+# including the End — exactly like Fabric's.
 
 SCENARIO="${1:-}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -136,7 +137,7 @@ CLIENT_EXTRA_ARGS=()
 case "$SCENARIO" in
     fresh-backfill)             CLIENT_RUNS=1; EXPECTED_SECONDS=280 ;;
     warm-rejoin)                CLIENT_RUNS=2; EXPECTED_SECONDS=360 ;;
-    dimension-trip)             CLIENT_RUNS=1; EXPECTED_SECONDS=420 ;;
+    dimension-trip)             CLIENT_RUNS=1; EXPECTED_SECONDS=440 ;;
     dirty-broadcast)            CLIENT_RUNS=1; EXPECTED_SECONDS=270 ;;
     rate-limit-storm)           CLIENT_RUNS=1; EXPECTED_SECONDS=370 ;;
     disk-saturation)            CLIENT_RUNS=1; EXPECTED_SECONDS=250 ;;
@@ -145,7 +146,7 @@ case "$SCENARIO" in
     bandwidth-throttle)         CLIENT_RUNS=1; EXPECTED_SECONDS=290 ;;
     cold-restart-resync)        CLIENT_RUNS=1; EXPECTED_SECONDS=280 ;;
     enabled-false)              CLIENT_RUNS=1; EXPECTED_SECONDS=230 ;;
-    teleport-prune)             CLIENT_RUNS=1; EXPECTED_SECONDS=420 ;;
+    teleport-prune)             CLIENT_RUNS=1; EXPECTED_SECONDS=470 ;;
     dirty-range-filter)         CLIENT_RUNS=1; EXPECTED_SECONDS=350 ;;
     dirty-during-backfill)      CLIENT_RUNS=1; EXPECTED_SECONDS=240 ;;
     dirty-while-offline)        CLIENT_RUNS=2; EXPECTED_SECONDS=420
@@ -225,12 +226,11 @@ mkdir -p "$RUN_RESULTS_DIR"
 
 # Step 5a: Stage world. Fresh-world scenarios start from nothing (generation paths);
 # only fresh-backfill SAVES its world as the reusable base afterwards (Step 13).
-# world_nether/world_the_end only exist on Paper (split dimension dirs) and are always
-# cleared: the base snapshot carries world/ only, so the End regenerates from the seed.
+# Both platforms keep all dimensions inside world/ (Paper on MC 26.1.2 uses the vanilla
+# unified world/dimensions/minecraft/<dim> layout, not the legacy split
+# world_nether/world_the_end dirs), so clearing/copying world/ covers the End too.
 echo "[soak] Staging world for scenario: $SCENARIO"
 rm -rf "$SERVER_RUN_DIR/world"
-rm -rf "$SERVER_RUN_DIR/world_nether"
-rm -rf "$SERVER_RUN_DIR/world_the_end"
 if [[ " $FRESH_WORLD_SCENARIOS " != *" $SCENARIO "* ]]; then
     cp -r "$BASE_WORLD_DIR/world" "$SERVER_RUN_DIR/world"
 fi

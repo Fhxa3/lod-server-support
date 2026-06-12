@@ -244,6 +244,17 @@ class DedupFanoutTest {
             p2.enqueue(new IncomingRequest(7, 7, 1L));
             pumpUntil(proc, dims, () -> p2.getHeldSyncSlots() == 1, "p2 attached");
 
+            // Barrier scaffolding: a second gated group at an unused position with the roles
+            // flipped (p2 primary, p1 attached). applyEvents' cleanup of a removed player's
+            // PRIMARY groups releases the attached players' pending entries, so p1's slot
+            // count dropping is the only externally observable proof that the processing
+            // thread has applied the removal.
+            p2.enqueue(new IncomingRequest(9, 9, 1L));
+            pumpUntil(proc, dims, () -> p2.getHeldSyncSlots() == 2 && proc.diskSubmits.get() == 2,
+                    "p2 admitted as primary of the barrier group");
+            p1.enqueue(new IncomingRequest(9, 9, 1L));
+            pumpUntil(proc, dims, () -> p1.getHeldSyncSlots() == 2, "p1 attached to the barrier group");
+
             // p2 disconnects and rejoins with a fresh state while the read is still in flight
             // (production removePlayer + registerPlayer: same UUID, new state object).
             players.remove(u2);
@@ -253,19 +264,27 @@ class DedupFanoutTest {
             players.put(u2, p2b);
             reader.registerPlayer(u2);
 
+            // Barrier: the removal is only mailbox-buffered; a cycle whose take predates
+            // notifyPlayerRemoved can still be mid-flight and would route a request enqueued
+            // now BEFORE the removal applies — the removal would then strip the rejoiner's
+            // fresh attachment. Wait for the removal's observable effect (the barrier group's
+            // cleanup releasing p1's attached slot) before the re-request exists.
+            pumpUntil(proc, dims, () -> p1.getHeldSyncSlots() == 1,
+                    "removal applied (barrier group cleanup released p1's attachment)");
+
             // The rejoined session re-requests the same position: the group must have survived
             // the attachee's removal (still keyed by the primary), so it attaches without a
-            // second read. The removal is mailbox-buffered before the enqueue, so any cycle
-            // that routes this request has already applied it.
+            // second read.
             p2b.enqueue(new IncomingRequest(7, 7, 1L));
             pumpUntil(proc, dims, () -> p2b.getHeldSyncSlots() == 1, "rejoined p2 attached");
 
             reader.gate.countDown();
             pumpUntil(proc, dims, () -> p1.getHeldSyncSlots() == 0 && p2b.getHeldSyncSlots() == 0,
                     "group resolves the primary and the rejoined attachment");
-            assertEquals(1, proc.diskSubmits.get(),
-                    "rejoiner must attach to the surviving group, not trigger a second read");
-            assertEquals(1, reader.readsExecuted.get());
+            assertEquals(2, proc.diskSubmits.get(),
+                    "rejoiner must attach to the surviving group, not trigger a third read"
+                            + " (2 = the (7,7) group + the barrier group)");
+            assertEquals(2, reader.readsExecuted.get());
 
             runBarrierRead(proc, dims, p1, 100, 100);
             var fanout = proc.deliveries.stream().filter(d -> d.cx() == 7 && d.cz() == 7).toList();

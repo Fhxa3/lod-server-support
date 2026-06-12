@@ -107,13 +107,31 @@ class ColumnStateMapTest {
         assertEquals(0, map.dirtyCount());
     }
 
+    // Contract change: retry marks used to survive onReceived deliberately, because their
+    // only writer was a rate-limit bounce — a guarantee that no response was coming, so a
+    // late receipt could only belong to an OLDER request and the retry still had to fire.
+    // The timeout sweep (LodRequestManager.sweepTimeouts) broke that premise: it marks
+    // retry for positions whose response can still arrive late, and an answer supersedes
+    // the pending retry — keeping the mark re-requested every late-delivered column once
+    // and reset ring confirmation for nothing.
     @Test
-    void onReceivedKeepsRetry() {
+    void onReceivedClearsRetry() {
         map.onReceived(POS, 5000L);
         map.markRetry(POS);
         map.onReceived(POS, 6000L);
-        assertEquals(6000L, map.classify(POS, true),
-                "rate-limit retry mark deliberately survives onReceived (unlike markSent)");
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "a data answer supersedes the pending retry — no redundant re-request");
+        assertFalse(map.hasRetries(), "lingering retry would pin confirmedRing to 0 for an extra scan");
+    }
+
+    @Test
+    void onUpToDateClearsRetry() {
+        map.onReceived(POS, 5000L);
+        map.markRetry(POS);
+        map.onUpToDate(POS);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "an up-to-date answer supersedes the pending retry exactly like data");
+        assertFalse(map.hasRetries());
     }
 
     @Test

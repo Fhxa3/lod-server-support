@@ -142,7 +142,8 @@ class PaperChunkGenerationServiceTest {
         }
         assertEquals(11L, byPlayer(ready, a).submissionOrder());
         assertEquals(22L, byPlayer(ready, b).submissionOrder());
-        assertEquals(diag(1, 0, 0, 0, 0), svc.getDiagnostics());
+        assertEquals(diag(1, 0, 0, 0, 1), svc.getDiagnostics(),
+                "one failed launch counts once as removed-in-flight (not per callback)");
         assertTrue(svc.tick().isEmpty(), "outcomes are drained exactly once");
     }
 
@@ -222,7 +223,8 @@ class PaperChunkGenerationServiceTest {
         assertTrue(svc.submitGeneration(b, level, 0, 0, 2L));
         svc.removePlayer(a);
         assertEquals(diag(1, 0, 1, 0, 0), svc.getDiagnostics(),
-                "launch survives (b still waits); removedInFlight only counts fully-orphaned launches");
+                "launch survives (b still waits); removedInFlight only counts terminal removals"
+                        + " (fully-orphaned or failed launches), not a launch with a surviving waiter");
 
         svc.onChunkReady(svc.launches.get(0).key(), level, null, 0, 0);
         var ready = svc.tick();
@@ -273,7 +275,8 @@ class PaperChunkGenerationServiceTest {
         var ready = svc.tick();
         assertEquals(1, ready.size());
         assertNull(ready.get(0).columnData());
-        assertEquals(diag(1, 0, 0, 0, 0), svc.getDiagnostics(), "not counted as completed");
+        assertEquals(diag(1, 0, 0, 0, 1), svc.getDiagnostics(),
+                "not completed — the failure is counted as removed-in-flight so the books balance");
         assertTrue(svc.submitGeneration(a, level, 5, 4, 2L));
     }
 
@@ -290,6 +293,8 @@ class PaperChunkGenerationServiceTest {
         var ready = svc.tick();
         assertEquals(1, ready.size());
         assertNull(ready.get(0).columnData());
+        assertEquals(diag(1, 0, 0, 0, 1), svc.getDiagnostics(),
+                "extraction failure counts as removed-in-flight, never as completed");
         assertTrue(svc.submitGeneration(a, level, 1, 0, 2L), "slot freed despite the exception");
     }
 
@@ -309,6 +314,8 @@ class PaperChunkGenerationServiceTest {
         var ready = svc.tick();
         assertEquals(1, ready.size());
         assertNull(ready.get(0).columnData());
+        assertEquals(1L, svc.getTotalRemovedInFlight(),
+                "the removal was counted before the Error propagated");
         assertTrue(svc.submitGeneration(a, level, 1, 0, 2L));
     }
 
@@ -414,6 +421,15 @@ class PaperChunkGenerationServiceTest {
         // (1,0) never completes -> timeout only
         for (int tick = 1; tick <= 21; tick++) svc.tick();
         assertEquals(1L, svc.getTotalTimeouts());
+        assertEquals(0, svc.getActiveCount());
+
+        // A failed async load (null chunk) -> removed_in_flight only: the terminal counter
+        // for removals that neither completed nor timed out, so A4 still balances.
+        assertTrue(svc.submitGeneration(a, level, 5, 5, 5L));
+        svc.onChunkReady(svc.launches.get(3).key(), level, null, 5, 5);
+        assertEquals(1, svc.tick().size());
+        assertEquals(2L, svc.getTotalRemovedInFlight());
+        assertEquals(1L, svc.getTotalCompleted(), "failure must not count as completed");
         assertEquals(0, svc.getActiveCount());
 
         // A4 books balance: submitted == completed + timeouts + removed_in_flight

@@ -40,9 +40,14 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
         this.requestService = new PaperRequestProcessingService(nmsServer, this, this.lssConfig);
         LSSLogger.info("Starting LSS LOD request processing service");
 
-        // Register dirty chunk event listeners
-        var worldHandler = new PaperWorldHandler(this, this.requestService.getDirtyTracker());
-        worldHandler.registerUpdateListeners(this.lssConfig.updateEvents);
+        // Register dirty chunk event listeners. enabled=false gates here (mirrors Fabric's
+        // ChunkMapSaveHook gate): the service tick — and so the dirty-broadcast drain — is
+        // disabled, so marking would grow the DirtyColumnTracker without bound for the whole
+        // server run. enabled is immutable per run, so skipping registration is safe.
+        if (this.lssConfig.enabled) {
+            var worldHandler = new PaperWorldHandler(this, this.requestService.getDirtyTracker());
+            worldHandler.registerUpdateListeners(this.lssConfig.updateEvents);
+        }
 
         // Register command
         var cmd = getCommand("lsslod");

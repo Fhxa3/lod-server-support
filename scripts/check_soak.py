@@ -34,7 +34,9 @@ dirty.pending == 0; joined to the nearest-in-wallMs client snapshot of the match
 Modes:
   check_soak.py --validate <scenario-name>      pre-flight scenario/config/registry validation
   check_soak.py <results-dir> <scenario-name>   evaluate laws + named checks, write verdict.json
-  check_soak.py --selftest                      in-memory law sanity check (A4)
+  check_soak.py --selftest                      in-memory pass/catch self-test of every law
+                                                (A1-A7, B1, B2), quiescence, disc completeness,
+                                                window floors, and all named checks
 """
 
 import argparse
@@ -81,6 +83,9 @@ ANOMALY_OPT_INS = {
 # recorded green runs at roughly one third of observed counts: fresh-backfill 31, warm-rejoin
 # 27/17, dimension-trip 6/22/16, dirty-broadcast 16. New scenarios get a conservative 3
 # (their converged tails run 40+ s at 5 s snapshot cadence).
+# Scenarios allowed to finish with zero nonzero-delta client-law windows (no LSS traffic).
+TRAFFIC_FLOOR_EXEMPT = frozenset({"enabled-false"})
+
 MIN_CLIENT_WINDOWS = {
     "fresh-backfill": {(1, 0): 10},
     "warm-rejoin": {(1, 0): 8, (2, 0): 5},
@@ -315,9 +320,10 @@ class QPoint:
     si: int        # server snapshot index (the LATER element of the stable pair)
     sseg: int      # server join segment (== client run number; 0 = before first join)
     run: int       # client run number
-    ci: int        # index into that run's snapshot list
+    ci: int        # index into that run's snapshot list (nearest — named checks/joins)
     cseg: int      # client dimension segment of the joined snapshot
     wall: int      # server snapshot wallMs
+    cib: int | None = None  # bounded at-or-before law row (see find_quiescent)
 
 
 def server_pair_quiescent(prev, cur):
@@ -365,8 +371,22 @@ def find_quiescent(server_snaps, runs):
             continue
         if crow["tracker_in_flight"] != 0 or crow["queued"] != 0:
             continue
+        # Law endpoint row (cib): the LATEST client row at-or-before this instant but
+        # not older than the stillness pair's start. The pair guarantees zero server
+        # activity and empty drains across [prev, cur], so a row inside that span holds
+        # counter values exactly equal to the instant's — no forward-skew exposure
+        # (a nearest-row pairing can lag INTO resumed traffic and desync the window).
+        cib = None
+        for j in range(len(snaps) - 1, -1, -1):
+            w = snaps[j]["wallMs"]
+            if w <= cur["wallMs"] and w >= prev["wallMs"] - SKEW_MS:
+                if snaps[j]["tracker_in_flight"] == 0 and snaps[j]["queued"] == 0:
+                    cib = j
+                break
+            if w < prev["wallMs"] - SKEW_MS:
+                break
         qpoints.append(QPoint(si=i, sseg=cur["_seg"], run=run, ci=ci,
-                              cseg=crow["_seg"], wall=cur["wallMs"]))
+                              cseg=crow["_seg"], wall=cur["wallMs"], cib=cib))
     return qpoints
 
 
@@ -549,6 +569,20 @@ def law_B2(snaps, cap_bytes_per_sec):
     must not outpace the configured global cap (with B2_HEADROOM for tick jitter). Evaluated
     over the raw series — pacing must hold DURING the storm, not just at quiescence."""
     out = []
+    # Whole-run cumulative bound: the per-window headroom only absorbs snapshot-edge
+    # transients; a sustained pacing regression (e.g. a divisor bug) hides inside it
+    # window-by-window but not cumulatively. Recorded worst case is 1.6% over the cap,
+    # so 5% headroom is generous yet tight.
+    if len(snaps) >= 2:
+        total_dt = (snaps[-1]["wallMs"] - snaps[0]["wallMs"]) / 1000.0
+        total_bytes = (get_path(snaps[-1], "bandwidth.total_bytes")
+                       - get_path(snaps[0], "bandwidth.total_bytes"))
+        if total_dt > 30 and total_bytes > cap_bytes_per_sec * total_dt * 1.05:
+            out.append(Violation("B2", f"wallMs[{snaps[0]['wallMs']}..{snaps[-1]['wallMs']}] whole-run",
+                                 "cumulative bandwidth exceeded the configured cap by more than 5%",
+                                 {"cap_bytes_per_s": cap_bytes_per_sec,
+                                  "total_bytes": total_bytes,
+                                  "wall_seconds": round(total_dt, 1)}))
     for i in range(1, len(snaps)):
         prev, cur = snaps[i - 1], snaps[i]
         dt = (cur["wallMs"] - prev["wallMs"]) / 1000.0
@@ -595,6 +629,7 @@ def evaluate_laws(ctx):
     violations = []
     windows = 0
     client_windows = {}
+    traffic_windows = 0
     snaps = ctx.server_snaps
     opt_ins = ANOMALY_OPT_INS.get(ctx.scenario, frozenset())
 
@@ -608,31 +643,72 @@ def evaluate_laws(ctx):
     if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
         violations += law_B2(snaps, cap)
 
-    # Quiescent-pair windows.
+    # Quiescent-pair windows. Client-law endpoints use each qpoint's BOUNDED at-or-before
+    # row (QPoint.cib): the stillness pair behind every qpoint guarantees zero server
+    # activity and empty drains across its span, so a client row inside that span carries
+    # counter values exactly equal to the instant's. This is skew-safe in both directions
+    # (a nearest-row pairing could lag INTO resumed traffic — the original false-A2 bug —
+    # while a two-sided-plateau requirement excluded every window that contained traffic,
+    # making the laws structurally vacuous: the CRITICAL review finding).
+    seg_first_window = {}
+
+    def run_client_laws(ps, cs, pc, cc, win, key, skip_a5=False):
+        nonlocal traffic_windows
+        v = []
+        v += law_A1(ps, cs, pc, cc, win)
+        v += law_A2(ps, cs, pc, cc, win)
+        if not skip_a5:
+            v += law_A5(ps, cs, pc, cc, win)
+        v += law_B1(ps, cs, pc, cc, win)
+        client_windows[key] = client_windows.get(key, 0) + 1
+        if get_path(cc, "requested_total") - get_path(pc, "requested_total") > 0:
+            traffic_windows += 1
+        return v
+
+    # Virtual run-start windows: each run's client counters are exactly zero at join,
+    # and the last pre-join server snapshot is still by construction (no client, or the
+    # kick gap). Anchoring the run's FIRST window there puts the entire backfill/resync
+    # burst inside a conservation window — without it, traffic before the first natural
+    # qpoint (i.e. the bulk of every scenario) is never law-checked.
+    for run, join in enumerate(ctx.joins, start=1):
+        csnaps = ctx.runs.get(run)
+        if not csnaps:
+            continue
+        first_q = next((q for q in ctx.qpoints if q.run == run and q.cib is not None), None)
+        if first_q is None or first_q.cseg != csnaps[0]["_seg"]:
+            continue  # no in-segment quiescence — covered only by named checks
+        pre = [sn for sn in snaps if sn["wallMs"] <= join["wallMs"]]
+        if not pre:
+            continue
+        ps, cs = pre[-1], snaps[first_q.si]
+        cc = csnaps[first_q.cib]
+        pc = {"wallMs": join["wallMs"], "requested_total": 0, "received_columns": 0,
+              "received_bytes": 0, "dropped": 0,
+              "responses": {"columns": 0, "up_to_date": 0, "not_generated": 0,
+                            "rate_limited": 0}}
+        win = window_label(ps, cs, run=run, dim=cc.get("dimension")) + " run-start"
+        violations += run_client_laws(ps, cs, pc, cc, win, (run, first_q.cseg))
+        windows += 1
+
     for k in range(1, len(ctx.qpoints)):
         q1, q2 = ctx.qpoints[k - 1], ctx.qpoints[k]
         ps, cs = snaps[q1.si], snaps[q2.si]
         same_window = (q1.run == q2.run and q1.cseg == q2.cseg and q1.sseg == q2.sseg)
-        # Client-involving laws need more than instant-stillness at the endpoints: the
-        # paired client row can lag the server instant by up to SKEW_MS, so the endpoint
-        # must sit inside a TWO-SIDED still plateau (the pair behind it proves stillness
-        # before; the row after it must be still too, covering the client row's skew).
-        # A one-sided endpoint let a send burst land between the server instant and the
-        # client row — server delta 52, client delta 0, false A1/A2. Also require
-        # distinct ordered client rows (same-row joins make client deltas vacuously 0).
-        def two_sided(q):
-            return q.si + 1 >= len(snaps) or server_pair_quiescent(snaps[q.si], snaps[q.si + 1])
-        client_laws_ok = same_window and q1.ci < q2.ci and two_sided(q1) and two_sided(q2)
+        client_laws_ok = (same_window and q1.cib is not None and q2.cib is not None
+                          and q1.cib < q2.cib)
         if same_window:
-            pc, cc = ctx.runs[q1.run][q1.ci], ctx.runs[q2.run][q2.ci]
-            win = window_label(ps, cs, run=q1.run, dim=cc.get("dimension"))
+            win_dim = ctx.runs[q1.run][q1.ci].get("dimension")
+            win = window_label(ps, cs, run=q1.run, dim=win_dim)
             if client_laws_ok:
-                violations += law_A1(ps, cs, pc, cc, win)
-                violations += law_A2(ps, cs, pc, cc, win)
-                violations += law_A5(ps, cs, pc, cc, win)
-                violations += law_B1(ps, cs, pc, cc, win)
-                key = (q1.run, q1.cseg)
-                client_windows[key] = client_windows.get(key, 0) + 1
+                pc, cc = ctx.runs[q1.run][q1.cib], ctx.runs[q2.run][q2.cib]
+                # A5 exempt in the first window after a segment change: a single request's
+                # disk-notFound and its gen-escalation/ng can straddle the dimension
+                # switch, splitting the identity's two sides across adjacent windows
+                # (observed live as an exact off-by-one on Paper dimension-trip).
+                first_after_boundary = seg_first_window.get((q1.run, q1.cseg), True)
+                seg_first_window[(q1.run, q1.cseg)] = False
+                violations += run_client_laws(ps, cs, pc, cc, win, (q1.run, q1.cseg),
+                                              skip_a5=first_after_boundary and q1.cseg > 0)
             violations += law_A3(ps, cs, win)
             violations += law_A4(ps, cs, win)
             violations += law_A7_server(ps, cs, win, opt_ins)
@@ -669,6 +745,16 @@ def evaluate_laws(ctx):
 
     # Vacuous-pass guard: enough client-laws windows actually evaluated per (run, segment).
     violations += check_window_floors(MIN_CLIENT_WINDOWS.get(ctx.scenario, {}), client_windows)
+    # Traffic floor: the client laws must have fired on at least one window with REAL
+    # deltas. Without this, a regression in window construction (e.g. the two-sided
+    # endpoint skip this guards against) can leave every evaluated window zero-delta —
+    # conservation 'verified' as 0 == 0. enabled-false is exempt: it legitimately has
+    # no LSS traffic at all.
+    if ctx.scenario not in TRAFFIC_FLOOR_EXEMPT and traffic_windows == 0:
+        violations.append(Violation("law-coverage", "entire run",
+                                    "no client-laws window carried nonzero request deltas — "
+                                    "conservation laws never fired on real traffic",
+                                    {"client_windows": sum(client_windows.values())}))
     return violations, windows, sum(client_windows.values())
 
 
@@ -1133,6 +1219,18 @@ def check_teleport_prune(ctx):
     no chunks out there), and the run must reconverge. The registered disc-completeness
     check supplies the >= annulus floor; this check supplies the <= bound that a prune
     regression (both discs retained, ~2x annulus) blows through."""
+    # The LAST tp is the long prune teleport — every timeline also has the standard
+    # origin pin (tp @a 0 150 0) a few seconds after join, which must not be the anchor.
+    tps = [c for c in ctx.commands if c["cmd"].startswith("tp ")]
+    tp = tps[-1] if tps else None
+    if tp is not None and not any(ctx.server_snaps[i]["wallMs"] < tp["wallMs"]
+                                  for i in ctx.quiescent_server):
+        yield Violation("teleport-prune", "pre-teleport",
+                        "premise lost — origin disc never verified-quiescent before the "
+                        "long teleport (an in-flight request could be silently "
+                        "range-dropped, which the laws would misread)",
+                        {"tp_wallMs": tp["wallMs"]})
+        return
     snaps = ctx.runs.get(1)
     if not snaps:
         yield Violation("teleport-prune", "run1", "no client snapshots in run 1", {})
@@ -1304,11 +1402,12 @@ def check_dirty_while_offline(ctx):
     timestamp must RISE across the rejoin (fresh re-serve — its server timestamp was
     invalidated by the empty-server drain) while the untouched control column's
     timestamp stays EXACTLY equal (warm up_to_date revalidation never re-stamps a >0
-    entry). Drain mechanics (verified live): the broadcaster does NOT drain while the
-    server is empty — there is nobody to broadcast to — so the mark must survive the gap
-    untouched and drain within 2x the broadcast interval after the second join. (The
-    rejoin-resync-vs-first-drain race is benign: a stale up_to_date answer is corrected
-    by the dirty push one interval later, which the rising probe timestamp proves.)"""
+    entry). Drain mechanics (settled by two live runs): the broadcaster drains on its
+    interval REGARDLESS of who is connected — durability for offline players comes from
+    the timestamp-cache invalidation performed at drain time, which forces the rejoin
+    resync to re-serve the edited column fresh. The rising probe timestamp asserts that
+    durable outcome directly; drain-counter motion during the gap is timing-dependent
+    in both directions and deliberately NOT asserted."""
     changed, control = "20:0", "-20:0"
     r1, r2 = ctx.final_client(1), ctx.final_client(2)
     if r1 is None or r2 is None:
@@ -1353,27 +1452,25 @@ def check_dirty_while_offline(ctx):
                         {"kick": kick is not None, "joins": len(ctx.joins)})
         return
     join2_wall = ctx.joins[1]["wallMs"]
+    # Premise guard: the edit must actually land INSIDE the offline gap. A fast rejoin
+    # (observed: 9.85s) can otherwise overtake a late-scheduled setblock, silently
+    # converting this into a plain online-dirty test while staying green.
+    for name in ("setblock", "save-all"):
+        cmd = next((c for c in ctx.commands
+                    if name in c["cmd"] and c["wallMs"] > kick["wallMs"]), None)
+        if cmd is None or not (kick["wallMs"] < cmd["wallMs"] < join2_wall):
+            yield Violation("dirty-while-offline", "offline gap",
+                            f"offline premise lost — {name} did not execute between the "
+                            "kick and the rejoin",
+                            {"cmd_wallMs": cmd["wallMs"] if cmd else None,
+                             "kick": kick["wallMs"], "join2": join2_wall})
+            return
     before = [s for s in ctx.server_snaps if s["wallMs"] <= kick["wallMs"]]
     gap = [s for s in ctx.server_snaps if kick["wallMs"] < s["wallMs"] < join2_wall]
     if not before or not gap:
         yield Violation("dirty-while-offline", "offline gap",
                         "no server snapshots inside the kick->rejoin gap", {})
         return
-    b0 = before[-1]["dirty"]["broadcast_positions"]
-    b1 = max(s["dirty"]["broadcast_positions"] for s in gap)
-    if b1 != b0:
-        yield Violation("dirty-while-offline", f"gap wallMs[{kick['wallMs']}..{join2_wall}]",
-                        "broadcast_positions moved while the server was empty — drains "
-                        "must wait for a connected player",
-                        {"before": b0, "max_in_gap": b1})
-    interval = ctx.config.get("dirtyBroadcastIntervalSeconds", DEFAULT_DIRTY_BROADCAST_SECONDS)
-    after = [s for s in ctx.server_snaps
-             if join2_wall < s["wallMs"] <= join2_wall + 2 * interval * 1000 + 5000]
-    if after and max(s["dirty"]["broadcast_positions"] for s in after) <= b0:
-        yield Violation("dirty-while-offline", f"post-rejoin wallMs[{join2_wall}..]",
-                        "offline edit's dirty mark was not drained after the rejoin",
-                        {"gap_value": b0,
-                         "max_after_join2": max(s["dirty"]["broadcast_positions"] for s in after)})
 
 
 @named_check("clearcache-mid-session", ["client.requested_total", "client.responses.up_to_date",
@@ -1384,7 +1481,8 @@ def check_clearcache_mid_session(ctx):
     per-session position dedup answers the ts=-1 wave with up_to_date (positions were
     already served this session), so recovery means a full re-REQUEST resolved without
     re-transfer — and crucially no wedged state and reconvergence. The action row splits
-    the client series into two segments (flushCache resets the request metrics)."""
+    the client series into two segments (metrics are cumulative across the reset;
+    all post-action expectations are DELTAS between segment-end snapshots)."""
     acts = [a for a in ctx.run_actions.get(1, []) if a["action"] == "clearcache"]
     if len(acts) != 1:
         yield Violation("clearcache-mid-session", "run1",
@@ -1404,14 +1502,19 @@ def check_clearcache_mid_session(ctx):
         return
     pre = snaps[segs[0][3]]
     post = snaps[segs[1][3]]
-    if post["requested_total"] < 1000:
+    # Deltas, not totals: client counters do NOT reset at the action row (flushCache
+    # wipes column state, not metrics), so absolute floors would be satisfied by the
+    # pre-action backfill alone even if the re-request wave never happened.
+    d_req = post["requested_total"] - pre["requested_total"]
+    if d_req < 1000:
         yield Violation("clearcache-mid-session", "post-action final snapshot",
                         "full re-request wave did not happen after clearcache",
-                        {"expected": ">= 1000", "actual": post["requested_total"]})
-    if post["responses"]["up_to_date"] < 500:
+                        {"expected": ">= 1000 post-action", "actual": d_req})
+    d_utd = post["responses"]["up_to_date"] - pre["responses"]["up_to_date"]
+    if d_utd < 500:
         yield Violation("clearcache-mid-session", "post-action final snapshot",
                         "re-requests were not resolved as up_to_date (session dedup miss)",
-                        {"expected": ">= 500", "actual": post["responses"]["up_to_date"]})
+                        {"expected": ">= 500 post-action", "actual": d_utd})
     delta_recv = post["received_columns"] - pre["received_columns"]
     if delta_recv > 50:
         yield Violation("clearcache-mid-session", "post-action segment",
@@ -2266,7 +2369,9 @@ def selftest():
                           _srv(80_000, over={"dirty.broadcast_positions": gap_broadcast}),
                           _srv(205_000, over={"dirty.broadcast_positions": post_broadcast}),
                           _srv(300_000, over={"dirty.broadcast_positions": post_broadcast})],
-            commands=[_cmd(60_000, "kick @a soak-phase-end")],
+            commands=[_cmd(60_000, "kick @a soak-phase-end"),
+                      _cmd(63_000, "setblock 320 310 0 minecraft:stone"),
+                      _cmd(65_000, "save-all")],
             joins=[_join(1000, 1), _join(200_000, 2)],
             runs={1: [_cli(55_000, over={"probes": {"20:0": 100, "-20:0": 100},
                                          "responses.up_to_date": 0})],
@@ -2278,10 +2383,71 @@ def selftest():
         dwo_ctx(changed2=100, control2=100))), "dirty-while-offline")
     hits("dirty-while-offline control re-downloaded", list(check_dirty_while_offline(
         dwo_ctx(changed2=200, control2=150))), "dirty-while-offline")
-    hits("dirty-while-offline drained while empty", list(check_dirty_while_offline(
-        dwo_ctx(changed2=200, control2=100, gap_broadcast=13))), "dirty-while-offline")
-    hits("dirty-while-offline never drained after rejoin", list(check_dirty_while_offline(
-        dwo_ctx(changed2=200, control2=100, post_broadcast=10))), "dirty-while-offline")
+    # Drain-counter motion during/after the gap is timing-dependent in both directions
+    # (settled by live runs) — no fixtures assert it. The durable outcome is the probe
+    # timestamp legs above; the premise guard below pins the edit landing inside the gap.
+    hits("dirty-while-offline edit raced past the gap", list(check_dirty_while_offline(
+        _ctx(server_snaps=[_srv(55_000, over={"dirty.broadcast_positions": 10}),
+                           _srv(300_000, over={"dirty.broadcast_positions": 13})],
+             commands=[_cmd(60_000, "kick @a soak-phase-end"),
+                       _cmd(210_000, "setblock 320 310 0 minecraft:stone"),
+                       _cmd(212_000, "save-all")],
+             joins=[_join(1000, 1), _join(200_000, 2)],
+             runs={1: [_cli(55_000, over={"probes": {"20:0": 100, "-20:0": 100},
+                                          "responses.up_to_date": 0})],
+                   2: [_cli(300_000, over={"probes": {"20:0": 200, "-20:0": 100},
+                                           "responses.up_to_date": 800})]}))),
+        "dirty-while-offline")
+
+    # --- stress named checks: one clean + one catch case each (review finding) ---
+    def stress_ctx(srv_over, cli_over, quiescent_last=True, config=None):
+        return _ctx(
+            server_snaps=[_srv(50_000), _srv(200_000, over=srv_over)],
+            runs={1: [_cli(200_000, over=cli_over)]},
+            quiescent_server={1} if quiescent_last else set(),
+            config=config or {})
+
+    storm_srv = {"service.gen_rate_limited": 40, "service.sync_rate_limited": 200,
+                 "generation.completed": 165}
+    storm_cli = {"responses.rate_limited": 240}
+    clean("rate-limit-storm clean", list(check_rate_limit_storm(
+        stress_ctx(storm_srv, storm_cli))))
+    hits("rate-limit-storm no bounces", list(check_rate_limit_storm(
+        stress_ctx({**storm_srv, "service.gen_rate_limited": 0},
+                   {**storm_cli, "responses.rate_limited": 0}))), "rate-limit-storm")
+
+    sat_srv = {"disk.saturated": 12, "disk.submitted": 2000, "disk.completed": 2000}
+    sat_cli = {"responses.rate_limited": 12}
+    clean("disk-saturation clean", list(check_disk_saturation(
+        stress_ctx(sat_srv, sat_cli))))
+    hits("disk-saturation never saturated", list(check_disk_saturation(
+        stress_ctx({**sat_srv, "disk.saturated": 0}, sat_cli))), "disk-saturation")
+
+    bw_cfg = {"bytesPerSecondLimitGlobal": 262144}
+    bw_srv = {"service.queue_full": 30}
+    bw_cli = {"received_bytes": 60_000_000}
+    clean("bandwidth-throttle clean", list(check_bandwidth_throttle(
+        stress_ctx(bw_srv, bw_cli, config=bw_cfg))))
+    hits("bandwidth-throttle queue never filled", list(check_bandwidth_throttle(
+        stress_ctx({**bw_srv, "service.queue_full": 0}, bw_cli, config=bw_cfg))),
+        "bandwidth-throttle")
+
+    gd_srv = {"disk.not_found": 2100, "generation.submitted": 0,
+              "generation.completed": 0, "generation.active": 0}
+    gd_cli = {"responses.not_generated": 2100, "received_columns": 26}
+    clean("generation-disabled clean", list(check_generation_disabled(
+        stress_ctx(gd_srv, gd_cli))))
+    hits("generation-disabled gen leaked", list(check_generation_disabled(
+        stress_ctx({**gd_srv, "generation.completed": 5}, gd_cli))),
+        "generation-disabled")
+
+    gcs_srv = {"generation.completed": 165}
+    gcs_cli = {"responses.not_generated": 800}
+    clean("generation-capacity-stress clean", list(check_generation_capacity_stress(
+        stress_ctx(gcs_srv, gcs_cli))))
+    hits("generation-capacity-stress stalled", list(check_generation_capacity_stress(
+        stress_ctx({**gcs_srv, "generation.completed": 40}, gcs_cli, quiescent_last=False))),
+        "generation-capacity-stress")
 
     # --- clearcache-mid-session: revalidation without re-transfer ---
     cc_action = [{"event": "action", "wallMs": 60_000, "action": "clearcache", "atSeconds": 60}]
@@ -2291,7 +2457,7 @@ def selftest():
             runs={1: [_cli(50_000, seg=0, over={"requested_total": 2200,
                                                 "responses.columns": 2100,
                                                 "received_columns": 2200}),
-                      _cli(120_000, seg=1, over={"requested_total": 2300,
+                      _cli(120_000, seg=1, over={"requested_total": 4400,
                                                  "responses.up_to_date": 2100,
                                                  "received_columns": post_received})]},
             run_actions={1: actions}, quiescent_server={0})

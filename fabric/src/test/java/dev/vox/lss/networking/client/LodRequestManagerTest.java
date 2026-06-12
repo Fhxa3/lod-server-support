@@ -330,6 +330,26 @@ class LodRequestManagerTest {
         assertTrue(manager.trackerForTest().isInFlight(POS));
     }
 
+    // ---- timeout sweep: the orphan-rescue wiring tick() runs on the scan cadence ----
+
+    @Test
+    void sweepTimeoutsEvictsStaleRequestsAndMarksThemForRetry() {
+        var tracker = manager.trackerForTest();
+        long stale = PositionUtil.packPosition(1, 0);
+        long fresh = PositionUtil.packPosition(2, 0);
+        tracker.markPending(stale, System.nanoTime() - 11_000L * LSSConstants.NANOS_PER_MS, false);
+        tracker.markPending(fresh, System.nanoTime(), false);
+
+        manager.sweepTimeouts();
+
+        assertFalse(tracker.isInFlight(stale), "timed-out request must release its in-flight slot");
+        assertTrue(tracker.isInFlight(fresh), "fresh request must survive the sweep");
+        assertTrue(manager.columnsForTest().hasRetries(),
+                "eviction must mark retry: in-flight counts as satisfied for ring confirmation,"
+                        + " so an unmarked eviction inside a confirmed ring is never rescanned"
+                        + " (the bandwidth-throttle soak's 161 permanently orphaned columns)");
+    }
+
     // ---- batch-response dispatch routing ----
 
     @Test

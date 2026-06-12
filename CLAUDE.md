@@ -42,13 +42,13 @@ CI builds (env `CI=true`) name the jars `lod-server-support-<platform>-<mod_vers
 ./gradlew :paper:test                                       # Paper JUnit tests (wire parity, NBT serialization, config)
 ```
 
-Most tests live in the Fabric module. Paper has Tier 1 JUnit tests as well (`./gradlew :paper:test`) — Fabric/Paper wire parity, NBT section serialization, and config validation; Paper runtime behavior still requires manual testing.
+Most tests live in the Fabric module. Paper has Tier 1 JUnit tests as well (`./gradlew :paper:test`, 87 tests) — Fabric/Paper wire parity, payload edge frames, NBT section serialization, the shared handshake gate, config validation + malformed-file tolerance, world-handler event reflection, generation-service accounting, and command output. Paper runtime behavior is validated live by the Paper soak harness (`SOAK_PLATFORM=paper ./scripts/soak.sh all` — fresh-backfill, warm-rejoin, dimension-trip, paper-dirty-falling-block against a real Paper server).
 
 ### Test Architecture
 
-- **Tier 1** (`fabric/src/test/java/dev/vox/lss/`): JUnit 5 tests via `fabric-loader-junit`. Tests position packing, bandwidth limiter, config validation, column cache store, column state map, in-flight tracker, request queue, column timestamp cache, dirty tracking and content filtering, slot admission and the off-thread processor mailbox, payload codecs, Fabric/Paper wire parity, NBT section serialization, and negative/oversized payload edge cases.
-- **Tier 2** (`fabric/src/gametest/java/dev/vox/lss/test/LSSGameTests.java`): 9 Fabric server gametests. Validates `RequestProcessingService` activation, diagnostics, command registration, and config loading inside a real dedicated server.
-- **Tier 3** (`fabric/src/gametest/java/dev/vox/lss/test/LSSClientGameTests.java`): End-to-end client-server flow test. Validates handshake, session config, spiral scanning, chunk section receipt. Fabric Loom handles headless rendering automatically.
+- **Tier 1** (`fabric/src/test/java/dev/vox/lss/`): JUnit 5 tests via `fabric-loader-junit`. Tests position packing, bandwidth limiter, config validation, column cache store, column state map, in-flight tracker, request queue, column timestamp cache, dirty tracking and content filtering, slot admission and the off-thread processor mailbox, payload codecs, Fabric/Paper wire parity, NBT section serialization, negative/oversized payload edge cases, the LodRequestManager request-loop contract (untracked-response gates, dimension guard, drain non-starvation), spiral-scanner budget scaling and retry reset, IncomingRequestRouter conservation + clientTimestamp routing, cross-player dedup fan-out, the disk-reader submit envelope, OffThreadProcessor disk-result delivery and lifecycle, send-action batching, the shared HandshakeGate ladder, client column decode + LSSApi dispatch, column cache v1/v2 migration, and malformed-config-file tolerance.
+- **Tier 2** (`fabric/src/gametest/java/dev/vox/lss/test/`): 22 Fabric server gametests across 4 classes — `LSSGameTests` (service activation, diagnostics, command registration, config loading), `ServiceLifecycleGameTests` (player registration/cleanup, in-memory probe without dirty-filter seeding, batch-request distance guards), `SerializerParityGameTests` (disk-read vs live serializer byte parity, DirtyContentFilter re-save suppression, End-void all-air sentinel), `GenerationLifecycleGameTests` (generation caps/piggybacking/timeouts, dimension-change re-registration). The in-game runner reports 23: vanilla contributes a built-in `minecraft:always_pass` test instance.
+- **Tier 3** (`fabric/src/gametest/java/dev/vox/lss/test/LSSClientGameTests.java`): End-to-end client-server flow test. Validates handshake, session config, spiral scanning, chunk section receipt, and decoded section content asserted at a registered `LSSApi` consumer (flat-world block layers, off-render-thread dispatch). Fabric Loom handles headless rendering automatically.
 
 The system property `-Dlss.test.integratedServer=true` (set in fabric/build.gradle for gametest JVMs) allows `RequestProcessingService` to activate on integrated servers during testing.
 
@@ -88,6 +88,7 @@ Chunk coordinates are packed as `((long)chunkX << 32) | (chunkZ & 0xFFFFFFFFL)`.
 - `PendingRequest` / `SlotType` — derived admission: a pending-map entry IS the held sync/generation slot (no separate limiter object)
 - `DirtyColumnTracker` — thread-safe tracker of per-dimension dirty chunk positions, drained by broadcasters
 - `SendActionBatcher` — reusable per-tick accumulator for batching `SendAction` responses by player
+- `HandshakeGate` — pure decision ladder for the C2S handshake (version mismatch → no reply; no consumer → reply without registering; disabled → advertise disabled; else register), shared by `LSSServerNetworking` and `LSSPaperPlugin` so reply/registration policy cannot drift between platforms
 - `JsonConfig` / `ServerConfigBase` — GSON config base classes; `ServerConfigBase` holds the server config fields, defaults, and clamps shared verbatim by Fabric and Paper
 
 ### Fabric Server-Side (`fabric/`)
@@ -121,6 +122,7 @@ Chunk coordinates are packed as `((long)chunkX << 32) | (chunkZ & 0xFFFFFFFFL)`.
 - `PaperConfig` — GSON JSON config (same defaults/validation as Fabric)
 - `PaperDirtyColumnBroadcaster` — broadcasts dirty column notifications to connected players (same as Fabric's `DirtyColumnBroadcaster`)
 - `PaperWorldHandler` — registers configurable Bukkit event listeners for dirty chunk detection via reflection-based position extraction
+- `PaperSoakBridge` — reflective gate from `LSSPaperPlugin` into the dev-only `dev.vox.lss.paper.soak` package (soak scenario driver + metrics exporter twins; excluded from the release shadowJar, retained by `soakShadowJar` for `SOAK_PLATFORM=paper` runs)
 
 ### Client-Side
 
@@ -220,10 +222,13 @@ Scenario-driven correctness harness: a real dedicated server + headless client e
 ./scripts/soak.sh warm-rejoin       # Two client runs — warm cache resync after a kick
 ./scripts/soak.sh dimension-trip    # Overworld → End → Overworld dimension boundaries
 ./scripts/soak.sh dirty-broadcast   # setblock → dirty broadcast → client re-request
-./scripts/soak.sh all               # All four in order; stops at first failure
+./scripts/soak.sh all               # All 17 Fabric scenarios in order; stops at first failure
+SOAK_PLATFORM=paper ./scripts/soak.sh all   # Paper port: fresh-backfill, warm-rejoin, dimension-trip, paper-dirty-falling-block
 ```
 
-Scenarios needing a base world auto-run `fresh-backfill` first. Exit code = checker exit code.
+Further scenarios (same invocation): rate-limit-storm, disk-saturation, generation-disabled, generation-capacity-stress, bandwidth-throttle, cold-restart-resync, enabled-false, teleport-prune, dirty-range-filter, dirty-during-backfill, dirty-while-offline, clearcache-mid-session, dimension-rejoin-warm.
+
+Scenarios needing a base world auto-run `fresh-backfill` first. warm-rejoin, dirty-while-offline, and dimension-rejoin-warm use two client runs. Exit code = checker exit code.
 
 ### Output Files
 
@@ -233,7 +238,7 @@ Scenarios needing a base world auto-run `fresh-backfill` first. Exit code = chec
 
 ### How It Works
 
-`soak.sh` stages world/cache/config per scenario, pre-validates the timeline (`check_soak.py --validate`), then starts `runSoakServer` and `runSoakClient` (no JFR). `SoakScenarioDriver` fires timeline commands at join-anchored offsets, snapshots every 5 s, and halts the server at scenario end; the soak client synchronously flushes its column cache before exiting. The checker evaluates deltas between verified-quiescent snapshots and writes `verdict.json`; any violation exits nonzero.
+`soak.sh` stages world/cache/config per scenario, pre-validates the timeline (`check_soak.py --validate`), then starts `runSoakServer` and `runSoakClient` (no JFR). `SoakScenarioDriver` fires timeline commands at join-anchored offsets, snapshots every 5 s, and halts the server at scenario end; the soak client synchronously flushes its column cache before exiting. The checker evaluates deltas between verified-quiescent snapshots and writes `verdict.json`; any violation exits nonzero. `SOAK_PLATFORM=paper` runs the identical scenario timelines against a real Paper server (`:paper:runSoakServer`, a run-paper task fed by the dev-only `soakShadowJar` that retains the soak package) with the unchanged Fabric soak client and checker; Paper keeps its own base world at `soak-worlds/base-paper`. Per-scenario client instrumentation: `-Psoak.probes=x:z,...` adds per-position timestamp probes to client snapshots; `-Psoak.clientActionAt=SECONDS:ACTION` fires one scripted client action (e.g. `60:clearcache`). warm-rejoin, dirty-while-offline, and dimension-rejoin-warm use two client runs.
 
 ### Key Files
 
@@ -242,6 +247,9 @@ Scenarios needing a base world auto-run `fresh-backfill` first. Exit code = chec
 - `scripts/check_soak.py` — stdlib Python invariant checker (`--validate` pre-flight, post-run laws, `--selftest`)
 - `scripts/lib/mc-run.sh` — shared server/client lifecycle helpers (sourced by soak.sh and benchmark.sh)
 - `fabric/src/main/java/dev/vox/lss/benchmark/SoakScenarioDriver.java` — server-side timeline executor + JSONL snapshots
+- `paper/src/main/java/dev/vox/lss/paper/soak/PaperSoakScenarioDriver.java` — Paper twin of the Fabric driver (Bukkit join anchors + 1-tick scheduler, same JSONL contract)
+- `paper/src/main/java/dev/vox/lss/paper/soak/PaperSoakMetricsExporter.java` — Paper twin of the server-side exporter (same snapshot schema)
+- `paper/src/main/java/dev/vox/lss/paper/PaperSoakBridge.java` — reflective gate; the soak package is excluded from the release shadowJar
 - `fabric/src/main/java/dev/vox/lss/BenchmarkBridge.java` — reflective gate to the dev-only harness package (excluded from release jars)
 
 ## Key Patterns

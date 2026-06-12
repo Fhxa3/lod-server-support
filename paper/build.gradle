@@ -56,11 +56,14 @@ shadowJar {
 }
 
 // Dev-only variant of the plugin jar that keeps the soak package; consumed exclusively
-// by runSoakServer (scripts/soak.sh SOAK_PLATFORM=paper). Never published.
+// by runSoakServer (scripts/soak.sh SOAK_PLATFORM=paper), which references it via the
+// task output, never by filename. Never published — the base name is deliberately
+// outside the release/CI glob (lod-server-support-paper-*.jar) so a stale soak jar in
+// build/libs can never be attached to a GitHub release or pushed to Modrinth.
 def soakShadowJar = tasks.register('soakShadowJar',
         com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar) {
-    archiveBaseName = 'lod-server-support-paper'
-    archiveClassifier = 'soak'
+    archiveBaseName = 'lss-paper-soak'
+    archiveClassifier = ''
     archiveVersion = ''
     from sourceSets.main.output
     configurations = [project.configurations.runtimeClasspath]

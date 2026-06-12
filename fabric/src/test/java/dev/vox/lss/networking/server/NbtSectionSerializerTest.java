@@ -188,6 +188,20 @@ class NbtSectionSerializerTest {
     }
 
     @Test
+    void stoneSection_allZeroSavedLight_omitsLightLayer() {
+        // Vanilla saves the light engine's allocated-but-zeroed arrays; "absent" means
+        // all-zero on the wire, so a disk serve must byte-match a live serve of the same
+        // content or DirtyContentFilter sees a phantom change on every save cycle.
+        byte[] wire = NbtSectionSerializer.serializeChunkNbt(
+                chunkNbt("minecraft:full", sectionNbt(0, true, true, new byte[2048], new byte[2048])), REGISTRY_ACCESS);
+        var sections = decode(wire);
+        assertEquals(1, sections.size(), "non-air section is kept");
+        assertEquals(Blocks.STONE.defaultBlockState(), sections.get(0).section().getBlockState(0, 0, 0));
+        assertFalse(sections.get(0).hasBlockLight(), "all-zero saved BlockLight is omitted, not shipped");
+        assertFalse(sections.get(0).hasSkyLight(), "all-zero saved SkyLight is omitted, not shipped");
+    }
+
+    @Test
     void missingBlockStates_sectionDropped() {
         var noStates = new CompoundTag();
         noStates.putInt("Y", 1);

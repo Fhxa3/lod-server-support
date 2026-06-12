@@ -95,12 +95,18 @@ class ColumnStateMap {
     /** Column data arrived (authoritative for the position, even if no longer tracked). */
     void onReceived(long packed, long columnTimestamp) {
         this.dirty.remove(packed);
+        // An answer supersedes any pending retry. Rate-limit bounces (the original retry
+        // writer) guarantee no response is coming, but the timeout sweep retries positions
+        // whose response may still arrive late — leaving the mark would re-request every
+        // late-delivered column once and keep confirmedRing pinned at 0 for an extra scan.
+        this.retry.remove(packed);
         put(packed, columnTimestamp);
         this.validated.add(packed);
     }
 
     /** Server confirmed the column is current. */
     void onUpToDate(long packed) {
+        this.retry.remove(packed); // an up-to-date answer supersedes a pending retry (see onReceived)
         this.validated.add(packed);
         // Up-to-date is the server affirming this position is current, so it must satisfy
         // BOTH unsatisfied states: -1 (all-air columns never get a VoxelColumn response)

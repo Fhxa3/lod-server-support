@@ -149,6 +149,7 @@ public class PaperChunkGenerationService {
                 } else {
                     LSSLogger.warn("Chunk at " + cx + "," + cz + " was null after async load completed");
                     addFailures(gen.callbacks, key, cx, cz);
+                    this.totalRemovedInFlight++;
                 }
             } catch (Throwable t) {
                 // Throwable, not Exception (mirrors the Fabric twin): an Error here would
@@ -156,14 +157,22 @@ public class PaperChunkGenerationService {
                 // per-player count until disconnect.
                 LSSLogger.error("Failed to extract primitives for generated chunk at " + cx + ", " + cz, t);
                 addFailures(gen.callbacks, key, cx, cz);
+                this.totalRemovedInFlight++;
                 if (t instanceof Error err) throw err;
             }
         } else {
             addFailures(gen.callbacks, key, cx, cz);
+            this.totalRemovedInFlight++;
         }
     }
 
-    /** Add a failure outcome (columnData == null) for every callback. Main thread only. */
+    /**
+     * Add a failure outcome (columnData == null) for every callback. Main thread only.
+     * Callers that removed the active entry must also count it exactly once — totalTimeouts
+     * on the timeout path, totalRemovedInFlight on the failure paths (mirrors the Fabric
+     * twin) — so the generation books (submitted == completed + timeouts + removed) balance
+     * (soak law A4).
+     */
     private void addFailures(List<GenerationCallback> callbacks, PendingGenerationKey key, int cx, int cz) {
         String dimension = key.dimension().identifier().toString();
         for (var cb : callbacks) {

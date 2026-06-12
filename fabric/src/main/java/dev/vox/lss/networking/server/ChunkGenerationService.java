@@ -150,6 +150,10 @@ public class ChunkGenerationService {
                 } catch (Throwable t) {
                     LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), t);
                     addFailures(ready, gen);
+                    // Failed extraction is a terminal removal that is neither completed nor a
+                    // timeout — count it as removed-in-flight so the generation books
+                    // (submitted == completed + timeouts + removed) still balance (soak law A4).
+                    this.totalRemovedInFlight++;
                 } finally {
                     // Always release the force-load ticket and drop the active entry — even on an
                     // Error during serialization — or the chunk stays force-loaded forever and the
