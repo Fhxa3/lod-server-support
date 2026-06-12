@@ -95,6 +95,18 @@ public final class BenchmarkHook {
      * column-cache IO queue BEFORE halting — the disconnect save runs async on a daemon
      * thread and halt(0) would otherwise lose it, silently turning a warm-rejoin scenario
      * into a cold one.
+     *
+     * <p>Snapshots are gated on the session-config REPLY, not on enabled: an
+     * enabled=false server must still produce rows (with server_enabled=false and
+     * zero-filled manager fields) or the kill-switch scenario has nothing to judge.
+     * Gating on the reply also keeps title-screen/boot ticks out of the series, which
+     * would otherwise prepend dimension="none" rows and shift every scenario's
+     * dimension-segment numbering.
+     *
+     * <p>{@code -Dlss.soak.clientActionAt=SECONDS:ACTION} runs one scripted client-side
+     * action (currently {@code clearcache} = LodRequestManager.flushCache, the /lss
+     * clearcache body) that many enabled-seconds into the session, appending an
+     * {@code action} event row — the server driver can only run server commands.
      */
     private static void initSoakClient() {
         LSSLogger.info("[Soak] Client hook active");
@@ -103,15 +115,39 @@ public final class BenchmarkHook {
         // Register a no-op consumer so the handshake includes CAPABILITY_VOXEL_COLUMNS.
         LSSApi.registerColumnConsumer((level, dimension, chunkX, chunkZ, columnData) -> {});
 
+        int[] actionAt = {-1};
+        String[] actionName = {null};
+        String actionSpec = System.getProperty("lss.soak.clientActionAt", "");
+        if (!actionSpec.isBlank()) {
+            int sep = actionSpec.indexOf(':');
+            try {
+                actionAt[0] = Integer.parseInt(actionSpec.substring(0, sep));
+                actionName[0] = actionSpec.substring(sep + 1);
+                LSSLogger.info("[Soak] Client action armed: " + actionName[0] + " at +" + actionAt[0] + "s");
+            } catch (RuntimeException e) {
+                throw new IllegalStateException("[Soak] Malformed lss.soak.clientActionAt '"
+                        + actionSpec + "' (want SECONDS:ACTION)", e);
+            }
+        }
+
         // Snapshot every second (like the benchmark hook) but only WRITE every 5s — the
         // LSS disconnect handler clears all counters before ours runs, so the disconnect
         // row must re-emit the last live snapshot instead of reading zeroed state.
         var latest = new java.util.concurrent.atomic.AtomicReference<Map<String, Object>>();
         final int[] clientTick = {0};
+        final int[] enabledSeconds = {0};
+        final boolean[] actionFired = {false};
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             clientTick[0]++;
-            if (!LSSClientNetworking.isServerEnabled()) return;
+            if (!LSSClientNetworking.hasReceivedSessionConfig()) return;
             if (clientTick[0] % LSSConstants.TICKS_PER_SECOND != 0) return;
+            if (LSSClientNetworking.isServerEnabled()) {
+                enabledSeconds[0]++;
+                if (!actionFired[0] && actionName[0] != null && enabledSeconds[0] >= actionAt[0]) {
+                    actionFired[0] = true;
+                    fireClientAction(outputFile, actionName[0], actionAt[0]);
+                }
+            }
             latest.set(BenchmarkMetricsExporter.buildClientSnapshot());
             if (clientTick[0] % (5 * LSSConstants.TICKS_PER_SECOND) == 0) {
                 appendSoakClientRow(outputFile, "snapshot", latest.get());
@@ -128,6 +164,29 @@ public final class BenchmarkHook {
             LSSLogger.info("[Soak] Cache flushed, exiting client");
             Runtime.getRuntime().halt(0);
         });
+    }
+
+    /** Runs one scripted client-side action on the main client thread and logs it as an
+     *  {@code action} row BEFORE the post-action snapshot, so the checker can segment the
+     *  client series at the counter reset (flushCache resets the request metrics). */
+    private static void fireClientAction(Path outputFile, String action, int atSeconds) {
+        var row = new java.util.LinkedHashMap<String, Object>();
+        row.put("event", "action");
+        row.put("wallMs", System.currentTimeMillis());
+        row.put("action", action);
+        row.put("atSeconds", atSeconds);
+        BenchmarkMetricsExporter.appendJsonLine(outputFile, row);
+        if ("clearcache".equals(action)) {
+            var manager = LSSClientNetworking.getRequestManager();
+            if (manager != null) {
+                LSSLogger.info("[Soak] Client action: clearcache (flushing column cache)");
+                manager.flushCache();
+            } else {
+                LSSLogger.warn("[Soak] Client action clearcache skipped — no request manager");
+            }
+        } else {
+            LSSLogger.warn("[Soak] Unknown client action '" + action + "' — row logged, nothing executed");
+        }
     }
 
     private static void appendSoakClientRow(Path outputFile, String event, Map<String, Object> snapshot) {

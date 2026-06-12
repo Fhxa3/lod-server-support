@@ -1,5 +1,6 @@
 package dev.vox.lss.mixin;
 
+import dev.vox.lss.config.LSSServerConfig;
 import dev.vox.lss.networking.server.LSSServerNetworking;
 import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ServerLevel;
@@ -23,7 +24,10 @@ public class ChunkMapSaveHook {
         // and the completed chunk reaches clients through the generation serve path.
         if (cir.getReturnValue() && chunk instanceof LevelChunk levelChunk) {
             var service = LSSServerNetworking.getRequestService();
-            if (service != null) {
+            // enabled=false also gates here: the service tick (and so the dirty-broadcast
+            // drain) is disabled, so marking would grow the tracker without bound — and
+            // the content hash serializes the column on every save for nothing.
+            if (service != null && LSSServerConfig.CONFIG.enabled) {
                 ServerLevel level = ((AccessorChunkMap) (Object) this).getLevel();
                 if (this.lss$cachedDimension == null) {
                     this.lss$cachedDimension = level.dimension().identifier().toString();

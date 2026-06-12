@@ -89,6 +89,16 @@ loom {
             client()
             runDir "build/run/soak-client"
             vmArg "-Dlss.soak=true"
+            // Stable identity: the dev client otherwise randomizes its offline username per
+            // launch, so a rejoin scenario's run 2 is a DIFFERENT player — fresh playerdata,
+            // overworld spawn instead of restoring into the dimension run 1 was kicked in.
+            programArg "--username"
+            programArg "SoakPlayer"
+            // Per-scenario client instrumentation (soak.sh passes these as -P properties):
+            // probes = per-position timestamp probes "x:z,..."; clientActionAt = one
+            // scripted client-side action "SECONDS:ACTION" (e.g. "60:clearcache")
+            vmArg "-Dlss.soak.probes=${findProperty('soak.probes') ?: ''}"
+            vmArg "-Dlss.soak.clientActionAt=${findProperty('soak.clientActionAt') ?: ''}"
             programArg "--quickPlayMultiplayer"
             programArg "localhost:25565"
         }

@@ -6,6 +6,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -196,5 +199,113 @@ class ColumnTimestampCacheTest {
         assertEquals(2, loaded.size());
         assertEquals(100L, loaded.get(LSSConstants.DIM_STR_OVERWORLD, 1L));
         assertEquals(999L, loaded.get(LSSConstants.DIM_STR_OVERWORLD, 99L));
+    }
+
+    // ---- Corrupt-file load guards ----
+    // load() runs in the OffThreadProcessor constructor at server boot: a corrupt
+    // lss-timestamps.bin (power-loss truncation, disk garbage) must never throw —
+    // it may only degrade to a cold cache that rebuilds itself.
+
+    private static DataOutputStream cacheFileOut(Path tempDir) throws IOException {
+        return new DataOutputStream(Files.newOutputStream(tempDir.resolve("lss-timestamps.bin")));
+    }
+
+    @Test
+    void loadTruncatedFileKeepsCompleteEntriesAndStaysUsable(@TempDir Path tempDir) throws IOException {
+        try (var out = cacheFileOut(tempDir)) {
+            out.writeInt(1); // FORMAT_VERSION
+            out.writeInt(1); // one dimension
+            out.writeUTF(LSSConstants.DIM_STR_OVERWORLD);
+            out.writeInt(4); // declares 4 entries...
+            out.writeLong(11L); out.writeLong(100L);
+            out.writeLong(22L); out.writeLong(200L);
+            out.writeLong(33L); // ...but power loss truncated mid-entry
+        }
+
+        var loaded = new ColumnTimestampCache(DEFAULT_MAX);
+        assertDoesNotThrow(() -> loaded.load(tempDir));
+        assertEquals(100L, loaded.get(LSSConstants.DIM_STR_OVERWORLD, 11L));
+        assertEquals(200L, loaded.get(LSSConstants.DIM_STR_OVERWORLD, 22L));
+        assertEquals(0L, loaded.get(LSSConstants.DIM_STR_OVERWORLD, 33L),
+                "the truncated entry must not be loaded");
+        // The cache must remain fully usable after the failed load
+        loaded.put(LSSConstants.DIM_STR_OVERWORLD, 33L, 300L, now);
+        assertEquals(300L, loaded.get(LSSConstants.DIM_STR_OVERWORLD, 33L));
+    }
+
+    @Test
+    void loadGarbageFileShorterThanHeaderIsDiscarded(@TempDir Path tempDir) throws IOException {
+        Files.write(tempDir.resolve("lss-timestamps.bin"),
+                new byte[]{(byte) 0xDE, (byte) 0xAD, (byte) 0xBE}); // EOF inside the version int
+
+        var loaded = new ColumnTimestampCache(DEFAULT_MAX);
+        assertDoesNotThrow(() -> loaded.load(tempDir));
+        assertEquals(0, loaded.size());
+        loaded.put(LSSConstants.DIM_STR_OVERWORLD, 1L, 100L, now);
+        assertEquals(100L, loaded.get(LSSConstants.DIM_STR_OVERWORLD, 1L));
+    }
+
+    @Test
+    void loadUnsupportedVersionIsDiscarded(@TempDir Path tempDir) throws IOException {
+        try (var out = cacheFileOut(tempDir)) {
+            out.writeInt(99); // future/corrupt format version
+            out.writeInt(1);
+            out.writeUTF(LSSConstants.DIM_STR_OVERWORLD);
+            out.writeInt(1);
+            out.writeLong(1L); out.writeLong(100L);
+        }
+
+        var loaded = new ColumnTimestampCache(DEFAULT_MAX);
+        assertDoesNotThrow(() -> loaded.load(tempDir));
+        assertEquals(0, loaded.size(), "a foreign format version must not be interpreted");
+    }
+
+    @Test
+    void loadNegativeEntryCountStopsCleanly(@TempDir Path tempDir) throws IOException {
+        try (var out = cacheFileOut(tempDir)) {
+            out.writeInt(1);
+            out.writeInt(1);
+            out.writeUTF(LSSConstants.DIM_STR_OVERWORLD);
+            out.writeInt(-5); // corrupt count: stream can no longer be positioned
+        }
+
+        var loaded = new ColumnTimestampCache(DEFAULT_MAX);
+        assertDoesNotThrow(() -> loaded.load(tempDir));
+        assertEquals(0, loaded.size());
+    }
+
+    @Test
+    void loadOversizedEntryCountIsDiscarded(@TempDir Path tempDir) throws IOException {
+        try (var out = cacheFileOut(tempDir)) {
+            out.writeInt(1);
+            out.writeInt(1);
+            out.writeUTF(LSSConstants.DIM_STR_OVERWORLD);
+            out.writeInt(6); // exceeds maxEntriesPerDimension below — treated as corrupt
+            for (int i = 0; i < 6; i++) {
+                out.writeLong(i); out.writeLong(i * 100L);
+            }
+        }
+
+        var small = new ColumnTimestampCache(5);
+        assertDoesNotThrow(() -> small.load(tempDir));
+        assertEquals(0, small.size(), "a count beyond the cache bound must not allocate/load");
+    }
+
+    @Test
+    void loadBadCountInSecondDimensionKeepsFirstDimension(@TempDir Path tempDir) throws IOException {
+        try (var out = cacheFileOut(tempDir)) {
+            out.writeInt(1);
+            out.writeInt(2); // two dimensions
+            out.writeUTF(LSSConstants.DIM_STR_OVERWORLD);
+            out.writeInt(1);
+            out.writeLong(7L); out.writeLong(70L);
+            out.writeUTF(LSSConstants.DIM_STR_THE_NETHER);
+            out.writeInt(-1); // corrupt second dimension: discard the rest, keep what loaded
+        }
+
+        var loaded = new ColumnTimestampCache(DEFAULT_MAX);
+        assertDoesNotThrow(() -> loaded.load(tempDir));
+        assertEquals(70L, loaded.get(LSSConstants.DIM_STR_OVERWORLD, 7L));
+        assertEquals(1, loaded.size());
     }
 }

@@ -29,8 +29,9 @@ import java.util.Map;
  * synchronization is cheap insurance against future call sites, not a present need.
  */
 public class DirtyContentFilter {
-    /** Per-dimension cap; on overflow the map is cleared (chunks re-mark dirty once — self-heals). */
-    private static final int MAX_ENTRIES_PER_DIMENSION = 512 * 1024;
+    /** Per-dimension cap; on overflow the map is cleared (chunks re-mark dirty once — self-heals).
+     *  Package-visible so the eviction test can fill exactly to the cap. */
+    static final int MAX_ENTRIES_PER_DIMENSION = 512 * 1024;
     private static final long FNV_OFFSET = 0xcbf29ce484222325L;
     private static final long FNV_PRIME = 0x100000001b3L;
     /** All-air columns serialize to null bytes — valid content, hashed as this sentinel
@@ -76,8 +77,10 @@ public class DirtyContentFilter {
         return changed;
     }
 
-    /** Stores the hash; returns true if it differs from the previous value (or none existed). */
-    private boolean storeHash(String dimension, long packed, long hash) {
+    /** Stores the hash; returns true if it differs from the previous value (or none existed).
+     *  Package-visible for testing the overflow-eviction path; synchronized (reentrant from the
+     *  public methods) so the seam keeps the class's entry-points-hold-the-lock insurance. */
+    synchronized boolean storeHash(String dimension, long packed, long hash) {
         var hashes = this.hashesByDimension.computeIfAbsent(dimension, k -> {
             var map = new Long2LongOpenHashMap();
             map.defaultReturnValue(0L);

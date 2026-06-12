@@ -157,4 +157,116 @@ class ColumnCacheStoreTest {
         var loaded = ColumnCacheStore.load("test-clear-server", dim);
         assertTrue(loaded.isEmpty());
     }
+
+    @Test
+    void v2FileMigrationStripsLevelBits() throws IOException {
+        var dim = testDimension("v2_migration");
+        Path file = getCacheFile("test-v2-migration", dim);
+        Files.createDirectories(file.getParent());
+        long ts1 = 1_750_000_000L;
+        long ts2 = 12_345L;
+        try (var out = new DataOutputStream(Files.newOutputStream(file))) {
+            out.writeInt(2); // v2 encoded values as (timestamp << 8 | detail level)
+            out.writeInt(2);
+            out.writeLong(100L);
+            out.writeLong((ts1 << 8) | 7L);
+            out.writeLong(200L);
+            out.writeLong((ts2 << 8) | 0L);
+        }
+
+        var loaded = ColumnCacheStore.load("test-v2-migration", dim);
+        assertEquals(2, loaded.size());
+        // Loading v2 values raw would inflate timestamps ~256x — the server would then
+        // answer up-to-date for stale columns forever.
+        assertEquals(ts1, loaded.get(100L), "v2 entries must have the packed level bits stripped");
+        assertEquals(ts2, loaded.get(200L));
+    }
+
+    @Test
+    void v1FileLoadsTimestampsVerbatim() throws IOException {
+        var dim = testDimension("v1_verbatim");
+        Path file = getCacheFile("test-v1-verbatim", dim);
+        Files.createDirectories(file.getParent());
+        try (var out = new DataOutputStream(Files.newOutputStream(file))) {
+            out.writeInt(1); // v1: raw timestamps, nothing packed
+            out.writeInt(1);
+            out.writeLong(42L);
+            out.writeLong(1_700_000_000L);
+        }
+
+        var loaded = ColumnCacheStore.load("test-v1-verbatim", dim);
+        assertEquals(1, loaded.size());
+        assertEquals(1_700_000_000L, loaded.get(42L), "v1 values must not be shifted on load");
+    }
+
+    @Test
+    void saveAsyncSnapshotsBeforeCallerMutates() {
+        var dim = testDimension("snapshot");
+        // Gate: occupy the FIFO IO thread with a slow save so the snapshot save below
+        // cannot start until long after the caller's mutations have completed. Without
+        // the defensive copy in saveAsync, the mutated map is what would get written.
+        var gateMap = new Long2LongOpenHashMap();
+        gateMap.defaultReturnValue(-1L);
+        for (int i = 0; i < 20_000; i++) gateMap.put(i, i);
+        ColumnCacheStore.saveAsync("test-snapshot-gate", dim, gateMap);
+
+        var map = new Long2LongOpenHashMap();
+        map.defaultReturnValue(-1L);
+        map.put(1L, 111L);
+        map.put(2L, 222L);
+        ColumnCacheStore.saveAsync("test-snapshot", dim, map);
+        // Mutate immediately — mirrors onDimensionChange's saveCache-then-clear ordering.
+        map.put(1L, 999_999L);
+        map.remove(2L);
+        map.put(3L, 333L);
+
+        ColumnCacheStore.flushPendingIo();
+        var loaded = ColumnCacheStore.load("test-snapshot", dim);
+        assertEquals(2, loaded.size(), "saved file must reflect the map as it was at saveAsync time");
+        assertEquals(111L, loaded.get(1L));
+        assertEquals(222L, loaded.get(2L));
+
+        ColumnCacheStore.clearForServer("test-snapshot-gate");
+        ColumnCacheStore.clearForServer("test-snapshot");
+    }
+
+    @Test
+    void dimensionFilesDoNotBleedAcrossDimensions() {
+        var dimA = testDimension("iso_a");
+        var dimB = testDimension("iso_b");
+        var mapA = new Long2LongOpenHashMap();
+        mapA.defaultReturnValue(-1L);
+        mapA.put(100L, 1111L);
+        var mapB = new Long2LongOpenHashMap();
+        mapB.defaultReturnValue(-1L);
+        mapB.put(100L, 2222L); // same packed position, different dimension
+        mapB.put(200L, 3333L);
+
+        ColumnCacheStore.save("test-dim-iso", dimA, mapA);
+        ColumnCacheStore.save("test-dim-iso", dimB, mapB);
+
+        var loadedA = ColumnCacheStore.load("test-dim-iso", dimA);
+        var loadedB = ColumnCacheStore.load("test-dim-iso", dimB);
+        assertEquals(1, loadedA.size());
+        assertEquals(1111L, loadedA.get(100L), "dimension A keeps its own timestamp for the shared position");
+        assertEquals(2, loadedB.size());
+        assertEquals(2222L, loadedB.get(100L));
+        assertEquals(3333L, loadedB.get(200L));
+    }
+
+    @Test
+    void clearForServerRemovesAllDimensionFiles() {
+        var dimA = testDimension("clear_multi_a");
+        var dimB = testDimension("clear_multi_b");
+        var map = new Long2LongOpenHashMap();
+        map.defaultReturnValue(-1L);
+        map.put(1L, 10L);
+
+        ColumnCacheStore.save("test-clear-multi", dimA, map);
+        ColumnCacheStore.save("test-clear-multi", dimB, map);
+        ColumnCacheStore.clearForServer("test-clear-multi");
+
+        assertTrue(ColumnCacheStore.load("test-clear-multi", dimA).isEmpty());
+        assertTrue(ColumnCacheStore.load("test-clear-multi", dimB).isEmpty());
+    }
 }

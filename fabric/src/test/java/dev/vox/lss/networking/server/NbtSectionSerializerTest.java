@@ -207,6 +207,8 @@ class NbtSectionSerializerTest {
         var sections = decode(wire);
         assertEquals(1, sections.size());
         assertEquals(Blocks.STONE.defaultBlockState(), sections.get(0).section().getBlockState(0, 0, 0));
+        assertTrue(sections.get(0).section().getBiomes().get(0, 0, 0).is(Biomes.PLAINS),
+                "missing-biomes NBT defaults to PLAINS (must match Paper's factory default)");
     }
 
     @Test
@@ -260,6 +262,39 @@ class NbtSectionSerializerTest {
         byte[] wire = NbtSectionSerializer.serializeChunkNbt(
                 chunkNbt("minecraft:full", sectionNbt(3, false, true, null, light(100, (byte) 0x0F))), REGISTRY_ACCESS);
         assertEquals(0, wire.length, "air-only with only SkyLight (no BlockLight) is dropped");
+    }
+
+    @Test
+    void corruptLightLength_skippedWithoutWireDesync() {
+        // Third-party world converters emit non-2048-byte light arrays; writing one raw would
+        // shift every byte after it and desync the client decoder for the rest of the column.
+        byte[] shortBlockLight = new byte[1024];
+        shortBlockLight[0] = 0x0F;
+        byte[] longSkyLight = new byte[4096];
+        longSkyLight[0] = 0x0F;
+        byte[] validSky = light(9, (byte) 0x0F);
+        byte[] wire = NbtSectionSerializer.serializeChunkNbt(
+                chunkNbt("minecraft:full",
+                        sectionNbt(0, true, true, shortBlockLight, longSkyLight),
+                        sectionNbt(1, true, true, null, validSky)),
+                REGISTRY_ACCESS);
+        var sections = decode(wire); // decode() asserts the buffer drains exactly
+        assertEquals(2, sections.size());
+        assertFalse(sections.get(0).hasBlockLight(), "1024-byte BlockLight is skipped, not written");
+        assertFalse(sections.get(0).hasSkyLight(), "4096-byte SkyLight is skipped, not written");
+        assertEquals(Blocks.STONE.defaultBlockState(), sections.get(0).section().getBlockState(0, 0, 0),
+                "block data of the corrupt-light section still serves");
+        assertTrue(sections.get(1).hasSkyLight(), "valid light after the corrupt section still decodes");
+        assertArrayEquals(validSky, sections.get(1).skyLight());
+    }
+
+    @Test
+    void airOnly_corruptLightLength_sectionDropped() {
+        byte[] shortLight = new byte[1024];
+        shortLight[5] = 0x0F; // non-zero, but wrong length cannot rescue an air-only section
+        byte[] wire = NbtSectionSerializer.serializeChunkNbt(
+                chunkNbt("minecraft:full", sectionNbt(2, false, true, shortLight, null)), REGISTRY_ACCESS);
+        assertEquals(0, wire.length, "air-only section with malformed light is dropped, not served");
     }
 
     @Test

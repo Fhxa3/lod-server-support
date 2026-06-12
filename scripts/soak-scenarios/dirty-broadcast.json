@@ -10,7 +10,9 @@
     { "anchor": 1, "at": 60, "cmd": "forceload add 320 0" },
     { "anchor": 1, "at": 62, "cmd": "setblock 320 310 0 minecraft:stone" },
     { "anchor": 1, "at": 64, "cmd": "save-all" },
-    { "anchor": 1, "at": 68, "cmd": "forceload remove 320 0" }
+    { "anchor": 1, "at": 68, "cmd": "forceload remove 320 0" },
+    { "anchor": 1, "at": 95, "cmd": "save-all" },
+    { "anchor": 1, "at": 110, "cmd": "save-all" }
   ],
-  "end": { "anchor": 1, "at": 130 }
+  "end": { "anchor": 1, "at": 145 }
 }

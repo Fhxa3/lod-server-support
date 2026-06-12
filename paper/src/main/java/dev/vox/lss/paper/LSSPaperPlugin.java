@@ -1,5 +1,6 @@
 package dev.vox.lss.paper;
 
+import dev.vox.lss.common.HandshakeGate;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import net.minecraft.server.level.ServerPlayer;
@@ -62,6 +63,9 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
             }
         }.runTaskTimer(this, 1L, 1L);
 
+        // Dev-only soak harness (no-op unless -Dlss.soak.scenario is set)
+        PaperSoakBridge.init(this);
+
         LSSLogger.info("LOD Server Support (Paper) enabled");
     }
 
@@ -105,38 +109,36 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
                 + " (protocol v" + handshake.protocolVersion()
                 + ", capabilities=" + handshake.capabilities() + ")");
 
-        if (handshake.protocolVersion() != LSSConstants.PROTOCOL_VERSION) {
-            // Must not reply: a mismatched client's SessionConfig codec has a
-            // different field layout on the same channel id, so any frame we
-            // send decodes as a DecoderException and kicks the player. Sending
-            // nothing leaves its LSS disabled (no LodRequestManager is created).
+        var service = this.requestService;
+        var decision = HandshakeGate.evaluate(handshake.protocolVersion(),
+                handshake.capabilities(), this.lssConfig.enabled, service != null);
+
+        if (!decision.sendSessionConfig()) {
+            // See HandshakeGate.Outcome.VERSION_MISMATCH: replying would kick the player.
             LSSLogger.warn("Player " + nmsPlayer.getName().getString()
                     + " has incompatible LSS protocol version " + handshake.protocolVersion()
                     + " (server: " + LSSConstants.PROTOCOL_VERSION + "), skipping LOD distribution");
             return;
         }
 
-        boolean effectiveEnabled = this.lssConfig.enabled && this.requestService != null;
-
         PaperPayloadHandler.sendSessionConfig(bukkitPlayer,
                 LSSConstants.PROTOCOL_VERSION,
-                effectiveEnabled,
+                decision.effectiveEnabled(),
                 this.lssConfig.lodDistanceChunks,
                 this.lssConfig.syncOnLoadConcurrencyLimitPerPlayer,
                 this.lssConfig.generationConcurrencyLimitPerPlayer,
                 this.lssConfig.enableChunkGeneration);
 
-        if ((handshake.capabilities() & LSSConstants.CAPABILITY_VOXEL_COLUMNS) == 0) {
-            // No consumer on the client — registering would only create a zombie
-            // state that ignores every request. Visible to admins via this log.
+        if (decision.outcome() == HandshakeGate.Outcome.NO_CONSUMER) {
+            // Visible to admins via this log.
             LSSLogger.info("Player " + nmsPlayer.getName().getString()
                     + " has no LOD consumer (caps=" + handshake.capabilities()
                     + "), skipping LOD registration");
             return;
         }
 
-        if (effectiveEnabled) {
-            this.requestService.registerPlayer(nmsPlayer, handshake.capabilities());
+        if (decision.registerPlayer()) {
+            service.registerPlayer(nmsPlayer, handshake.capabilities());
             LSSLogger.info("Player " + nmsPlayer.getName().getString()
                     + " registered for LSS LOD request processing (caps="
                     + handshake.capabilities() + ")");

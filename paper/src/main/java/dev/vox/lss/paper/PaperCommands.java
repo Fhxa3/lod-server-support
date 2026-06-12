@@ -8,15 +8,25 @@ import org.bukkit.command.TabCompleter;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * Bukkit command handler for /lsslod stats and /lsslod diag.
  */
 public class PaperCommands implements CommandExecutor, TabCompleter {
-    private final LSSPaperPlugin plugin;
+    private final Supplier<PaperRequestProcessingService> serviceSupplier;
+    private final Supplier<PaperConfig> configSupplier;
 
     public PaperCommands(LSSPaperPlugin plugin) {
-        this.plugin = plugin;
+        this(plugin::getRequestService, plugin::getLssConfig);
+    }
+
+    // Package-visible seam: lets T1 tests drive the command paths without a JavaPlugin
+    // instance. Suppliers preserve the late binding of plugin.getRequestService().
+    PaperCommands(Supplier<PaperRequestProcessingService> serviceSupplier,
+                  Supplier<PaperConfig> configSupplier) {
+        this.serviceSupplier = serviceSupplier;
+        this.configSupplier = configSupplier;
     }
 
     @Override
@@ -26,7 +36,7 @@ public class PaperCommands implements CommandExecutor, TabCompleter {
             return true;
         }
 
-        var service = this.plugin.getRequestService();
+        var service = this.serviceSupplier.get();
         if (service == null) {
             sender.sendMessage("LSS LOD request processing is not active");
             return true;
@@ -55,7 +65,7 @@ public class PaperCommands implements CommandExecutor, TabCompleter {
     }
 
     private void showDiagnostics(CommandSender sender, PaperRequestProcessingService service) {
-        var config = this.plugin.getLssConfig();
+        var config = this.configSupplier.get();
         var genService = service.getGenerationService();
         var data = DiagnosticsFormatter.collectDiagData(
                 config.enabled, config.lodDistanceChunks,

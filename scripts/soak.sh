@@ -2,30 +2,83 @@
 set -euo pipefail
 
 # LSS Soak Test Orchestrator
-# Usage: ./scripts/soak.sh <scenario>|all
+# Usage: [SOAK_PLATFORM=fabric|paper] ./scripts/soak.sh <scenario>|all
 #   scenario: fresh-backfill | warm-rejoin | dimension-trip | dirty-broadcast
+#           | rate-limit-storm | disk-saturation | generation-disabled
+#           | generation-capacity-stress | bandwidth-throttle
+#           | cold-restart-resync | enabled-false | teleport-prune
+#           | dirty-range-filter | dirty-during-backfill | dirty-while-offline
+#           | clearcache-mid-session | dimension-rejoin-warm
+#           | paper-dirty-falling-block (SOAK_PLATFORM=paper only)
 #
 # Runs a real dedicated server + headless client through a scripted timeline
 # (scripts/soak-scenarios/<name>.json), collects jsonl snapshots from both
 # sides into soak-results/<scenario>-<timestamp>/, then runs
 # scripts/check_soak.py against them. Exit code = checker exit code.
+#
+# SOAK_PLATFORM=paper runs the identical scenario against a real Paper server
+# (:paper:runSoakServer + PaperSoakScenarioDriver) with the UNCHANGED Fabric soak
+# client and checker. Paper keeps its own base-world snapshot (soak-worlds/base-paper);
+# Paper stores the End in world_the_end/, which is not part of the snapshot, so the
+# staged End regenerates from the fixed seed (acceptable — the laws are delta-based).
 
 SCENARIO="${1:-}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SELF="$PROJECT_ROOT/scripts/soak.sh"
-SERVER_RUN_DIR="$PROJECT_ROOT/fabric/build/run/soak-server"
 CLIENT_RUN_DIR="$PROJECT_ROOT/fabric/build/run/soak-client"
 RESULTS_ROOT="$PROJECT_ROOT/soak-results"
 WORLDS_DIR="$PROJECT_ROOT/soak-worlds"
 SCENARIOS_DIR="$PROJECT_ROOT/scripts/soak-scenarios"
-ALL_SCENARIOS=(fresh-backfill warm-rejoin dimension-trip dirty-broadcast)
+ALL_SCENARIOS=(fresh-backfill warm-rejoin dimension-trip dirty-broadcast
+               rate-limit-storm disk-saturation generation-disabled
+               generation-capacity-stress bandwidth-throttle
+               cold-restart-resync enabled-false teleport-prune
+               dirty-range-filter dirty-during-backfill dirty-while-offline
+               clearcache-mid-session dimension-rejoin-warm)
+# Scenarios ported to Paper. The remaining ones are Fabric-specific for now: the dirty-*
+# family leans on the save-hook + DirtyContentFilter (Paper's dirty detection is
+# event-driven — paper-dirty-falling-block is the Paper-native dirty scenario),
+# cold-restart-resync restores a Fabric-layout world/cache snapshot pair, and the
+# stress/config scenarios simply haven't been validated on Paper yet.
+PAPER_SCENARIOS=(fresh-backfill warm-rejoin dimension-trip paper-dirty-falling-block)
+# Scenarios that run on a fresh (deleted) world; everything else copies the base world.
+FRESH_WORLD_SCENARIOS="fresh-backfill rate-limit-storm generation-disabled generation-capacity-stress"
 LOG_PREFIX="soak"
+
+# Exported so 'all' recursion and auto-run fresh-backfill inherit the platform.
+SOAK_PLATFORM="${SOAK_PLATFORM:-fabric}"
+export SOAK_PLATFORM
+case "$SOAK_PLATFORM" in
+    fabric)
+        SERVER_RUN_DIR="$PROJECT_ROOT/fabric/build/run/soak-server"
+        SERVER_GRADLE_TASK=":fabric:runSoakServer"
+        SERVER_CONFIG_DIR="$SERVER_RUN_DIR/config"
+        BASE_WORLD_DIR="$WORLDS_DIR/base"
+        PLATFORM_TAG=""
+        SERVER_READY_TIMEOUT=120
+        ;;
+    paper)
+        SERVER_RUN_DIR="$PROJECT_ROOT/paper/build/run/soak-server"
+        SERVER_GRADLE_TASK=":paper:runSoakServer"
+        # PaperConfig loads from the plugin data folder (plugin.yml name: LodServerSupport)
+        SERVER_CONFIG_DIR="$SERVER_RUN_DIR/plugins/LodServerSupport"
+        BASE_WORLD_DIR="$WORLDS_DIR/base-paper"
+        PLATFORM_TAG="paper-"
+        # run-paper downloads the Paper server jar inside the gradle task on first run
+        SERVER_READY_TIMEOUT=240
+        ;;
+    *)
+        echo "[soak] ERROR: Unknown SOAK_PLATFORM '$SOAK_PLATFORM' (want fabric or paper)"
+        exit 1
+        ;;
+esac
 
 source "$PROJECT_ROOT/scripts/lib/mc-run.sh"
 
 usage() {
-    echo "Usage: $0 <scenario>|all"
-    echo "  scenarios: ${ALL_SCENARIOS[*]}"
+    echo "Usage: [SOAK_PLATFORM=fabric|paper] $0 <scenario>|all"
+    echo "  fabric scenarios: ${ALL_SCENARIOS[*]}"
+    echo "  paper scenarios:  ${PAPER_SCENARIOS[*]}"
 }
 
 if [[ -z "$SCENARIO" ]]; then
@@ -36,15 +89,25 @@ fi
 # 'all' runs every scenario in spec order; set -e stops at the first failure
 # and propagates the failing child's exit code.
 if [[ "$SCENARIO" == "all" ]]; then
-    for s in "${ALL_SCENARIOS[@]}"; do
-        "$SELF" "$s"
-    done
-    echo "[soak] All scenarios passed"
+    if [[ "$SOAK_PLATFORM" == "paper" ]]; then
+        for s in "${PAPER_SCENARIOS[@]}"; do
+            "$SELF" "$s"
+        done
+    else
+        for s in "${ALL_SCENARIOS[@]}"; do
+            "$SELF" "$s"
+        done
+    fi
+    echo "[soak] All scenarios passed ($SOAK_PLATFORM)"
     exit 0
 fi
 
 case "$SCENARIO" in
     fresh-backfill|warm-rejoin|dimension-trip|dirty-broadcast) ;;
+    rate-limit-storm|disk-saturation|generation-disabled|generation-capacity-stress|bandwidth-throttle) ;;
+    cold-restart-resync|enabled-false|teleport-prune|dirty-range-filter) ;;
+    dirty-during-backfill|dirty-while-offline|clearcache-mid-session|dimension-rejoin-warm) ;;
+    paper-dirty-falling-block) ;;
     *)
         echo "[soak] ERROR: Unknown scenario '$SCENARIO'"
         usage
@@ -52,13 +115,45 @@ case "$SCENARIO" in
         ;;
 esac
 
-# Per-scenario knobs: number of client runs and expected end-to-end seconds.
+# Platform gating: the Paper port covers a validated subset; the falling-block scenario is
+# Paper-native (setblock fires no Bukkit event, and Fabric's save-hook detection would need
+# a save-all the timeline deliberately omits).
+if [[ "$SOAK_PLATFORM" == "paper" && " ${PAPER_SCENARIOS[*]} " != *" $SCENARIO "* ]]; then
+    echo "[soak] ERROR: Scenario '$SCENARIO' is not ported to SOAK_PLATFORM=paper"
+    usage
+    exit 1
+fi
+if [[ "$SOAK_PLATFORM" == "fabric" && "$SCENARIO" == paper-* ]]; then
+    echo "[soak] ERROR: Scenario '$SCENARIO' requires SOAK_PLATFORM=paper"
+    usage
+    exit 1
+fi
+
+# Per-scenario knobs: number of client runs, expected end-to-end seconds, and extra
+# gradle -P properties for the CLIENT JVM (per-position probes / scripted client action).
 # Kill switch budget = expected + 240s slack.
+CLIENT_EXTRA_ARGS=()
 case "$SCENARIO" in
-    fresh-backfill)  CLIENT_RUNS=1; EXPECTED_SECONDS=280 ;;
-    warm-rejoin)     CLIENT_RUNS=2; EXPECTED_SECONDS=360 ;;
-    dimension-trip)  CLIENT_RUNS=1; EXPECTED_SECONDS=420 ;;
-    dirty-broadcast) CLIENT_RUNS=1; EXPECTED_SECONDS=240 ;;
+    fresh-backfill)             CLIENT_RUNS=1; EXPECTED_SECONDS=280 ;;
+    warm-rejoin)                CLIENT_RUNS=2; EXPECTED_SECONDS=360 ;;
+    dimension-trip)             CLIENT_RUNS=1; EXPECTED_SECONDS=420 ;;
+    dirty-broadcast)            CLIENT_RUNS=1; EXPECTED_SECONDS=270 ;;
+    rate-limit-storm)           CLIENT_RUNS=1; EXPECTED_SECONDS=370 ;;
+    disk-saturation)            CLIENT_RUNS=1; EXPECTED_SECONDS=250 ;;
+    generation-disabled)        CLIENT_RUNS=1; EXPECTED_SECONDS=230 ;;
+    generation-capacity-stress) CLIENT_RUNS=1; EXPECTED_SECONDS=330 ;;
+    bandwidth-throttle)         CLIENT_RUNS=1; EXPECTED_SECONDS=290 ;;
+    cold-restart-resync)        CLIENT_RUNS=1; EXPECTED_SECONDS=280 ;;
+    enabled-false)              CLIENT_RUNS=1; EXPECTED_SECONDS=230 ;;
+    teleport-prune)             CLIENT_RUNS=1; EXPECTED_SECONDS=420 ;;
+    dirty-range-filter)         CLIENT_RUNS=1; EXPECTED_SECONDS=350 ;;
+    dirty-during-backfill)      CLIENT_RUNS=1; EXPECTED_SECONDS=240 ;;
+    dirty-while-offline)        CLIENT_RUNS=2; EXPECTED_SECONDS=420
+                                CLIENT_EXTRA_ARGS=("-Psoak.probes=20:0,-20:0") ;;
+    clearcache-mid-session)     CLIENT_RUNS=1; EXPECTED_SECONDS=280
+                                CLIENT_EXTRA_ARGS=("-Psoak.clientActionAt=60:clearcache") ;;
+    dimension-rejoin-warm)      CLIENT_RUNS=2; EXPECTED_SECONDS=650 ;;
+    paper-dirty-falling-block)  CLIENT_RUNS=1; EXPECTED_SECONDS=300 ;;
 esac
 RUNTIME_BUDGET=$((EXPECTED_SECONDS + 240))
 DEADLINE_EPOCH=0
@@ -93,59 +188,80 @@ soak_port_in_use() {
 }
 
 echo "========================================="
-echo " LSS Soak: scenario=$SCENARIO, client runs=$CLIENT_RUNS, budget=${RUNTIME_BUDGET}s"
+echo " LSS Soak: platform=$SOAK_PLATFORM, scenario=$SCENARIO, client runs=$CLIENT_RUNS, budget=${RUNTIME_BUDGET}s"
 echo "========================================="
 
 # Step 1: Auto-run fresh-backfill first if a base world is required but missing
-if [[ "$SCENARIO" != "fresh-backfill" && ! -d "$WORLDS_DIR/base/world" ]]; then
-    echo "[soak] No base world at $WORLDS_DIR/base/world — running fresh-backfill first"
-    "$SELF" fresh-backfill
+# (fresh-world scenarios never need it). cold-restart-resync additionally needs the
+# client-cache snapshot taken at the same instant as the base world — a base world
+# saved by an older fresh-backfill (pre-snapshot) must be regenerated.
+if [[ " $FRESH_WORLD_SCENARIOS " != *" $SCENARIO "* ]]; then
+    if [[ ! -d "$BASE_WORLD_DIR/world" ]]; then
+        echo "[soak] No base world at $BASE_WORLD_DIR/world — running fresh-backfill first"
+        "$SELF" fresh-backfill
+    elif [[ "$SCENARIO" == "cold-restart-resync" && ! -d "$BASE_WORLD_DIR/client-cache" ]]; then
+        echo "[soak] Base world has no client-cache snapshot — re-running fresh-backfill"
+        "$SELF" fresh-backfill
+    fi
 fi
 
 # Step 2: Pre-flight — validate the scenario timeline before anything boots
 echo "[soak] Validating scenario..."
 python3 "$PROJECT_ROOT/scripts/check_soak.py" --validate "$SCENARIO"
 
-# Step 3: Build
+# Step 3: Build (the soak client is always the Fabric client; paper additionally needs
+# the dev plugin jar that retains the soak package)
 echo "[soak] Building mod..."
 cd "$PROJECT_ROOT"
 ./gradlew :fabric:build -x test -x runGameTest -x runClientGameTest --quiet
+if [[ "$SOAK_PLATFORM" == "paper" ]]; then
+    ./gradlew :paper:soakShadowJar --quiet
+fi
 
 # Step 4: Prepare run + results directories
 mkdir -p "$SERVER_RUN_DIR" "$CLIENT_RUN_DIR"
-RUN_RESULTS_DIR="$RESULTS_ROOT/$SCENARIO-$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_RESULTS_DIR="$RESULTS_ROOT/$SCENARIO-$PLATFORM_TAG$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$RUN_RESULTS_DIR"
 
-# Step 5a: Stage world
+# Step 5a: Stage world. Fresh-world scenarios start from nothing (generation paths);
+# only fresh-backfill SAVES its world as the reusable base afterwards (Step 13).
+# world_nether/world_the_end only exist on Paper (split dimension dirs) and are always
+# cleared: the base snapshot carries world/ only, so the End regenerates from the seed.
 echo "[soak] Staging world for scenario: $SCENARIO"
-case "$SCENARIO" in
-    fresh-backfill)
-        rm -rf "$SERVER_RUN_DIR/world"
-        rm -rf "$SERVER_RUN_DIR/world_nether"
-        rm -rf "$SERVER_RUN_DIR/world_the_end"
-        ;;
-    *)
-        rm -rf "$SERVER_RUN_DIR/world"
-        cp -r "$WORLDS_DIR/base/world" "$SERVER_RUN_DIR/world"
-        ;;
-esac
+rm -rf "$SERVER_RUN_DIR/world"
+rm -rf "$SERVER_RUN_DIR/world_nether"
+rm -rf "$SERVER_RUN_DIR/world_the_end"
+if [[ " $FRESH_WORLD_SCENARIOS " != *" $SCENARIO "* ]]; then
+    cp -r "$BASE_WORLD_DIR/world" "$SERVER_RUN_DIR/world"
+fi
 
 # Step 5b: Stage client column cache. warm-rejoin clears too: its run 1 IS the
 # cache-populating run (otherwise, under 'all' ordering, run 1 starts warm from the
 # previous scenario's cache and the run1-vs-run2 named check has nothing to compare).
+# The contention/generation-config/bandwidth scenarios clear so every position goes
+# through the live request path instead of resolving as a cached revalidation.
+# cold-restart-resync RESTORES the snapshot taken alongside the base world: the client
+# cache and the world's data/lss-timestamps.bin were persisted at the same instant, so
+# a brand-new server JVM must resync this client almost entirely via up_to_date.
 case "$SCENARIO" in
-    fresh-backfill|dimension-trip|warm-rejoin)
-        echo "[soak] Clearing client column cache"
-        rm -rf "$CLIENT_RUN_DIR/config/lss/cache"
-        ;;
     dirty-broadcast)
         echo "[soak] Keeping client column cache"
         ;;
+    cold-restart-resync)
+        echo "[soak] Restoring client column cache from $BASE_WORLD_DIR/client-cache"
+        rm -rf "$CLIENT_RUN_DIR/config/lss/cache"
+        mkdir -p "$CLIENT_RUN_DIR/config/lss"
+        cp -r "$BASE_WORLD_DIR/client-cache" "$CLIENT_RUN_DIR/config/lss/cache"
+        ;;
+    *)
+        echo "[soak] Clearing client column cache"
+        rm -rf "$CLIENT_RUN_DIR/config/lss/cache"
+        ;;
 esac
 
-# Step 6a: Stage server config override
-mkdir -p "$SERVER_RUN_DIR/config"
-cp "$SCENARIO_CONFIG" "$SERVER_RUN_DIR/config/lss-server-config.json"
+# Step 6a: Stage server config override (fabric: config/; paper: the plugin data folder)
+mkdir -p "$SERVER_CONFIG_DIR"
+cp "$SCENARIO_CONFIG" "$SERVER_CONFIG_DIR/lss-server-config.json"
 
 # Step 6b: Write server.properties + eula.txt. Superflat: fresh noise terrain carries
 # minutes of unsettled fluid ticks (aquifers, gen-border flows) that mutate chunk content
@@ -186,14 +302,14 @@ if soak_port_in_use; then
 fi
 
 # Step 9: Start server and arm the kill switch once it is ready
-mc_start_server "$RUN_RESULTS_DIR/server.log" :fabric:runSoakServer -Psoak.scenario="$SCENARIO_JSON" ${SOAK_EXTRA_GRADLE_ARGS:-}
-mc_wait_server_ready "$SERVER_RUN_DIR/logs/latest.log" "$RUN_RESULTS_DIR/server.log" 120
+mc_start_server "$RUN_RESULTS_DIR/server.log" "$SERVER_GRADLE_TASK" -Psoak.scenario="$SCENARIO_JSON" ${SOAK_EXTRA_GRADLE_ARGS:-}
+mc_wait_server_ready "$SERVER_RUN_DIR/logs/latest.log" "$RUN_RESULTS_DIR/server.log" "$SERVER_READY_TIMEOUT"
 DEADLINE_EPOCH=$(( $(date +%s) + RUNTIME_BUDGET ))
 
 # Step 10: Client runs (the server kicks the client between runs / halts at scenario end)
 for (( run=1; run<=CLIENT_RUNS; run++ )); do
     echo "[soak] Client run $run/$CLIENT_RUNS"
-    mc_start_client "$RUN_RESULTS_DIR/client-run$run.log" :fabric:runSoakClient
+    mc_start_client "$RUN_RESULTS_DIR/client-run$run.log" :fabric:runSoakClient ${CLIENT_EXTRA_ARGS[@]+"${CLIENT_EXTRA_ARGS[@]}"}
     while kill -0 "$CLIENT_PID" 2>/dev/null; do
         soak_check_deadline
         sleep 1
@@ -229,12 +345,22 @@ cp "$CLIENT_RUN_DIR/soak-results/"client-run*.jsonl "$RUN_RESULTS_DIR/" 2>/dev/n
     || echo "[soak] WARNING: No client jsonl files found"
 cp "$SCENARIO_JSON" "$RUN_RESULTS_DIR/"
 
-# Step 13: Save world for reuse (fresh-backfill only)
+# Step 13: Save world for reuse (fresh-backfill only). The client column cache is
+# snapshotted alongside it: the world copy carries data/lss-timestamps.bin (final save
+# runs on server shutdown, before this copy), so world + client-cache form a mutually
+# consistent warm pair that cold-restart-resync restores into a brand-new server JVM.
 if [[ "$SCENARIO" == "fresh-backfill" && -d "$SERVER_RUN_DIR/world" ]]; then
-    echo "[soak] Saving world to $WORLDS_DIR/base/ for reuse"
-    mkdir -p "$WORLDS_DIR/base"
-    rm -rf "$WORLDS_DIR/base/world"
-    cp -r "$SERVER_RUN_DIR/world" "$WORLDS_DIR/base/world"
+    echo "[soak] Saving world to $BASE_WORLD_DIR/ for reuse"
+    mkdir -p "$BASE_WORLD_DIR"
+    rm -rf "$BASE_WORLD_DIR/world"
+    cp -r "$SERVER_RUN_DIR/world" "$BASE_WORLD_DIR/world"
+    if [[ -d "$CLIENT_RUN_DIR/config/lss/cache" ]]; then
+        echo "[soak] Saving client column cache snapshot to $BASE_WORLD_DIR/client-cache"
+        rm -rf "$BASE_WORLD_DIR/client-cache"
+        cp -r "$CLIENT_RUN_DIR/config/lss/cache" "$BASE_WORLD_DIR/client-cache"
+    else
+        echo "[soak] WARNING: No client cache to snapshot (cold-restart-resync will re-run fresh-backfill)"
+    fi
 fi
 
 # Step 14: Run the checker — its exit code is this script's exit code

@@ -29,7 +29,9 @@ public class PaperChunkGenerationService {
 
     record GenerationCallback(UUID playerUuid, long submissionOrder) {}
 
-    private record PendingGenerationKey(ResourceKey<Level> dimension, int cx, int cz) {}
+    // Package-visible (with launchAsyncLoad/onChunkReady) so T1 tests can drive the async
+    // boundary directly instead of going through Bukkit's scheduler.
+    record PendingGenerationKey(ResourceKey<Level> dimension, int cx, int cz) {}
 
     /**
      * Tracks an active async chunk load. The async future fires {@link #onChunkReady}
@@ -98,8 +100,9 @@ public class PaperChunkGenerationService {
     /**
      * Launches Paper's async chunk load. The callback fires on the main thread
      * when the chunk reaches FULL status. Paper manages tickets automatically.
+     * Package-visible seam: tests override this to capture the launch.
      */
-    private void launchAsyncLoad(PendingGenerationKey key, ServerLevel level, int cx, int cz) {
+    void launchAsyncLoad(PendingGenerationKey key, ServerLevel level, int cx, int cz) {
         level.getWorld().getChunkAtAsync(cx, cz, true, false).whenComplete((chunk, ex) -> {
             if (ex != null) {
                 LSSLogger.error("Async chunk load failed at " + cx + "," + cz, ex);
@@ -120,9 +123,10 @@ public class PaperChunkGenerationService {
 
     /**
      * Called on the main thread when Paper finishes loading/generating a chunk to FULL.
+     * Package-visible so tests can fire the completion that launchAsyncLoad would schedule.
      */
-    private void onChunkReady(PendingGenerationKey key, ServerLevel level,
-                               Chunk chunk, int cx, int cz) {
+    void onChunkReady(PendingGenerationKey key, ServerLevel level,
+                       Chunk chunk, int cx, int cz) {
         var gen = this.active.remove(key);
         if (gen == null) return; // cleaned up by removePlayer or timeout
 
@@ -231,6 +235,17 @@ public class PaperChunkGenerationService {
         return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d, removed=%d",
                 totalSubmitted, totalCompleted, active.size(), totalTimeouts, totalRemovedInFlight);
     }
+
+    public long getTotalSubmitted() { return this.totalSubmitted; }
+
+    public long getTotalCompleted() { return this.totalCompleted; }
+
+    public long getTotalTimeouts() { return this.totalTimeouts; }
+
+    public long getTotalRemovedInFlight() { return this.totalRemovedInFlight; }
+
+    /** Main thread only (like every other read of {@code active}). */
+    public int getActiveCount() { return this.active.size(); }
 
     private static void incrementCount(Map<UUID, Integer> map, UUID uuid) {
         map.merge(uuid, 1, Integer::sum);

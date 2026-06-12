@@ -20,6 +20,10 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public class LSSClientNetworking {
     private static volatile boolean serverEnabled = false;
+    // True once a SessionConfig reply (compatible version) arrived for the current
+    // connection — distinguishes "server said disabled" from "no LSS server / not yet
+    // answered". Read by the dev-only soak hook to snapshot disabled sessions.
+    private static volatile boolean sessionConfigReceived = false;
     private static volatile int serverLodDistance = 0;
     private static final AtomicLong columnsReceived = new AtomicLong();
     private static final AtomicLong bytesReceived = new AtomicLong();
@@ -30,6 +34,10 @@ public class LSSClientNetworking {
 
     public static boolean isServerEnabled() {
         return serverEnabled;
+    }
+
+    public static boolean hasReceivedSessionConfig() {
+        return sessionConfigReceived;
     }
 
     public static int getServerLodDistance() {
@@ -96,6 +104,7 @@ public class LSSClientNetworking {
                     }
 
                     serverEnabled = payload.enabled();
+                    sessionConfigReceived = true;
                     serverLodDistance = payload.lodDistanceChunks();
 
                     // Without a registered LSSApi consumer there is nothing to deliver columns
@@ -127,16 +136,7 @@ public class LSSClientNetworking {
                     context.client().execute(() -> {
                         var manager = requestManager;
                         if (manager == null) return;
-                        for (int i = 0; i < payload.count(); i++) {
-                            long packed = payload.packedPositions()[i];
-                            byte type = payload.responseTypes()[i];
-                            switch (type) {
-                                case LSSConstants.RESPONSE_RATE_LIMITED -> manager.onRateLimited(packed);
-                                case LSSConstants.RESPONSE_UP_TO_DATE -> manager.onColumnUpToDate(packed);
-                                case LSSConstants.RESPONSE_NOT_GENERATED -> manager.onColumnNotGenerated(packed);
-                                default -> LSSLogger.warn("Unknown batch response type: " + type);
-                            }
-                        }
+                        dispatchBatchResponses(manager, payload);
                     });
                 }
         );
@@ -173,9 +173,28 @@ public class LSSClientNetworking {
         );
     }
 
+    /**
+     * Routes each batch entry to its per-type manager callback. An unknown responseType
+     * skips that entry only, never the rest of the batch (forward compat with newer
+     * servers). Package-private so tests can exercise it without a network receiver.
+     */
+    static void dispatchBatchResponses(LodRequestManager manager, BatchResponseS2CPayload payload) {
+        for (int i = 0; i < payload.count(); i++) {
+            long packed = payload.packedPositions()[i];
+            byte type = payload.responseTypes()[i];
+            switch (type) {
+                case LSSConstants.RESPONSE_RATE_LIMITED -> manager.onRateLimited(packed);
+                case LSSConstants.RESPONSE_UP_TO_DATE -> manager.onColumnUpToDate(packed);
+                case LSSConstants.RESPONSE_NOT_GENERATED -> manager.onColumnNotGenerated(packed);
+                default -> LSSLogger.warn("Unknown batch response type: " + type);
+            }
+        }
+    }
+
     private static void registerConnectionLifecycle() {
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
             serverEnabled = false;
+            sessionConfigReceived = false;
             serverLodDistance = 0;
             requestManager = null;
 
@@ -207,6 +226,7 @@ public class LSSClientNetworking {
             columnProcessor.shutdown();
             columnProcessor.resetStats();
             serverEnabled = false;
+            sessionConfigReceived = false;
             serverLodDistance = 0;
             columnsReceived.set(0);
             bytesReceived.set(0);

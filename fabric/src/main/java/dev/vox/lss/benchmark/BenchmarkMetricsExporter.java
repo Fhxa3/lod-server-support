@@ -76,6 +76,14 @@ public final class BenchmarkMetricsExporter {
             genMap.put("timeouts", genService.getTotalTimeouts());
             genMap.put("removed_in_flight", genService.getTotalRemovedInFlight());
             genMap.put("active", genService.getActiveCount());
+        } else {
+            // enableChunkGeneration=false leaves the service null; the soak checker schema
+            // requires every generation.* field, so zero-fill instead of emitting {}.
+            genMap.put("submitted", 0L);
+            genMap.put("completed", 0L);
+            genMap.put("timeouts", 0L);
+            genMap.put("removed_in_flight", 0L);
+            genMap.put("active", 0);
         }
         result.put("generation", genMap);
 
@@ -108,47 +116,81 @@ public final class BenchmarkMetricsExporter {
     }
 
     /**
+     * Per-position probe list parsed from {@code -Dlss.soak.probes=x:z,...} (chunk
+     * coordinates). Empty when the property is unset/blank, so non-probe scenarios emit
+     * no {@code probes} field at all.
+     */
+    private static final java.util.List<Map.Entry<String, int[]>> SOAK_PROBES = parseSoakProbes();
+
+    private static java.util.List<Map.Entry<String, int[]>> parseSoakProbes() {
+        String spec = System.getProperty("lss.soak.probes", "");
+        var probes = new java.util.ArrayList<Map.Entry<String, int[]>>();
+        for (String token : spec.split(",")) {
+            token = token.trim();
+            if (token.isEmpty()) continue;
+            int sep = token.indexOf(':');
+            try {
+                int cx = Integer.parseInt(token.substring(0, sep));
+                int cz = Integer.parseInt(token.substring(sep + 1));
+                probes.add(Map.entry(token, new int[]{cx, cz}));
+            } catch (RuntimeException e) {
+                LSSLogger.warn("[Soak] Ignoring malformed probe token '" + token + "' (want x:z)");
+            }
+        }
+        return probes;
+    }
+
+    /**
      * Client diagnostic snapshot keyed by the soak checker contract. `received_columns`
      * and `received_bytes` are the wire-level (pre-dimension-guard) counters used by
      * delivery conservation; `responses.*` are the post-guard request metrics used by
-     * request conservation.
+     * request conservation. Manager-scoped fields are zero-filled when no
+     * LodRequestManager exists (server replied enabled=false) so the disabled session
+     * still satisfies the checker schema, with `server_enabled` naming the cause.
      */
     public static Map<String, Object> buildClientSnapshot() {
         var result = new LinkedHashMap<String, Object>();
+        result.put("server_enabled", LSSClientNetworking.isServerEnabled());
         result.put("received_columns", LSSClientNetworking.getColumnsReceived());
         result.put("received_bytes", LSSClientNetworking.getBytesReceived());
         result.put("dropped", LSSClientNetworking.getColumnsDropped());
         result.put("queued", LSSClientNetworking.getQueuedColumnCount());
 
         LodRequestManager manager = LSSClientNetworking.getRequestManager();
-        if (manager != null) {
-            result.put("dimension", manager.getCurrentDimensionId());
+        result.put("dimension", manager != null ? manager.getCurrentDimensionId() : "none");
 
-            var responses = new LinkedHashMap<String, Object>();
-            responses.put("columns", manager.getTotalColumnsReceived());
-            responses.put("up_to_date", manager.getTotalUpToDate());
-            responses.put("not_generated", manager.getTotalNotGenerated());
-            responses.put("rate_limited", manager.getTotalRateLimited());
-            result.put("responses", responses);
+        var responses = new LinkedHashMap<String, Object>();
+        responses.put("columns", manager != null ? manager.getTotalColumnsReceived() : 0L);
+        responses.put("up_to_date", manager != null ? manager.getTotalUpToDate() : 0L);
+        responses.put("not_generated", manager != null ? manager.getTotalNotGenerated() : 0L);
+        responses.put("rate_limited", manager != null ? manager.getTotalRateLimited() : 0L);
+        result.put("responses", responses);
 
-            result.put("requested_total", manager.getTotalPositionsRequested());
-            result.put("send_cycles", manager.getTotalSendCycles());
+        result.put("requested_total", manager != null ? manager.getTotalPositionsRequested() : 0L);
+        result.put("send_cycles", manager != null ? manager.getTotalSendCycles() : 0L);
 
-            var columns = new LinkedHashMap<String, Object>();
-            columns.put("known", manager.getReceivedColumnCount());
-            columns.put("empty", manager.getEmptyColumnCount());
-            columns.put("dirty", manager.getDirtyColumnCount());
-            result.put("columns", columns);
+        var columns = new LinkedHashMap<String, Object>();
+        columns.put("known", manager != null ? manager.getReceivedColumnCount() : 0);
+        columns.put("empty", manager != null ? manager.getEmptyColumnCount() : 0);
+        columns.put("dirty", manager != null ? manager.getDirtyColumnCount() : 0);
+        result.put("columns", columns);
 
-            var scan = new LinkedHashMap<String, Object>();
-            scan.put("confirmed", manager.getConfirmedRing());
-            scan.put("ring", manager.getScanRing());
-            scan.put("missing_vanilla", manager.getMissingVanillaChunks());
-            result.put("scan", scan);
+        var scan = new LinkedHashMap<String, Object>();
+        scan.put("confirmed", manager != null ? manager.getConfirmedRing() : 0);
+        scan.put("ring", manager != null ? manager.getScanRing() : 0);
+        scan.put("missing_vanilla", manager != null ? manager.getMissingVanillaChunks() : 0);
+        result.put("scan", scan);
 
-            result.put("tracker_in_flight", manager.getPendingCount());
-        } else {
-            result.put("dimension", "none");
+        result.put("tracker_in_flight", manager != null ? manager.getPendingCount() : 0);
+
+        if (!SOAK_PROBES.isEmpty()) {
+            var probes = new LinkedHashMap<String, Object>();
+            for (var probe : SOAK_PROBES) {
+                int[] pos = probe.getValue();
+                probes.put(probe.getKey(),
+                        manager != null ? manager.getColumnTimestamp(pos[0], pos[1]) : -1L);
+            }
+            result.put("probes", probes);
         }
 
         return result;

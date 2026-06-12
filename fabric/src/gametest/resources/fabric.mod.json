@@ -5,7 +5,12 @@
     "name": "LSS Tests",
     "environment": "*",
     "entrypoints": {
-        "fabric-gametest": ["dev.vox.lss.test.LSSGameTests"],
+        "fabric-gametest": [
+            "dev.vox.lss.test.GenerationLifecycleGameTests",
+            "dev.vox.lss.test.LSSGameTests",
+            "dev.vox.lss.test.SerializerParityGameTests",
+            "dev.vox.lss.test.ServiceLifecycleGameTests"
+        ],
         "fabric-client-gametest": ["dev.vox.lss.test.LSSClientGameTests"]
     },
     "depends": {

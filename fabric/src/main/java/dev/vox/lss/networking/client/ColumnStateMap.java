@@ -65,9 +65,17 @@ class ColumnStateMap {
         else if (timestamp == 0) this.emptyCount++;
     }
 
-    /** Mark dirty if the column is known (&gt;0). Returns true if marked. */
+    /**
+     * Mark dirty if the client has any recorded disposition for the column (data OR a
+     * not-generated stamp). A dirty broadcast means the server just SAVED content there,
+     * so a ts==0 stamp is stale — without this rescue, a not-generated answer under
+     * enableChunkGeneration=false (or any probe-miss race on a fresh world) parks the
+     * position permanently even after the chunk exists on disk. The re-request goes out
+     * with ts=0, which the server routes disk-first and can now serve. Unknown (-1)
+     * positions stay unmarked — the scan ladder requests those anyway.
+     */
     boolean markDirtyIfKnown(long packed) {
-        if (this.timestamps.get(packed) > 0) {
+        if (this.timestamps.get(packed) != -1L) {
             this.dirty.add(packed);
             return true;
         }
@@ -156,6 +164,9 @@ class ColumnStateMap {
     Long2LongOpenHashMap mapForSave() {
         return this.timestamps;
     }
+
+    /** Raw stored timestamp for one position: -1 absent, 0 not-generated, &gt;0 received. */
+    long timestampFor(long packed) { return this.timestamps.get(packed); }
 
     boolean isEmptyMap() { return this.timestamps.isEmpty(); }
     boolean hasRetries() { return !this.retry.isEmpty(); }

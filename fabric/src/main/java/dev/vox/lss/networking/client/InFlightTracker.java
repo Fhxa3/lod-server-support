@@ -53,16 +53,24 @@ class InFlightTracker {
     }
 
     /**
-     * Sweep all timed-out requests, removing them from tracking.
+     * Sweep all timed-out requests, removing them from tracking and reporting each evicted
+     * position. Callers MUST mark evictions for retry: while a position is in flight the
+     * scanner counts it as satisfied, so ring confirmation can advance past it — if the
+     * response then never lands (send-queue drop under bandwidth pressure), the position
+     * returns to unknown inside an already-confirmed ring and is never rescanned. The
+     * retry mark resets ring confirmation and re-requests it (bandwidth-throttle soak
+     * found 161 such permanently orphaned positions).
      */
-    void timeoutSweep(long thresholdNanos) {
+    void timeoutSweep(long thresholdNanos, java.util.function.LongConsumer onTimeout) {
         long now = System.nanoTime();
         var iter = this.pendingRequests.long2LongEntrySet().iterator();
         while (iter.hasNext()) {
             var entry = iter.next();
             if (now - entry.getLongValue() > thresholdNanos) {
                 this.generationPositions.remove(entry.getLongKey());
+                long pos = entry.getLongKey();
                 iter.remove();
+                onTimeout.accept(pos);
             }
         }
     }

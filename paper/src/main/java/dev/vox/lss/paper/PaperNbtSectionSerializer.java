@@ -92,13 +92,17 @@ final class PaperNbtSectionSerializer {
                 buf.writeByte(p.sectionY);
                 p.section.write(buf);
 
-                boolean hasBlockLight = p.blockLight.length == 2048;
+                // All-zero layers are skipped to match the live serializer exactly (mirrors
+                // Fabric's NbtSectionSerializer): "absent" means all-zero on the wire, and
+                // vanilla saves the light engine's allocated-but-zeroed arrays, which would
+                // otherwise make disk serves byte-diverge from live serves of identical content.
+                boolean hasBlockLight = p.blockLight.length == 2048 && hasNonZeroNibble(p.blockLight);
                 buf.writeBoolean(hasBlockLight);
                 if (hasBlockLight) {
                     buf.writeBytes(p.blockLight);
                 }
 
-                boolean hasSkyLight = p.skyLight.length == 2048;
+                boolean hasSkyLight = p.skyLight.length == 2048 && hasNonZeroNibble(p.skyLight);
                 buf.writeBoolean(hasSkyLight);
                 if (hasSkyLight) {
                     buf.writeBytes(p.skyLight);
@@ -148,17 +152,18 @@ final class PaperNbtSectionSerializer {
         }
 
         if (section.hasOnlyAir()) {
-            if (blockLightData.length != 2048) {
+            if (blockLightData.length != 2048 || !hasNonZeroNibble(blockLightData)) {
                 return null;
             }
-            // Check if block light has any non-zero nibbles
-            boolean hasLight = false;
-            for (byte b : blockLightData) {
-                if (b != 0) { hasLight = true; break; }
-            }
-            if (!hasLight) return null;
         }
 
         return section;
+    }
+
+    private static boolean hasNonZeroNibble(byte[] light) {
+        for (byte b : light) {
+            if (b != 0) return true;
+        }
+        return false;
     }
 }

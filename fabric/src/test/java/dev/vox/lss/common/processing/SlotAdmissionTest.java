@@ -25,7 +25,13 @@ class SlotAdmissionTest {
 
         @Override
         public String getPlayerName() { return "test"; }
+
+        void enqueue(IncomingRequest r) { enqueueIncomingRequest(r); }
     }
+
+    // Mirrors AbstractPlayerRequestState.MAX_INCOMING_QUEUE — the OOM-DoS bound on a
+    // flooding client. A deliberate bound change must update this test.
+    private static final int MAX_INCOMING_QUEUE = 16384;
 
     private TestState state;
 
@@ -113,5 +119,45 @@ class SlotAdmissionTest {
         assertTrue(state.hasPendingRequest(0, 0));
         state.removePendingByPosition(0, 0);
         assertFalse(state.hasPendingRequest(0, 0));
+    }
+
+    // ---- Incoming-queue flood bound ----
+
+    @Test
+    void incomingFloodDropsAtTheBoundAndRecoversAfterDraining() {
+        for (int i = 0; i < MAX_INCOMING_QUEUE + 100; i++) {
+            state.enqueue(new IncomingRequest(i, 0, -1L));
+        }
+        assertEquals(MAX_INCOMING_QUEUE, state.getTotalRequestsReceived(),
+                "accepted requests stop exactly at the bound");
+        assertEquals(100, state.getTotalIncomingDropped(), "overflow must be dropped, not queued");
+
+        // The bound holds structurally: exactly MAX entries are pollable
+        int drained = 0;
+        while (state.pollIncomingRequest() != null) drained++;
+        assertEquals(MAX_INCOMING_QUEUE, drained);
+
+        // Recovery: draining must reopen the queue (a wedged-closed queue kills LOD for good)
+        state.enqueue(new IncomingRequest(99999, 0, -1L));
+        assertEquals(MAX_INCOMING_QUEUE + 1, state.getTotalRequestsReceived());
+        assertEquals(100, state.getTotalIncomingDropped(), "post-recovery enqueue must not drop");
+        assertNotNull(state.pollIncomingRequest());
+    }
+
+    @Test
+    void incomingQueueReopensExactlyByDrainedCapacity() {
+        // Catches counter desync between poll and enqueue (either direction wedges the gate)
+        for (int i = 0; i < MAX_INCOMING_QUEUE; i++) {
+            state.enqueue(new IncomingRequest(i, 1, -1L));
+        }
+        for (int i = 0; i < 50; i++) {
+            assertNotNull(state.pollIncomingRequest());
+        }
+        for (int i = 0; i < 60; i++) {
+            state.enqueue(new IncomingRequest(i, 2, -1L));
+        }
+        assertEquals(MAX_INCOMING_QUEUE + 50, state.getTotalRequestsReceived(),
+                "exactly the drained capacity reopens");
+        assertEquals(10, state.getTotalIncomingDropped(), "the rest must bounce off the bound");
     }
 }

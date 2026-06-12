@@ -1,5 +1,6 @@
 package dev.vox.lss.networking.server;
 
+import dev.vox.lss.common.HandshakeGate;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.config.LSSServerConfig;
@@ -36,40 +37,37 @@ public class LSSServerNetworking {
                             + " (protocol v" + payload.protocolVersion()
                             + ", capabilities=" + payload.capabilities() + ")");
 
-                    if (payload.protocolVersion() != LSSConstants.PROTOCOL_VERSION) {
-                        // Must not reply: a mismatched client's SessionConfig codec has a
-                        // different field layout on the same channel id, so any frame we
-                        // send decodes as a DecoderException and kicks the player. Sending
-                        // nothing leaves its LSS disabled (no LodRequestManager is created).
+                    var config = LSSServerConfig.CONFIG;
+                    var service = requestService;
+                    var decision = HandshakeGate.evaluate(payload.protocolVersion(),
+                            payload.capabilities(), config.enabled, service != null);
+
+                    if (!decision.sendSessionConfig()) {
+                        // See HandshakeGate.Outcome.VERSION_MISMATCH: replying would kick the player.
                         LSSLogger.warn("Player " + player.getName().getString()
                                 + " has incompatible LSS protocol version " + payload.protocolVersion()
                                 + " (server: " + LSSConstants.PROTOCOL_VERSION + "), skipping LOD distribution");
                         return;
                     }
 
-                    var config = LSSServerConfig.CONFIG;
-                    var service = requestService;
-                    boolean effectiveEnabled = config.enabled && service != null;
-
                     ServerPlayNetworking.send(player, new SessionConfigS2CPayload(
                             LSSConstants.PROTOCOL_VERSION,
-                            effectiveEnabled,
+                            decision.effectiveEnabled(),
                             config.lodDistanceChunks,
                             config.syncOnLoadConcurrencyLimitPerPlayer,
                             config.generationConcurrencyLimitPerPlayer,
                             config.enableChunkGeneration
                     ));
 
-                    if ((payload.capabilities() & LSSConstants.CAPABILITY_VOXEL_COLUMNS) == 0) {
-                        // No consumer on the client — registering would only create a zombie
-                        // state that ignores every request. Visible to admins via this log.
+                    if (decision.outcome() == HandshakeGate.Outcome.NO_CONSUMER) {
+                        // Visible to admins via this log.
                         LSSLogger.info("Player " + player.getName().getString()
                                 + " has no LOD consumer (caps=" + payload.capabilities()
                                 + "), skipping LOD registration");
                         return;
                     }
 
-                    if (effectiveEnabled) {
+                    if (decision.registerPlayer()) {
                         service.registerPlayer(player, payload.capabilities());
                         LSSLogger.info("Player " + player.getName().getString()
                                 + " registered for LSS LOD request processing (caps="

@@ -69,9 +69,21 @@ class ColumnStateMapTest {
 
     @Test
     void dirtyOnUnknownPositionIsNotMarked() {
-        assertFalse(map.markDirtyIfKnown(POS), "dirty only applies to known (>0) columns");
+        assertFalse(map.markDirtyIfKnown(POS), "dirty needs a recorded disposition; unknown (-1) is not one");
+    }
+
+    @Test
+    void dirtyRescuesParkedNotGeneratedStamp() {
+        // generation-disabled soak finding: a not-generated stamp parks the position, but a
+        // dirty broadcast proves the server SAVED content there — the stamp is stale and the
+        // position must become requestable again (ts=0 routes disk-first server-side).
         map.onNotGenerated(POS);
-        assertFalse(map.markDirtyIfKnown(POS), "not-generated (0) columns are not markable dirty");
+        assertEquals(SATISFIED, map.classify(POS, false), "parked while gen disabled");
+        assertTrue(map.markDirtyIfKnown(POS), "dirty broadcast rescues the parked stamp");
+        assertEquals(0L, map.classify(POS, false), "re-requestable with ts=0 (disk-first)");
+        map.markSent(POS);
+        map.onReceived(POS, 9000L);
+        assertEquals(SATISFIED, map.classify(POS, false), "healed after the disk serve");
     }
 
     // ---- transitions ----

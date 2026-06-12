@@ -2,6 +2,7 @@ package dev.vox.lss.networking.client;
 
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
+import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.networking.payloads.BatchChunkRequestC2SPayload;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
@@ -139,8 +140,11 @@ public class LodRequestManager {
             if (scanned > 0) {
                 updateSendPerTick(scanned);
             }
-            // Timeout sweep: evict stale requests on the scan cadence (even if scan skipped)
-            this.tracker.timeoutSweep(TIMEOUT_NANOS);
+            // Timeout sweep: evict stale requests on the scan cadence (even if scan skipped).
+            // Evictions are marked for retry — in-flight counts as satisfied for ring
+            // confirmation, so an unmarked eviction inside a confirmed ring would never be
+            // rescanned (permanent hole; see InFlightTracker.timeoutSweep).
+            this.tracker.timeoutSweep(TIMEOUT_NANOS, this.columns::markRetry);
         }
 
         // --- Every tick: drain queue through concurrency limits ---
@@ -159,7 +163,8 @@ public class LodRequestManager {
 
     // --- Queue drain ---
 
-    private int drainQueue(int maxToSend) {
+    /** Package-private for direct test coverage — tick() needs a running Minecraft client. */
+    int drainQueue(int maxToSend) {
         long now = System.nanoTime();
         boolean generationEnabled = this.sessionConfig.generationEnabled();
         int maxGenConcurrency = this.sessionConfig.generationConcurrencyLimitPerPlayer();
@@ -291,12 +296,32 @@ public class LodRequestManager {
         this.scanner.reset();
     }
 
+    // --- Test seams ---
+    // tick() needs a running Minecraft client, so LodRequestManagerTest seeds the
+    // collaborators directly. Single-threaded use only (main-client-thread contract).
+
+    ColumnStateMap columnsForTest() { return this.columns; }
+    InFlightTracker trackerForTest() { return this.tracker; }
+    RequestQueue queueForTest() { return this.queue; }
+    SpiralScanner scannerForTest() { return this.scanner; }
+
+    /** tick() derives this from the client level; tests set it directly. */
+    void setLastDimensionForTest(ResourceKey<Level> dimension) { this.lastDimension = dimension; }
+
     // --- Public getters ---
 
     /** Dimension id of the level this manager is currently scanning, or "none" before the first tick. */
     public String getCurrentDimensionId() {
         var dim = this.lastDimension;
         return dim != null ? dim.identifier().toString() : "none";
+    }
+
+    /**
+     * Stored timestamp for one column position (-1 absent, 0 not-generated, &gt;0 epoch
+     * seconds). Main client thread only — used by the soak harness per-position probes.
+     */
+    public long getColumnTimestamp(int cx, int cz) {
+        return this.columns.timestampFor(PositionUtil.packPosition(cx, cz));
     }
 
     public int getReceivedColumnCount() { return this.columns.receivedCount(); }

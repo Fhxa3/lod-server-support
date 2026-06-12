@@ -183,6 +183,8 @@ class NbtSectionSerializerTest {
         var sections = decode(wire);
         assertEquals(1, sections.size());
         assertEquals(Blocks.STONE.defaultBlockState(), sections.get(0).section().getBlockState(0, 0, 0));
+        assertTrue(sections.get(0).section().getBiomes().get(0, 0, 0).is(Biomes.PLAINS),
+                "missing-biomes NBT defaults to PLAINS (must match Fabric's explicit default)");
     }
 
     @Test

@@ -73,13 +73,18 @@ class InFlightTrackerTest {
         long freshGen = PositionUtil.packPosition(3, 3);
         tracker.markPending(freshGen, System.nanoTime(), true);
 
-        tracker.timeoutSweep(ONE_HOUR_NANOS);
+        var evicted = new java.util.HashSet<Long>();
+        tracker.timeoutSweep(ONE_HOUR_NANOS, evicted::add);
 
         assertEquals(1, tracker.size());
         assertEquals(1, tracker.generationCount(), "expired generation slot must be released");
         assertFalse(tracker.isInFlight(GEN_POS));
         assertFalse(tracker.isInFlight(SYNC_POS));
         assertTrue(tracker.isInFlight(freshGen));
+        // Every eviction must be reported (the manager marks them for retry — an in-flight
+        // position counts as scan-satisfied, so a silent eviction inside a confirmed ring
+        // would never be rescanned: the bandwidth-throttle orphan bug).
+        assertEquals(java.util.Set.of(GEN_POS, SYNC_POS), evicted);
     }
 
     @Test

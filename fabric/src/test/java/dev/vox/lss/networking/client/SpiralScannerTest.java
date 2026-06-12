@@ -2,6 +2,7 @@ package dev.vox.lss.networking.client;
 
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.config.LSSClientConfig;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
 import org.junit.jupiter.api.Test;
 
@@ -32,9 +33,16 @@ class SpiralScannerTest {
     /** Drive maybeScan until the 20-tick cadence fires; returns the queued count. */
     private static int fireScan(SpiralScanner s, int viewDistance, ColumnStateMap columns,
                                 RequestQueue queue) {
+        return fireScan(s, viewDistance, 0, 1000, 0, columns, queue);
+    }
+
+    /** fireScan with explicit budget-scale inputs (column queue fill, missing vanilla chunks). */
+    private static int fireScan(SpiralScanner s, int viewDistance, int columnQueueSize,
+                                int columnQueueHaltThreshold, int missingVanilla,
+                                ColumnStateMap columns, RequestQueue queue) {
         for (int i = 0; i < LSSConstants.TICKS_PER_SECOND + 1; i++) {
-            int n = s.maybeScan(CX, CZ, viewDistance, 0, 1000, () -> 0,
-                    columns, pos -> false, queue);
+            int n = s.maybeScan(CX, CZ, viewDistance, columnQueueSize, columnQueueHaltThreshold,
+                    () -> missingVanilla, columns, pos -> false, queue);
             if (n >= 0) return n;
         }
         throw new AssertionError("scan cadence never fired");
@@ -130,6 +138,120 @@ class SpiralScannerTest {
         var s = scanner(16, 2, 100);
         var queue = new RequestQueue();
         assertEquals(8, fireScan(s, 2, new ColumnStateMap(), queue));
+    }
+
+    @Test
+    void retryMarkInsideConfirmedDiscForcesRescanFromRingZero() {
+        var columns = new ColumnStateMap();
+        int[] c = new int[2];
+        for (int r = 3; r <= 4; r++) {
+            for (int i = 0; i < 8 * r; i++) {
+                SpiralScanner.ringIndexToCoord(r, i, CX, CZ, c);
+                long packed = PositionUtil.packPosition(c[0], c[1]);
+                columns.onReceived(packed, 1000L);
+                columns.markSent(packed);
+                columns.onUpToDate(packed);
+            }
+        }
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+        assertEquals(0, fireScan(s, 2, columns, queue));
+        assertEquals(5, s.getConfirmedRing(), "precondition: disc confirmed past lodDistance");
+
+        // A rate-limited bounce marks a ring-3 position for retry. The disc is already
+        // confirmed past it, so the next scan must restart from ring 0 or the retry would
+        // sit inside the skipped prefix and never be re-sent.
+        SpiralScanner.ringIndexToCoord(3, 0, CX, CZ, c);
+        long retried = PositionUtil.packPosition(c[0], c[1]);
+        columns.markRetry(retried);
+
+        assertEquals(1, fireScan(s, 2, columns, queue),
+                "scan after a retry mark must re-walk the confirmed disc and queue the retry");
+        assertEquals(List.of(retried), drain(queue));
+        assertEquals(3, s.getConfirmedRing(), "confirmation holds at the unsatisfied retry ring");
+    }
+
+    @Test
+    void queuePressureShrinksBudgetLinearlyWithFloorOne() {
+        // base budget = 25 * 4 = 100; rings 3..16 hold 1064 candidates, far above any budget
+        var s = scanner(16, 25, 100);
+        var queue = new RequestQueue();
+        assertEquals(75, fireScan(s, 2, 250, 1000, 0, new ColumnStateMap(), queue),
+                "column queue at 25% of halt threshold scales the budget linearly to 75");
+
+        // At the halt threshold the linear scale reaches 0 but the budget floors at 1
+        s = scanner(16, 25, 100);
+        queue = new RequestQueue();
+        assertEquals(1, fireScan(s, 2, 1000, 1000, 0, new ColumnStateMap(), queue),
+                "queue pressure floors the budget at 1, never 0");
+    }
+
+    @Test
+    void missingVanillaShrinksBudgetQuadraticallyToZero() {
+        // base = 100; viewDistance 2 → exclusion area 25; 15 missing → fraction 0.6,
+        // quadratic scale 1 - 0.36 = 0.64 (a linear scale would give 40)
+        var s = scanner(16, 25, 100);
+        var queue = new RequestQueue();
+        assertEquals(64, fireScan(s, 2, 0, 1000, 15, new ColumnStateMap(), queue),
+                "vanilla-load scale is quadratic in the missing fraction");
+
+        // All 25 exclusion chunks missing → scale 0 → no scan at all (no floor on this path)
+        s = scanner(16, 25, 100);
+        queue = new RequestQueue();
+        assertEquals(0, fireScan(s, 2, 0, 1000, 25, new ColumnStateMap(), queue),
+                "fully missing vanilla disc zeroes the budget");
+    }
+
+    @Test
+    void backoffSurvivesMovementResetButNotDimensionChangeClear() {
+        // Movement and dirty-broadcast paths call resetScanCounter() alone; it must
+        // preserve a pending rate-limit backoff.
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+        s.noteRateLimited();
+        s.resetScanCounter();
+        assertEquals(0, fireScan(s, 2, new ColumnStateMap(), queue),
+                "backoff still pending after a movement-path reset");
+        assertTrue(fireScan(s, 2, new ColumnStateMap(), queue) > 0, "next scan proceeds normally");
+
+        // The dimension-change path additionally calls clearSkipNextScan() — the backoff
+        // belonged to the old dimension's load and must be discarded.
+        s = scanner(4, 100, 100);
+        queue = new RequestQueue();
+        s.noteRateLimited();
+        s.resetScanCounter();
+        s.clearSkipNextScan();
+        assertTrue(fireScan(s, 2, new ColumnStateMap(), queue) > 0,
+                "dimension change discards the pending backoff");
+    }
+
+    @Test
+    void effectiveLodDistanceIsMinOfServerAndClientOverride() {
+        int saved = LSSClientConfig.CONFIG.lodDistanceChunks;
+        try {
+            var s = scanner(10, 100, 100);
+            LSSClientConfig.CONFIG.lodDistanceChunks = 0; // 0 = override disabled, server wins
+            assertEquals(10, s.getEffectiveLodDistance());
+            LSSClientConfig.CONFIG.lodDistanceChunks = 6; // client below server clamps down
+            assertEquals(6, s.getEffectiveLodDistance());
+            LSSClientConfig.CONFIG.lodDistanceChunks = 15; // client above server has no effect
+            assertEquals(10, s.getEffectiveLodDistance());
+        } finally {
+            LSSClientConfig.CONFIG.lodDistanceChunks = saved;
+        }
+    }
+
+    @Test
+    void pruneDistanceBuffersTheEffectiveLodDistance() {
+        int saved = LSSClientConfig.CONFIG.lodDistanceChunks;
+        try {
+            LSSClientConfig.CONFIG.lodDistanceChunks = 6;
+            var s = scanner(10, 100, 100);
+            // Buffer applies to the client-clamped effective distance (6), not the server's 10
+            assertEquals(6 + LSSConstants.LOD_DISTANCE_BUFFER, s.getPruneDistance());
+        } finally {
+            LSSClientConfig.CONFIG.lodDistanceChunks = saved;
+        }
     }
 
     @Test

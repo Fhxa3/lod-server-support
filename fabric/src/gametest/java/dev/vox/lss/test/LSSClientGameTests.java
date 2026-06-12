@@ -1,18 +1,56 @@
 package dev.vox.lss.test;
 
 import dev.vox.lss.api.LSSApi;
+import dev.vox.lss.api.VoxelColumnConsumer;
+import dev.vox.lss.api.VoxelColumnData;
 import dev.vox.lss.config.LSSServerConfig;
 import dev.vox.lss.networking.client.LSSClientNetworking;
+import dev.vox.lss.networking.server.LSSServerNetworking;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.util.HttpUtil;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.biome.Biomes;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
+
+/**
+ * End-to-end client gametest, two singleplayer worlds on one client boot:
+ *
+ * <ul>
+ *   <li><b>Main flow + consumer content</b> — handshake, session config, spiral scan, column
+ *       receipt, and the product's core promise: a registered {@link LSSApi} consumer receives
+ *       DECODED {@code LevelChunkSection}s whose block states, biome, and sky light match the
+ *       known superflat test world (bedrock −64, dirt −63/−62, grass −61, plains). This is the
+ *       only place the hand-rolled {@code ClientColumnProcessor} decode is checked against the
+ *       server encode end-to-end — every counter-based assertion passes even if columns decode
+ *       to garbage.</li>
+ *   <li><b>LAN-publish activation</b> — with the {@code lss.test.integratedServer} override
+ *       cleared, a private integrated server must defer the request service and the client must
+ *       stay silent; publishing to LAN must start the service via {@code IntegratedServerLanHook}
+ *       and complete the host handshake (the only production activation path on integrated
+ *       servers, otherwise never exercised because gametest JVMs force the override).</li>
+ * </ul>
+ */
 public class LSSClientGameTests implements FabricClientGameTest {
 
     @Override
     public void runTest(ClientGameTestContext context) {
-        // Register a no-op consumer so the handshake includes CAPABILITY_VOXEL_COLUMNS.
-        // Without a consumer, capabilities=0 and the server skips all request routing.
-        LSSApi.registerColumnConsumer((level, dimension, chunkX, chunkZ, columnData) -> {});
+        // Register a recording consumer so the handshake includes CAPABILITY_VOXEL_COLUMNS
+        // (without a consumer, capabilities=0 and the server skips all request routing) AND
+        // so decoded section content can be asserted against the known flat world.
+        var recorder = new RecordingColumnConsumer();
+        LSSApi.registerColumnConsumer(recorder);
 
         // Low values prevent llvmpipe from starving the integrated server on CI
         context.runOnClient(client -> {
@@ -20,6 +58,11 @@ public class LSSClientGameTests implements FabricClientGameTest {
             client.options.simulationDistance().set(2);
         });
 
+        runMainFlowTest(context, recorder);
+        runLanPublishActivationTest(context);
+    }
+
+    private static void runMainFlowTest(ClientGameTestContext context, RecordingColumnConsumer recorder) {
         try (TestSingleplayerContext _ = context.worldBuilder().create()) {
             // Wait for join -> handshake -> session config -> LodRequestManager creation
             context.waitTicks(40);
@@ -104,7 +147,205 @@ public class LSSClientGameTests implements FabricClientGameTest {
                         + manager.getTotalColumnsReceived());
             }
 
+            // C7: Registered consumer receives correctly DECODED section content. Columns are
+            // dispatched off the render thread after an extra decode hop, so allow a settle.
+            waitForOrFail(context, () -> recorder.receivedCount() > 0, 400,
+                    "registered consumer never received a column although the client received "
+                            + LSSClientNetworking.getColumnsReceived()
+                            + " (decode/dispatch pipeline broken)");
+            assertDecodedFlatWorldContent(recorder.snapshot());
+        }
+    }
 
+    /**
+     * Every decoded column of the consistent-settings test world (classic flat preset) must
+     * contain exactly one section, sectionY −4, holding bedrock at local Y 0, dirt at 1–2,
+     * grass at 3, air above — and at least one column must carry sky light (15 in open air,
+     * 0 inside the buried dirt). A framing bug in the ClientColumnProcessor decode (sectionY
+     * sign, light flag order, palette misalignment) garbles one of these exact expectations.
+     */
+    private static void assertDecodedFlatWorldContent(List<RecordingColumnConsumer.RecordedColumn> records) {
+        if (records.isEmpty()) {
+            throw new AssertionError("No recorded columns to assert content on");
+        }
+
+        int skyLitColumns = 0;
+        for (var rec : records) {
+            String at = "decoded column (" + rec.chunkX() + ", " + rec.chunkZ() + ")";
+
+            if (!rec.dimension().equals(Level.OVERWORLD)) {
+                throw new AssertionError(at + ": expected overworld dimension, got " + rec.dimension());
+            }
+            // Documented threading contract of VoxelColumnConsumer: dispatch happens on the
+            // dedicated LSS-ColumnProcessor thread, never the render thread.
+            if (!"LSS-ColumnProcessor".equals(rec.threadName())) {
+                throw new AssertionError(at + ": consumer must be called on the LSS-ColumnProcessor thread, got "
+                        + rec.threadName());
+            }
+            if (rec.data().columnTimestamp() <= 0) {
+                throw new AssertionError(at + ": served columns must carry a real (positive) timestamp, got "
+                        + rec.data().columnTimestamp());
+            }
+
+            var sections = rec.data().sections();
+            if (sections.length != 1) {
+                throw new AssertionError(at + ": superflat columns must decode to exactly the one non-air section, got "
+                        + sections.length);
+            }
+            var sectionData = sections[0];
+            // Bottom overworld section (blocks y -64..-49); a signed/unsigned read bug yields 252.
+            if (sectionData.sectionY() != -4) {
+                throw new AssertionError(at + ": expected sectionY -4, got " + sectionData.sectionY());
+            }
+
+            var section = sectionData.section();
+            // Superflat layers: bedrock -64, dirt -63/-62, grass -61 -> local Y 0..3.
+            for (int[] xz : new int[][] {{0, 0}, {15, 15}, {8, 3}}) {
+                int x = xz[0];
+                int z = xz[1];
+                assertBlock(section, at, x, 0, z, Blocks.BEDROCK);
+                assertBlock(section, at, x, 1, z, Blocks.DIRT);
+                assertBlock(section, at, x, 2, z, Blocks.DIRT);
+                assertBlock(section, at, x, 3, z, Blocks.GRASS_BLOCK);
+                if (!section.getBlockState(x, 4, z).isAir()) {
+                    throw new AssertionError(at + ": expected air above the grass surface at local ("
+                            + x + ", 4, " + z + "), got " + section.getBlockState(x, 4, z));
+                }
+            }
+            if (!section.getNoiseBiome(0, 0, 0).is(Biomes.PLAINS)) {
+                throw new AssertionError(at + ": expected plains biome, got " + section.getNoiseBiome(0, 0, 0));
+            }
+
+            var skyLight = sectionData.skyLight();
+            if (skyLight != null) {
+                skyLitColumns++;
+                if (skyLight.get(8, 4, 8) != 15) {
+                    throw new AssertionError(at + ": open air above the surface must have full sky light, got "
+                            + skyLight.get(8, 4, 8));
+                }
+                if (skyLight.get(8, 2, 8) != 0) {
+                    throw new AssertionError(at + ": buried dirt must have zero sky light, got "
+                            + skyLight.get(8, 2, 8));
+                }
+            }
+        }
+
+        // In-memory probes of the lit spawn area always include sky light; columns read back
+        // from disk may legitimately omit it, hence at-least-one instead of all.
+        if (skyLitColumns == 0) {
+            throw new AssertionError("No decoded column carried sky light data across "
+                    + records.size() + " columns (light encode/decode broken)");
+        }
+    }
+
+    private static void assertBlock(LevelChunkSection section, String at, int x, int y, int z, Block expected) {
+        var state = section.getBlockState(x, y, z);
+        if (!state.is(expected)) {
+            throw new AssertionError(at + ": block at local (" + x + ", " + y + ", " + z
+                    + ") in section -4 should be " + expected + ", got " + state);
+        }
+    }
+
+    /**
+     * LAN-publish activation path. The gametest JVM forces {@code lss.test.integratedServer};
+     * clear it so this world exercises the real singleplayer gating, and restore it afterwards
+     * for anything else that runs in this JVM.
+     */
+    private static void runLanPublishActivationTest(ClientGameTestContext context) {
+        String override = System.clearProperty("lss.test.integratedServer");
+        try (TestSingleplayerContext _ = context.worldBuilder().create()) {
+            // A (buggy) join-time handshake + session config roundtrip would land well within
+            // this window, so the negative assertions below are meaningful.
+            context.waitTicks(40);
+
+            if (LSSServerNetworking.getRequestService() != null) {
+                throw new AssertionError("Request service must stay deferred on a private integrated server");
+            }
+            if (LSSClientNetworking.hasReceivedSessionConfig()) {
+                throw new AssertionError("Client must not handshake on a private integrated server");
+            }
+            if (LSSClientNetworking.getRequestManager() != null) {
+                throw new AssertionError("No LodRequestManager may exist before LAN publish");
+            }
+
+            // Publish from the client thread, exactly like ShareToLanScreen does.
+            boolean published = context.computeOnClient(client ->
+                    client.getSingleplayerServer().publishServer(
+                            GameType.SURVIVAL, false, HttpUtil.getAvailablePort()));
+            if (!published) {
+                throw new AssertionError("publishServer must succeed (LAN port bind failed?)");
+            }
+
+            // IntegratedServerLanHook injects at publishServer RETURN, so the service start is
+            // synchronous with the publish call.
+            if (LSSServerNetworking.getRequestService() == null) {
+                throw new AssertionError("LAN publish must start the request processing service");
+            }
+
+            // Host handshake: triggerHostHandshake -> C2S handshake -> SessionConfig -> manager.
+            waitForOrFail(context, LSSClientNetworking::isServerEnabled, 400,
+                    "host handshake after LAN publish never completed (no SessionConfig applied)");
+            if (LSSClientNetworking.getRequestManager() == null) {
+                throw new AssertionError("Host handshake must create the LodRequestManager");
+            }
+            if (LSSClientNetworking.getServerLodDistance() != LSSServerConfig.CONFIG.lodDistanceChunks) {
+                throw new AssertionError("LAN session config must carry the configured LOD distance: expected "
+                        + LSSServerConfig.CONFIG.lodDistanceChunks + ", got "
+                        + LSSClientNetworking.getServerLodDistance());
+            }
+            // Registration happens server-side before the SessionConfig the client just applied.
+            int registered = LSSServerNetworking.getRequestService().getPlayers().size();
+            if (registered != 1) {
+                throw new AssertionError("LAN host must be registered for request processing, got "
+                        + registered + " registered players");
+            }
+        } finally {
+            if (override != null) {
+                System.setProperty("lss.test.integratedServer", override);
+            }
+        }
+    }
+
+    /** Framework waitFor throws a generic timeout message; this names the stuck condition. */
+    private static void waitForOrFail(ClientGameTestContext context, BooleanSupplier condition,
+                                      int timeoutTicks, String failureMessage) {
+        for (int waited = 0; waited < timeoutTicks && !condition.getAsBoolean(); waited += 2) {
+            context.waitTicks(2);
+        }
+        if (!condition.getAsBoolean()) {
+            throw new AssertionError(failureMessage);
+        }
+    }
+
+    /**
+     * Records dispatched columns for content assertions. Written on the LSS-ColumnProcessor
+     * thread, read from the gametest thread (the concurrent queue safe-publishes the decoded
+     * sections). Bounded: superflat content is uniform, so the first columns prove decoding.
+     */
+    private static final class RecordingColumnConsumer implements VoxelColumnConsumer {
+        record RecordedColumn(ResourceKey<Level> dimension, int chunkX, int chunkZ,
+                              VoxelColumnData data, String threadName) {}
+
+        private static final int MAX_RECORDED = 256;
+
+        private final ConcurrentLinkedQueue<RecordedColumn> records = new ConcurrentLinkedQueue<>();
+        private final AtomicInteger received = new AtomicInteger();
+
+        @Override
+        public void onVoxelColumnReceived(ClientLevel level, ResourceKey<Level> dimension,
+                                          int chunkX, int chunkZ, VoxelColumnData columnData) {
+            if (this.received.getAndIncrement() < MAX_RECORDED) {
+                this.records.add(new RecordedColumn(dimension, chunkX, chunkZ, columnData,
+                        Thread.currentThread().getName()));
+            }
+        }
+
+        int receivedCount() {
+            return this.received.get();
+        }
+
+        List<RecordedColumn> snapshot() {
+            return List.copyOf(this.records);
         }
     }
 }
