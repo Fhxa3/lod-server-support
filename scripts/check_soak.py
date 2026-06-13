@@ -2343,6 +2343,58 @@ def selftest():
         server_snaps=[_srv(1000)],
         runs={1: [_cli(1000, over={"server_enabled": True})]}))), "enabled-false")
 
+    # --- fresh-backfill named check (was selftest-dark): gen>500, quiescent tail, confirmed>24 ---
+    fb_srv = [_srv(1000), _srv(6000, over={"generation.completed": 600})]
+    fb_cli = _cli(6000, over={"scan.confirmed": 30})
+    clean("fresh-backfill healthy", list(check_fresh_backfill(_ctx(
+        server_snaps=fb_srv, runs={1: [fb_cli]}, quiescent_server={1}))))
+    hits("fresh-backfill too little generation", list(check_fresh_backfill(_ctx(
+        server_snaps=[_srv(1000), _srv(6000, over={"generation.completed": 400})],
+        runs={1: [fb_cli]}, quiescent_server={1}))), "fresh-backfill")
+    hits("fresh-backfill non-quiescent tail", list(check_fresh_backfill(_ctx(
+        server_snaps=fb_srv, runs={1: [fb_cli]}, quiescent_server=set()))), "fresh-backfill")
+    hits("fresh-backfill scan not confirmed", list(check_fresh_backfill(_ctx(
+        server_snaps=fb_srv, runs={1: [_cli(6000, over={"scan.confirmed": 20})]},
+        quiescent_server={1}))), "fresh-backfill")
+    hits("fresh-backfill no client", list(check_fresh_backfill(_ctx(
+        server_snaps=fb_srv, runs={}, quiescent_server={1}))), "fresh-backfill")
+
+    # --- warm-rejoin named check (was selftest-dark): run2 warm-cache signals ---
+    wr_r1 = _cli(1000, over={"responses.columns": 1200})
+    wr_r2 = _cli(2000, over={"responses.up_to_date": 700, "responses.columns": 200,
+                             "requested_total": 1500})
+    clean("warm-rejoin healthy", list(check_warm_rejoin(_ctx(runs={1: [wr_r1], 2: [wr_r2]}))))
+    hits("warm-rejoin missing run2", list(check_warm_rejoin(_ctx(runs={1: [wr_r1]}))), "warm-rejoin")
+    hits("warm-rejoin cold cache low utd", list(check_warm_rejoin(_ctx(
+        runs={1: [wr_r1], 2: [_cli(2000, over={"responses.up_to_date": 100,
+              "responses.columns": 200, "requested_total": 1500})]}))), "warm-rejoin")
+    hits("warm-rejoin full re-download", list(check_warm_rejoin(_ctx(
+        runs={1: [wr_r1], 2: [_cli(2000, over={"responses.up_to_date": 700,
+              "responses.columns": 1300, "requested_total": 1500})]}))), "warm-rejoin")
+    hits("warm-rejoin no revalidation", list(check_warm_rejoin(_ctx(
+        runs={1: [wr_r1], 2: [_cli(2000, over={"responses.up_to_date": 700,
+              "responses.columns": 200, "requested_total": 500})]}))), "warm-rejoin")
+
+    # --- dirty-broadcast named check (was selftest-dark): broadcast rose, re-fetch, dirty drained ---
+    db_cmd = {"event": "command", "cmd": "setblock 0 5 0 minecraft:stone", "wallMs": 5000,
+              "anchor": 1, "at": 4}
+    db_srv = [_srv(2000), _srv(8000, over={"dirty.broadcast_positions": 5})]
+    db_cli = [_cli(2000, over={"received_columns": 100}), _cli(10000, over={"received_columns": 150})]
+    clean("dirty-broadcast healthy", list(check_dirty_broadcast(_ctx(
+        server_snaps=db_srv, commands=[db_cmd], runs={1: db_cli}))))
+    hits("dirty-broadcast no setblock", list(check_dirty_broadcast(_ctx(
+        server_snaps=db_srv, commands=[], runs={1: db_cli}))), "dirty-broadcast")
+    hits("dirty-broadcast server broadcast nothing", list(check_dirty_broadcast(_ctx(
+        server_snaps=[_srv(2000), _srv(8000)], commands=[db_cmd], runs={1: db_cli}))), "dirty-broadcast")
+    hits("dirty-broadcast dirty stuck above baseline", list(check_dirty_broadcast(_ctx(
+        server_snaps=db_srv, commands=[db_cmd],
+        runs={1: [_cli(2000, over={"received_columns": 100}),
+                  _cli(10000, over={"received_columns": 150, "columns.dirty": 4})]}))), "dirty-broadcast")
+    hits("dirty-broadcast no re-fetch", list(check_dirty_broadcast(_ctx(
+        server_snaps=db_srv, commands=[db_cmd],
+        runs={1: [_cli(2000, over={"received_columns": 100}),
+                  _cli(10000, over={"received_columns": 100})]}))), "dirty-broadcast")
+
     # --- cold-restart-resync: warm dominance; re-download caught ---
     clean("cold-restart warm", list(check_cold_restart_resync(_ctx(
         server_snaps=[_srv(1000, over={"service.up_to_date": 2000})],
