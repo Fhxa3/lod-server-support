@@ -191,6 +191,41 @@ public class ServiceLifecycleGameTests {
         helper.succeed();
     }
 
+    /**
+     * FP-006: shutdown() must be idempotent and tear down every per-player structure. Server stop
+     * can call it after a manual shutdown (e.g. an integrated server published to LAN then closed),
+     * so a second call must be a harmless no-op rather than an exception or a double-free.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty")
+    public void serviceShutdownIsIdempotentAndClearsEveryPerPlayerStructure(GameTestHelper helper) {
+        var server = helper.getLevel().getServer();
+        var playerList = server.getPlayerList();
+        var mock = placeMockServerPlayer(helper);
+        var uuid = mock.getUUID();
+        var service = new RequestProcessingService(server);
+        try {
+            service.registerPlayer(mock, LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+            helper.assertTrue(service.getPlayers().containsKey(uuid), "premise: a player is registered");
+            helper.assertTrue(service.getDiskReader().getPlayerQueue(uuid) != null,
+                    "premise: the disk-reader queue exists");
+
+            service.shutdown();
+            helper.assertTrue(service.getPlayers().isEmpty(), "shutdown clears the players map");
+            helper.assertTrue(service.getDiskReader().getPlayerQueue(uuid) == null,
+                    "shutdown tears down the disk-reader result queue");
+            var gen = service.getGenerationService();
+            helper.assertTrue(gen == null || gen.getActiveCount() == 0,
+                    "shutdown clears any active generation");
+
+            // The second call (server-stop after a manual shutdown) must not throw or re-break.
+            service.shutdown();
+            helper.assertTrue(service.getPlayers().isEmpty(), "a second shutdown stays clean");
+        } finally {
+            playerList.remove(mock);
+        }
+        helper.succeed();
+    }
+
     @GameTest(structure = "fabric-gametest-api-v1:empty")
     public void removePlayerCleansAllStateAndLifecycleAutoRemovesOnlyDelistedPlayers(GameTestHelper helper) {
         ServerLevel level = helper.getLevel();
