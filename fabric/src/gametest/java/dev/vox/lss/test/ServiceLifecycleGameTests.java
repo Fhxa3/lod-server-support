@@ -140,6 +140,57 @@ public class ServiceLifecycleGameTests {
         helper.succeed();
     }
 
+    /**
+     * SP-016: extreme client-supplied chunk coordinates (Integer.MIN/MAX on both axes) must be
+     * gated without overflow. The Chebyshev distance widens to long and clamps to
+     * Integer.MAX_VALUE; a regression to naive int subtraction would wrap an extreme coord under
+     * the distance gate and admit a far-off position — a disk read for a chunk light-years away.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty")
+    public void batchRequestDistanceGuardGatesExtremeCoordsWithoutOverflow(GameTestHelper helper) {
+        var server = helper.getLevel().getServer();
+        var playerList = server.getPlayerList();
+        var mock = placeMockServerPlayer(helper);
+        var service = new RequestProcessingService(server);
+        try {
+            var state = service.registerPlayer(mock, LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+            int pcx = mock.getBlockX() >> 4;
+            int pcz = mock.getBlockZ() >> 4;
+
+            long[] positions = {
+                    PositionUtil.packPosition(Integer.MAX_VALUE, Integer.MAX_VALUE),
+                    PositionUtil.packPosition(Integer.MIN_VALUE, Integer.MIN_VALUE),
+                    PositionUtil.packPosition(Integer.MAX_VALUE, Integer.MIN_VALUE),
+                    PositionUtil.packPosition(Integer.MIN_VALUE, Integer.MAX_VALUE),
+                    PositionUtil.packPosition(pcx, pcz), // the only in-range position
+            };
+            service.handleBatchRequest(mock, new BatchChunkRequestC2SPayload(
+                    positions, new long[]{-1L, -1L, -1L, -1L, 42L}, 5));
+
+            helper.assertTrue(state.getTotalRequestsReceived() == 1,
+                    "only the in-range position passes; the four extremes are gated without "
+                            + "overflow, got " + state.getTotalRequestsReceived());
+            var it = state.getIncomingRequests().iterator();
+            helper.assertTrue(it.hasNext(), "the in-range request must be queued");
+            var req = it.next();
+            helper.assertTrue(req.cx() == pcx && req.cz() == pcz,
+                    "the surviving request must be the player's own chunk, got ["
+                            + req.cx() + ", " + req.cz() + "]");
+            helper.assertTrue(!it.hasNext(), "no extreme-coord request may slip under the gate");
+
+            // No tick has run, so the gate alone must not have submitted any disk/gen work.
+            helper.assertTrue(service.getDiskReader().getPendingResultCount() == 0,
+                    "a gated batch must not submit a disk read for an extreme coord");
+            var gen = service.getGenerationService();
+            helper.assertTrue(gen == null || gen.getActiveCount() == 0,
+                    "a gated batch must not submit generation for an extreme coord");
+        } finally {
+            service.shutdown();
+            playerList.remove(mock);
+        }
+        helper.succeed();
+    }
+
     @GameTest(structure = "fabric-gametest-api-v1:empty")
     public void removePlayerCleansAllStateAndLifecycleAutoRemovesOnlyDelistedPlayers(GameTestHelper helper) {
         ServerLevel level = helper.getLevel();

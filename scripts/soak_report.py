@@ -71,6 +71,20 @@ OPT_IN_NAMES = {
     "disk pool saturated": "saturated",
     "ingest failures": "rate_limited",  # ingest-failure scenarios opt into the same vocab
 }
+# Per-scenario opt-ins for CONCERNING counters that are the expected mechanism of THAT scenario
+# (the checker's conservation laws still account for them, so they are not lost work):
+# queue_full backs up under a deliberate bandwidth throttle / saturation; removed_in_flight fires
+# on the kicks and dimension changes those scenarios script. Confirmed benign in the round-2 sweep.
+SCENARIO_CONCERNING_OPT_IN = {
+    "bandwidth-throttle": {"send-queue full drops"},
+    "disk-saturation": {"send-queue full drops"},
+    "rate-limit-storm": {"send-queue full drops"},
+    "warm-rejoin": {"gen removed in-flight"},
+    "dimension-trip": {"gen removed in-flight"},
+    "dimension-rejoin-warm": {"gen removed in-flight"},
+    "dirty-while-offline": {"gen removed in-flight"},
+    "cold-restart-resync": {"gen removed in-flight"},
+}
 HIGH_WATER = {
     "disk pending": "disk.pending_hw",
     "generation active": "generation.active_hw",
@@ -277,6 +291,7 @@ def _first_nonzero_wall(snaps, path):
 def section_unexpected(rep, d):
     out = []
     opt = CS.ANOMALY_OPT_INS.get(d["scenario"], frozenset())
+    scen_opt = SCENARIO_CONCERNING_OPT_IN.get(d["scenario"], frozenset())
 
     def scan(label, snaps, watch, concerning):
         final = snaps[-1] if snaps else {}
@@ -286,8 +301,8 @@ def section_unexpected(rep, d):
                 continue
             when = _first_nonzero_wall(snaps, path)
             if concerning:
-                opted = OPT_IN_NAMES.get(name) in opt
-                note = "  (declared scenario purpose)" if opted else "  <-- CONCERNING"
+                opted = OPT_IN_NAMES.get(name) in opt or name in scen_opt
+                note = "  (expected for this scenario)" if opted else "  <-- CONCERNING"
                 out.append(f"  {label} {name}: {v} (first @{when}ms){note}")
                 if not opted:
                     rep["anomalies"] += 1
