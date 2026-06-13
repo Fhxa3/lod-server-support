@@ -9,7 +9,6 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.server.level.ChunkMap;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunkSection;
@@ -18,6 +17,8 @@ import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.PalettedContainerRO;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -29,14 +30,22 @@ final class PaperNbtSectionSerializer {
 
     private static final byte[] EMPTY = new byte[0];
 
+    /** Test seam: the region-file NBT read — the only NMS call in the Paper disk-read path.
+     *  Production wires {@link ChunkMap#read}; tests inject empty / failing / timing-out
+     *  futures to pin the submit-envelope triage. */
+    @FunctionalInterface
+    interface ChunkNbtRead {
+        CompletableFuture<Optional<CompoundTag>> read(int cx, int cz);
+    }
+
     /**
      * Read chunk NBT from disk, verify FULL status, and serialize sections
      * into MC-native wire format.
      * Returns the serialized byte array, or null if the chunk is missing/not FULL/empty.
      */
-    static byte[] readAndSerializeSections(ChunkMap chunkMap, RegistryAccess registryAccess,
+    static byte[] readAndSerializeSections(ChunkNbtRead read, RegistryAccess registryAccess,
                                             int cx, int cz) throws Exception {
-        var future = chunkMap.read(new ChunkPos(cx, cz));
+        var future = read.read(cx, cz);
         var optionalTag = future.get(LSSConstants.DISK_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         if (optionalTag.isEmpty()) return null;
         return serializeChunkNbt(optionalTag.get(), registryAccess);

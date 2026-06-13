@@ -6,6 +6,7 @@ import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.tracking.DirtyColumnTracker;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 
 import java.util.HashSet;
 import java.util.Map;
@@ -26,6 +27,20 @@ class PaperDirtyColumnBroadcaster {
 
     private int counter = 0;
     private long[] positionFilterBuffer = null;
+
+    /** Test seam: sends one dirty-columns notification frame to a player. Production
+     *  default is the raw plugin-message send. */
+    @FunctionalInterface
+    interface DirtyColumnsSender {
+        void send(ServerPlayer player, long[] positions) throws Exception;
+    }
+
+    private DirtyColumnsSender dirtySender = (player, positions) ->
+            PaperPayloadHandler.sendDirtyColumns(player.getBukkitEntity(), positions);
+
+    void setDirtySender(DirtyColumnsSender sender) {
+        this.dirtySender = sender;
+    }
 
     PaperDirtyColumnBroadcaster(MinecraftServer server, Map<UUID, PaperPlayerRequestState> players,
                                 DirtyColumnTracker dirtyTracker, PaperOffThreadProcessor offThreadProcessor) {
@@ -78,7 +93,7 @@ class PaperDirtyColumnBroadcaster {
                     System.arraycopy(this.positionFilterBuffer, 0, result, 0, count);
                     this.offThreadProcessor.clearDiskReadDone(player.getUUID(), result);
                     try {
-                        PaperPayloadHandler.sendDirtyColumns(player.getBukkitEntity(), result);
+                        this.dirtySender.send(player, result);
                     } catch (Exception e) {
                         LSSLogger.error("Failed to send dirty columns to " + player.getName().getString(), e);
                         if (failedPlayers == null) failedPlayers = new HashSet<>();

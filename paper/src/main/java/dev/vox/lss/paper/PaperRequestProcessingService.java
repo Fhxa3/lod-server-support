@@ -34,7 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * calls.
  */
 public class PaperRequestProcessingService {
-    private final Map<UUID, PaperPlayerRequestState> players = new ConcurrentHashMap<>();
+    private final Map<UUID, PaperPlayerRequestState> players;
     private final MinecraftServer server;
     private final PaperChunkDiskReader diskReader;
     private final PaperChunkGenerationService generationService;
@@ -56,28 +56,80 @@ public class PaperRequestProcessingService {
     private static final int DIAG_LOG_INTERVAL_TICKS = 100;
     private static final int MAX_PROBES_PER_TICK_PER_PLAYER = 512;
 
+    /** Test seam: puts one encoded voxel-column frame on the wire. Production default is the
+     *  raw NMS payload send; tests inject recording/throwing senders. */
+    @FunctionalInterface
+    interface ColumnPayloadSender {
+        void send(PaperPlayerRequestState state, byte[] data) throws Exception;
+    }
+
+    /** Test seam: resolves a loaded chunk into pre-serialized column data, or null when the
+     *  chunk is not loaded. Production default probes the chunk source on the main thread. */
+    @FunctionalInterface
+    interface LoadedColumnProbe {
+        LoadedColumnData probe(ServerLevel level, int cx, int cz);
+    }
+
+    private ColumnPayloadSender columnPayloadSender = (state, data) ->
+            PaperPayloadHandler.sendRawNmsPayload(state.getPlayer().getBukkitEntity(),
+                    PaperPayloadHandler.ID_VOXEL_COLUMN, data);
+
+    private LoadedColumnProbe loadedColumnProbe = (level, cx, cz) -> {
+        LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
+        return chunk != null ? PaperSectionSerializer.serializeColumn(level, chunk, cx, cz) : null;
+    };
+
+    void setColumnPayloadSender(ColumnPayloadSender sender) {
+        this.columnPayloadSender = sender;
+    }
+
+    void setLoadedColumnProbe(LoadedColumnProbe probe) {
+        this.loadedColumnProbe = probe;
+    }
+
+    /** Collaborator set for the package-private constructor. Tests build it over recording
+     *  collaborators; production wiring lives in {@link #productionWiring} only. */
+    record Wiring(Map<UUID, PaperPlayerRequestState> players,
+                  PaperChunkDiskReader diskReader,
+                  PaperChunkGenerationService generationService,
+                  PaperOffThreadProcessor offThreadProcessor,
+                  DirtyColumnTracker dirtyTracker,
+                  PaperDirtyColumnBroadcaster dirtyBroadcaster) {}
+
     public PaperRequestProcessingService(MinecraftServer server, Plugin plugin, PaperConfig config) {
+        this(server, config, productionWiring(server, plugin, config));
+    }
+
+    /** Test seam: same field wiring as production, collaborators injected. */
+    PaperRequestProcessingService(MinecraftServer server, PaperConfig config, Wiring wiring) {
         this.server = server;
         this.config = config;
-
-        this.diskReader = new PaperChunkDiskReader(config.diskReaderThreads);
-        if (config.enableChunkGeneration) {
-            this.generationService = new PaperChunkGenerationService(config, plugin);
-        } else {
-            this.generationService = null;
-        }
+        this.players = wiring.players();
+        this.diskReader = wiring.diskReader();
+        this.generationService = wiring.generationService();
         this.bandwidthLimiter = new SharedBandwidthLimiter(config.bytesPerSecondLimitGlobal);
+        this.offThreadProcessor = wiring.offThreadProcessor();
+        this.dirtyTracker = wiring.dirtyTracker();
+        this.dirtyBroadcaster = wiring.dirtyBroadcaster();
+    }
+
+    private static Wiring productionWiring(MinecraftServer server, Plugin plugin, PaperConfig config) {
+        Map<UUID, PaperPlayerRequestState> players = new ConcurrentHashMap<>();
+        var diskReader = new PaperChunkDiskReader(config.diskReaderThreads);
+        PaperChunkGenerationService generationService = config.enableChunkGeneration
+                ? new PaperChunkGenerationService(config, plugin) : null;
 
         var dataDir = server.getWorldPath(LevelResource.ROOT).resolve("data");
-        this.offThreadProcessor = new PaperOffThreadProcessor(
-                this.players,
-                this.diskReader, this.generationService != null, dataDir,
+        var offThreadProcessor = new PaperOffThreadProcessor(
+                players, diskReader, generationService != null, dataDir,
                 config.perDimensionTimestampCacheSizeMB);
-        this.offThreadProcessor.start();
+        offThreadProcessor.start();
 
-        this.dirtyTracker = new DirtyColumnTracker();
-        this.dirtyBroadcaster = new PaperDirtyColumnBroadcaster(
-                server, this.players, this.dirtyTracker, this.offThreadProcessor);
+        var dirtyTracker = new DirtyColumnTracker();
+        var dirtyBroadcaster = new PaperDirtyColumnBroadcaster(
+                server, players, dirtyTracker, offThreadProcessor);
+        return new Wiring(players, diskReader, generationService, offThreadProcessor,
+                dirtyTracker, dirtyBroadcaster);
     }
 
     public DirtyColumnTracker getDirtyTracker() {
@@ -239,10 +291,8 @@ public class PaperRequestProcessingService {
         for (var state : this.players.values()) {
             if (!state.hasCompletedHandshake())
                 continue;
-            var bukkitPlayer = state.getPlayer().getBukkitEntity();
             long[] dropped = state.flushSendQueue(perPlayerCap, this.bandwidthLimiter, this.diag,
-                    data -> PaperPayloadHandler.sendRawNmsPayload(bukkitPlayer,
-                            PaperPayloadHandler.ID_VOXEL_COLUMN, data));
+                    data -> this.columnPayloadSender.send(state, data));
             if (dropped.length > 0) {
                 // A send failure discarded resolved-but-undelivered columns: clear their
                 // done-bits so the client's re-requests re-resolve instead of being
@@ -275,9 +325,9 @@ public class PaperRequestProcessingService {
             if (skipPositions != null && skipPositions.contains(packed))
                 continue;
 
-            LevelChunk chunk = level.getChunkSource().getChunkNow(req.cx(), req.cz());
-            if (chunk != null) {
-                probes.put(packed, PaperSectionSerializer.serializeColumn(level, chunk, req.cx(), req.cz()));
+            var column = this.loadedColumnProbe.probe(level, req.cx(), req.cz());
+            if (column != null) {
+                probes.put(packed, column);
             }
             probed++;
         }

@@ -13,6 +13,7 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.function.IntSupplier;
 
 public class LodRequestManager {
     /** Backpressure threshold: halt sending when column processing queue exceeds this fraction. */
@@ -87,9 +88,33 @@ public class LodRequestManager {
 
         int playerCx = player.getBlockX() >> 4;
         int playerCz = player.getBlockZ() >> 4;
-        var currentDim = level.dimension();
+        int viewDistance = mc.options.getEffectiveRenderDistance();
+        tickWithContext(playerCx, playerCz, level.dimension(), viewDistance,
+                LSSClientNetworking.getQueuedColumnCount(),
+                () -> countMissingVanillaChunks(level, playerCx, playerCz, viewDistance));
+    }
 
-        // --- Dimension change: flush state, reload cache ---
+    /**
+     * Tick body behind the Minecraft-client guards, phases in fixed order: dimension/cache →
+     * movement prune → metrics → backpressure halt → cache gate → scan+sweep → drain+send.
+     * The backpressure halt deliberately precedes the cache poll, the timeout sweep, and the
+     * drain: while the decode queue is mostly full nothing new goes out, and recovery paths
+     * resume only once the queue drains. Package-private for direct test coverage — tick()
+     * needs a running Minecraft client.
+     */
+    void tickWithContext(int playerCx, int playerCz, ResourceKey<Level> currentDim,
+                         int viewDistance, int columnQueueSize, IntSupplier missingVanilla) {
+        tickDimensionAndCachePhase(currentDim);
+        tickMovementPhase(playerCx, playerCz);
+        this.metrics.updateRollingRates();
+        if (haltedByBackpressure(columnQueueSize)) return;
+        if (!tickCacheGatePhase()) return;
+        tickScanPhase(playerCx, playerCz, viewDistance, columnQueueSize, missingVanilla);
+        tickDrainPhase();
+    }
+
+    /** Dimension change: flush state, reload cache. First tick starts the initial load. */
+    void tickDimensionAndCachePhase(ResourceKey<Level> currentDim) {
         if (this.lastDimension != null && !currentDim.equals(this.lastDimension)) {
             this.onDimensionChange(currentDim);
         } else if (!this.cacheLoaded) {
@@ -97,8 +122,17 @@ public class LodRequestManager {
             startAsyncCacheLoad(currentDim);
         }
         this.lastDimension = currentDim;
+    }
 
-        // --- Movement: prune out-of-range data + drop stale in-flight tracking ---
+    /**
+     * Movement: prune out-of-range data + drop stale in-flight tracking, and restart the
+     * scan cadence at the new center. Two pinned consequences (LodRequestManagerTickTest):
+     * the (0,0) lastChunk init makes a player joining outside chunk (0,0) take this branch
+     * on tick 1, losing the primed immediate first scan (~1 s join delay); and crossing a
+     * chunk boundary more often than every 20 ticks restarts the cadence each time,
+     * starving both scans AND the timeout sweep that rides them until the player rests.
+     */
+    void tickMovementPhase(int playerCx, int playerCz) {
         if (playerCx != this.lastChunkX || playerCz != this.lastChunkZ) {
             int pruneDistance = this.scanner.getPruneDistance();
             this.columns.pruneOutOfRange(playerCx, playerCz, pruneDistance);
@@ -107,20 +141,25 @@ public class LodRequestManager {
             this.lastChunkZ = playerCz;
             this.scanner.resetScanCounter();
         }
+    }
 
-        // --- Metrics ---
-        this.metrics.updateRollingRates();
+    /** Backpressure: halt when the column processing queue is mostly full. */
+    boolean haltedByBackpressure(int columnQueueSize) {
+        return columnQueueSize >= haltThreshold();
+    }
 
-        // --- Backpressure: halt when column processing queue is mostly full ---
-        int columnQueueSize = LSSClientNetworking.getQueuedColumnCount();
-        int haltThreshold = ClientColumnProcessor.MAX_QUEUED_COLUMNS * BACKPRESSURE_NUMERATOR / BACKPRESSURE_DENOMINATOR;
-        if (columnQueueSize >= haltThreshold) return;
+    private static int haltThreshold() {
+        return ClientColumnProcessor.MAX_QUEUED_COLUMNS * BACKPRESSURE_NUMERATOR / BACKPRESSURE_DENOMINATOR;
+    }
 
-        // --- Cache gate: don't scan until timestamp cache has loaded ---
-        // Poll inline rather than relying on thenAcceptAsync callback scheduling,
-        // which can be delayed on starved render threads (e.g., CI with llvmpipe).
+    /**
+     * Cache gate: don't scan until the timestamp cache has loaded; returns false while the
+     * load is still pending. Polls inline rather than relying on thenAcceptAsync callback
+     * scheduling, which can be delayed on starved render threads (e.g., CI with llvmpipe).
+     */
+    boolean tickCacheGatePhase() {
         if (this.pendingCacheLoad != null) {
-            if (!this.pendingCacheLoad.isDone()) return;
+            if (!this.pendingCacheLoad.isDone()) return false;
             try {
                 var loaded = this.pendingCacheLoad.getNow(null);
                 if (loaded != null && this.lastDimension != null) {
@@ -129,12 +168,17 @@ public class LodRequestManager {
             } catch (Exception ignored) {}
             this.pendingCacheLoad = null;
         }
+        return true;
+    }
 
-        // --- Periodic scan (every 20 ticks): discover positions needing requests ---
-        int viewDistance = mc.options.getEffectiveRenderDistance();
+    /**
+     * Periodic scan (every 20 ticks): discover positions needing requests.
+     * @return the {@link SpiralScanner#maybeScan} result (-1 when the cadence did not fire)
+     */
+    int tickScanPhase(int playerCx, int playerCz, int viewDistance, int columnQueueSize,
+                      IntSupplier missingVanilla) {
         int scanned = this.scanner.maybeScan(playerCx, playerCz, viewDistance,
-                columnQueueSize, haltThreshold,
-                () -> countMissingVanillaChunks(level, playerCx, playerCz, viewDistance),
+                columnQueueSize, haltThreshold(), missingVanilla,
                 this.columns, this.tracker::isInFlight, this.queue);
         if (scanned >= 0) {
             if (scanned > 0) {
@@ -143,12 +187,20 @@ public class LodRequestManager {
             // Timeout sweep: evict stale requests on the scan cadence (even if scan skipped).
             sweepTimeouts();
         }
+        return scanned;
+    }
 
-        // --- Every tick: drain queue through concurrency limits ---
+    /**
+     * Every tick: drain queue through concurrency limits and send.
+     * @return the number of positions sent
+     */
+    int tickDrainPhase() {
         if (this.queue.hasNext()) {
             int sent = drainQueue(this.maxSendPerTick);
             if (sent > 0) sendRequests(this.sendPositionBuffer, this.sendTimestampBuffer, sent);
+            return sent;
         }
+        return 0;
     }
 
     // --- Send rate adaptation ---
@@ -203,16 +255,29 @@ public class LodRequestManager {
 
     // --- Request sending and callbacks ---
 
+    /** Batch send transport. Seam for tests; production default is Fabric client networking. */
+    interface BatchSender {
+        void send(BatchChunkRequestC2SPayload payload);
+    }
+
+    private BatchSender batchSender = payload -> ClientPlayNetworking.send(payload);
+
     private void sendRequests(long[] positionBuffer, long[] timestampBuffer, int count) {
         try {
-            ClientPlayNetworking.send(new BatchChunkRequestC2SPayload(positionBuffer, timestampBuffer, count));
+            this.batchSender.send(new BatchChunkRequestC2SPayload(positionBuffer, timestampBuffer, count));
         } catch (Exception e) {
             LSSLogger.error("Failed to send batch chunk request", e);
             for (int i = 0; i < count; i++) {
                 this.tracker.removeByPosition(positionBuffer[i]);
+                // drainQueue consumed the dirty/retry marks at markSent, so without
+                // restoration a validated position whose batch never reached the wire
+                // classifies SATISFIED forever — the same orphan class as a timeout
+                // eviction (see sweepTimeouts), without the 10 s grace. Re-mark retry:
+                // classify re-asks with the stored timestamp, no invented stamps.
+                this.columns.markRetry(positionBuffer[i]);
             }
         }
-        this.metrics.recordSendCycle(count);
+        this.metrics.recordSendCycle(count); // counts attempts — a failed batch still counts
     }
 
     public void onColumnReceived(long packed, long columnTimestamp, ResourceKey<Level> dimension) {
@@ -339,6 +404,17 @@ public class LodRequestManager {
 
     /** tick() derives this from the client level; tests set it directly. */
     void setLastDimensionForTest(ResourceKey<Level> dimension) { this.lastDimension = dimension; }
+
+    /** Replace the batch send transport (production default sends via Fabric networking). */
+    void setBatchSenderForTest(BatchSender sender) { this.batchSender = sender; }
+
+    /** Inject a cache-load future to drive the cache gate without real cache IO. */
+    void setPendingCacheLoadForTest(CompletableFuture<Long2LongOpenHashMap> future) {
+        this.pendingCacheLoad = future;
+    }
+
+    /** Skip the first-tick async cache load — tick-phase tests drive the gate explicitly. */
+    void markCacheLoadedForTest() { this.cacheLoaded = true; }
 
     // --- Public getters ---
 

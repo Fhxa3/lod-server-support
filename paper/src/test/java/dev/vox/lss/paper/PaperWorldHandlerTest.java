@@ -13,6 +13,7 @@ import org.bukkit.event.Event;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.plugin.EventExecutor;
+import org.bukkit.plugin.IllegalPluginAccessException;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.PluginManager;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,8 +25,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -44,7 +47,8 @@ class PaperWorldHandlerTest {
 
     private static final String OVERWORLD = "minecraft:overworld";
 
-    private record Registration(Class<?> eventClass, Listener listener, EventExecutor executor) {}
+    private record Registration(Class<?> eventClass, Listener listener, EventExecutor executor,
+                                boolean ignoreCancelled) {}
 
     private DirtyColumnTracker tracker;
     private PaperWorldHandler handler;
@@ -89,10 +93,24 @@ class PaperWorldHandlerTest {
 
     /** Plugin whose PluginManager records every registerEvent call. */
     private Plugin pluginProxy() {
+        return pluginProxyRejecting(Set.of());
+    }
+
+    /**
+     * Like {@link #pluginProxy()}, but registerEvent throws Bukkit's real registration
+     * error for the given classes — the abstract / handler-list-less Event shape that
+     * {@code SimplePluginManager.getEventListeners} rejects at runtime.
+     */
+    private Plugin pluginProxyRejecting(Set<Class<?>> rejected) {
         PluginManager pm = proxy(PluginManager.class, (p, m, args) -> {
             if ("registerEvent".equals(m.getName()) && args != null && args.length == 6) {
+                Class<?> eventClass = (Class<?>) args[0];
+                if (rejected.contains(eventClass)) {
+                    throw new IllegalPluginAccessException(
+                            "Unable to find handler list for event " + eventClass.getName());
+                }
                 registrations.add(new Registration(
-                        (Class<?>) args[0], (Listener) args[1], (EventExecutor) args[3]));
+                        eventClass, (Listener) args[1], (EventExecutor) args[3], (boolean) args[5]));
             }
             return defaults().invoke(p, m, args);
         });
@@ -310,5 +328,186 @@ class PaperWorldHandlerTest {
         handler.registerUpdateListeners(defaults);
         assertEquals(defaults.size(), registrations.size(),
                 "every default event class name resolves on the Paper API (catches typos in defaults)");
+    }
+
+    // ---- discovery-ladder order (full walk; each rung returns a DISTINCT chunk) ----
+
+    public static class AllFiveEvent extends Event {
+        private final World w;
+        public AllFiveEvent(World w) { this.w = w; }
+        public List<Block> blockList() { return List.of(block(w, 0, 0)); }      // chunk (0,0)
+        public List<BlockState> getBlocks() { return List.of(blockState(w, 16, 0)); } // chunk (1,0)
+        public Block getBlock() { return block(w, 32, 0); }                      // chunk (2,0)
+        public Location getLocation() { return new Location(w, 48.0, 64.0, 0.0); } // chunk (3,0)
+        public Chunk getChunk() { return chunk(w, 4, 0); }                       // chunk (4,0)
+        @Override public HandlerList getHandlers() { return new HandlerList(); }
+    }
+
+    public static class FourRungEvent extends Event {
+        private final World w;
+        public FourRungEvent(World w) { this.w = w; }
+        public List<BlockState> getBlocks() { return List.of(blockState(w, 16, 0)); }
+        public Block getBlock() { return block(w, 32, 0); }
+        public Location getLocation() { return new Location(w, 48.0, 64.0, 0.0); }
+        public Chunk getChunk() { return chunk(w, 4, 0); }
+        @Override public HandlerList getHandlers() { return new HandlerList(); }
+    }
+
+    public static class ThreeRungEvent extends Event {
+        private final World w;
+        public ThreeRungEvent(World w) { this.w = w; }
+        public Block getBlock() { return block(w, 32, 0); }
+        public Location getLocation() { return new Location(w, 48.0, 64.0, 0.0); }
+        public Chunk getChunk() { return chunk(w, 4, 0); }
+        @Override public HandlerList getHandlers() { return new HandlerList(); }
+    }
+
+    public static class TwoRungEvent extends Event {
+        private final World w;
+        public TwoRungEvent(World w) { this.w = w; }
+        public Location getLocation() { return new Location(w, 48.0, 64.0, 0.0); }
+        public Chunk getChunk() { return chunk(w, 4, 0); }
+        @Override public HandlerList getHandlers() { return new HandlerList(); }
+    }
+
+    @Test
+    void discoveryLadderWalksBlockListThenGetBlocksThenGetBlockThenGetLocationThenGetChunk() throws Exception {
+        // PP-011: each removal of the top rung must promote exactly the next one — a reorder
+        // among getBlocks/getBlock/getLocation/getChunk changes which chunk gets marked.
+        registerAndFire(new AllFiveEvent(overworld));
+        assertDirty(OVERWORLD, PositionUtil.packPosition(0, 0));
+
+        registerAndFire(new FourRungEvent(overworld));
+        assertDirty(OVERWORLD, PositionUtil.packPosition(1, 0));
+
+        registerAndFire(new ThreeRungEvent(overworld));
+        assertDirty(OVERWORLD, PositionUtil.packPosition(2, 0));
+
+        registerAndFire(new TwoRungEvent(overworld));
+        assertDirty(OVERWORLD, PositionUtil.packPosition(3, 0));
+        // getChunk-only bottom rung is pinned by getChunkEventUsesChunkCoordsWithoutShift
+    }
+
+    // ---- registration failure shapes ----
+
+    /** The handler-list-less shape real Bukkit rejects from inside registerEvent. */
+    public abstract static class AbstractHandlerlessEvent extends Event {
+    }
+
+    @Test
+    void abstractEventRegistrationThrowIsContainedAndLaterNamesStillRegister() {
+        // PP-012: Bukkit throws IllegalPluginAccessException from registerEvent for events
+        // without a resolvable handler list; the generic catch must contain it per-entry.
+        var rejecting = new PaperWorldHandler(
+                pluginProxyRejecting(Set.of(AbstractHandlerlessEvent.class)), tracker);
+        rejecting.registerUpdateListeners(List.of(
+                AbstractHandlerlessEvent.class.getName(),
+                BlockListEvent.class.getName()));
+        assertEquals(1, registrations.size(), "the registration throw must not abort the loop");
+        assertEquals(BlockListEvent.class, registrations.get(0).eventClass());
+    }
+
+    @Test
+    void nullUpdateEventsEntryIsSkippedAndLoopContinues() {
+        // PP-013: GSON can deserialize [null, ...]; Class.forName(null) NPEs into the
+        // generic catch and the remaining names must still register.
+        handler.registerUpdateListeners(Arrays.asList(null, SingleBlockEvent.class.getName()));
+        assertEquals(1, registrations.size());
+        assertEquals(SingleBlockEvent.class, registrations.get(0).eventClass());
+    }
+
+    // ---- runtime-subclass caching ----
+
+    public static class BaseBlockEvent extends Event {
+        private final Block block;
+        public BaseBlockEvent(Block block) { this.block = block; }
+        public Block getBlock() { return block; }
+        @Override public HandlerList getHandlers() { return new HandlerList(); }
+    }
+
+    public static class SubWithBlockListEvent extends BaseBlockEvent {
+        private final List<Block> blocks;
+        public SubWithBlockListEvent(Block base, List<Block> blocks) {
+            super(base);
+            this.blocks = blocks;
+        }
+        public List<Block> blockList() { return blocks; }
+    }
+
+    public static class PlainSubEvent extends BaseBlockEvent {
+        public PlainSubEvent(Block block) { super(block); }
+    }
+
+    @Test
+    void subclassEventsDiscoverAndCacheExtractorsByRuntimeClass() throws Exception {
+        // PP-014: Bukkit delivers subclasses of the registered class; discovery keyed on the
+        // REGISTERED class would miss SubWithBlockListEvent's richer blockList() extractor.
+        handler.registerUpdateListeners(List.of(BaseBlockEvent.class.getName()));
+        var reg = registrations.getLast();
+
+        fire(reg, new SubWithBlockListEvent(
+                block(overworld, 0, 0), List.of(block(overworld, 160, 0))));
+        assertDirty(OVERWORLD, PositionUtil.packPosition(10, 0));
+
+        fire(reg, new PlainSubEvent(block(overworld, 32, 0)));
+        assertDirty(OVERWORLD, PositionUtil.packPosition(2, 0));
+
+        // Second fire of each subclass rides its own cached extractor (independent entries)
+        fire(reg, new SubWithBlockListEvent(
+                block(overworld, 320, 320), List.of(block(overworld, 480, 0))));
+        assertDirty(OVERWORLD, PositionUtil.packPosition(30, 0));
+    }
+
+    // ---- registration arguments ----
+
+    @Test
+    void registrationPassesIgnoreCancelledTrueScopedToTheRegisterEventArg() {
+        // PP-015 (scoped pin): cancelled events must not mark dirty. Actual bus-level
+        // suppression is Bukkit's contract for this flag — untestable in a proxy harness,
+        // so the pin is the literal argument the handler registers with.
+        handler.registerUpdateListeners(List.of(SingleBlockEvent.class.getName()));
+        assertTrue(registrations.getLast().ignoreCancelled());
+    }
+
+    // ---- extractor invocation failure ----
+
+    public static class ThrowingBlockEvent extends Event {
+        private final Block block;
+        public ThrowingBlockEvent(Block block) { this.block = block; }
+        public Block getBlock() {
+            if (block == null) throw new IllegalStateException("extractor boom");
+            return block;
+        }
+        @Override public HandlerList getHandlers() { return new HandlerList(); }
+    }
+
+    @Test
+    void extractorExceptionIsContainedAndSubsequentEventsStillProcess() throws Exception {
+        // PP-016: a throwing extractor must be debug-logged, never rethrown into the event
+        // bus, and must not poison the cached method for later events.
+        handler.registerUpdateListeners(List.of(ThrowingBlockEvent.class.getName()));
+        var reg = registrations.getLast();
+
+        assertDoesNotThrow(() -> fire(reg, new ThrowingBlockEvent(null)));
+        assertEquals(0, tracker.pendingCount());
+
+        fire(reg, new ThrowingBlockEvent(block(overworld, 16, 16)));
+        assertDirty(OVERWORLD, PositionUtil.packPosition(1, 1));
+    }
+
+    // ---- defaults yield extractors ----
+
+    @Test
+    void everyDefaultUpdateEventYieldsAPositionExtractorAndFluidFlowStaysExcluded() throws Exception {
+        // PP-017: resolvable-but-extractor-less defaults register fine and then silently
+        // extract nothing forever; pin that discoverMethod finds a rung for each default.
+        List<String> defaults = new PaperConfig().updateEvents;
+        assertFalse(defaults.contains("org.bukkit.event.block.BlockFromToEvent"),
+                "high-frequency fluid flow is deliberately opt-in, never a default");
+        for (String name : defaults) {
+            assertNotNull(PaperWorldHandler.discoverMethod(Class.forName(name)),
+                    name + " resolves but yields no position extractor — it would register and "
+                            + "silently mark nothing forever");
+        }
     }
 }

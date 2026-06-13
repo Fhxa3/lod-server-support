@@ -124,4 +124,35 @@ class InFlightTrackerTest {
         assertEquals(0, tracker.generationCount());
         assertFalse(tracker.isInFlight(GEN_POS));
     }
+
+    /**
+     * CL-024 boundary pin. The sweep contract is strictly-greater (age &gt; threshold), but
+     * the sweep reads System.nanoTime() internally, so exact age==threshold cannot be staged
+     * (the clock advances between markPending and the comparison) — &gt; vs &gt;= is genuinely
+     * indistinguishable from outside without a clock seam (see handoff-PKG-A.md). The
+     * boundary is therefore pinned from both sides at the tightest stageable offsets:
+     * 1 ms past the threshold MUST evict (no hidden slack or grace margin on top of the
+     * passed threshold), and an entry well inside the threshold — far from "fresh" at half
+     * the threshold's age — MUST survive (the threshold parameter, not a built-in constant,
+     * bounds eviction from below).
+     */
+    @Test
+    void timeoutBoundaryEvictsJustPastThresholdAndKeepsEntriesInsideIt() {
+        long threshold = ONE_HOUR_NANOS;
+        long now = System.nanoTime();
+        long justPast = PositionUtil.packPosition(4, 4);
+        long wellInside = PositionUtil.packPosition(5, 5);
+        tracker.markPending(justPast, now - threshold - TimeUnit.MILLISECONDS.toNanos(1), false);
+        tracker.markPending(wellInside, now - threshold + TimeUnit.MINUTES.toNanos(30), true);
+
+        var evicted = new java.util.HashSet<Long>();
+        tracker.timeoutSweep(threshold, evicted::add);
+
+        assertEquals(java.util.Set.of(justPast), evicted,
+                "exactly the entry 1 ms past the threshold is evicted — no extra slack, no early eviction");
+        assertFalse(tracker.isInFlight(justPast));
+        assertTrue(tracker.isInFlight(wellInside),
+                "a 30-minute-old entry under a 1-hour threshold must never time out");
+        assertEquals(1, tracker.generationCount(), "the surviving generation entry keeps its slot");
+    }
 }

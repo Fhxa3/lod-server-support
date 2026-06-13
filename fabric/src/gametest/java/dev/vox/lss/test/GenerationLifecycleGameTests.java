@@ -5,6 +5,8 @@ import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.processing.TickSnapshot;
 import dev.vox.lss.config.LSSServerConfig;
 import dev.vox.lss.networking.server.ChunkGenerationService;
+import dev.vox.lss.networking.server.DirtyContentFilter;
+import dev.vox.lss.networking.server.LSSServerNetworking;
 import dev.vox.lss.networking.server.RequestProcessingService;
 import net.fabricmc.fabric.api.gametest.v1.GameTest;
 import net.minecraft.core.BlockPos;
@@ -69,6 +71,10 @@ public class GenerationLifecycleGameTests {
     private static final int DIMENSION_CHUNK_OFFSET = 208;
     private static final int STALE_TICKET_CHUNK_OFFSET = 224;
     private static final int REMOVAL_CHUNK_OFFSET = 240;
+    private static final int REMOVED_DRAIN_CHUNK_OFFSET = 248;
+    private static final int SEED_SUPPRESS_CHUNK_OFFSET = 256;
+    private static final int GEN_REASK_CHUNK_OFFSET = 264;
+    private static final int SERIALIZER_FAULT_CHUNK_OFFSET = 280;
 
     /** Deprecated upstream without a replacement; it is the only factory that places a real
      *  ServerPlayer (player list entry + embedded-channel connection) inside a gametest. */
@@ -534,10 +540,348 @@ public class GenerationLifecycleGameTests {
                     "no generation entry may exist for the dropped stale request");
             helper.assertTrue(service.getOffThreadProcessor().pollGenerationTicketRequest() == null,
                     "the stale ticket request must be consumed by the drain, not left queued");
+            // FP-019: the guard must DROP, never feed a failure — a regression that called
+            // feedGenerationFailure (with the current dimension) instead of dropping would
+            // emit a spurious NOT_GENERATED outcome and book genDrained for it.
+            helper.assertTrue(
+                    service.getOffThreadProcessor().getDiagnostics().getTotalGenDrained() == 0,
+                    "the dimension guard's drop must not produce a generation outcome: "
+                            + "genDrained must stay 0, got " + service.getOffThreadProcessor()
+                                    .getDiagnostics().getTotalGenDrained());
             // Success path cleanup (a failed run leaves only a delisted-on-cleanup mock).
             mock.setServerLevel(level);
             service.shutdown();
             server.getPlayerList().remove(mock);
         });
+    }
+
+    /**
+     * FP-021: the {@code !player.isRemoved()} arm of the generation-ticket drain. A
+     * discarded-but-still-listed player (the death window) keeps its session, but a ticket
+     * request drained while the player entity is removed must NOT create an MC ticket —
+     * it must feed a failure outcome so the pending slot frees and the client hears
+     * ColumnNotGenerated, instead of force-loading a chunk for an entity that cannot
+     * receive it.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty", maxTicks = 400)
+    public void removedButListedPlayerAtDrainFeedsFailureWithoutCreatingTicket(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        var server = level.getServer();
+        var playerList = server.getPlayerList();
+        var origin = ChunkPos.containing(helper.absolutePos(BlockPos.ZERO));
+        int cx = origin.x() + REMOVED_DRAIN_CHUNK_OFFSET;
+        // Must not exist on disk (a found read never converts to a generation ticket), and
+        // the failure feed means no run ever generates it — but salt anyway (world persists).
+        int cz = origin.z() + (int) Math.floorMod(System.nanoTime(), 64L);
+        var tickets = ticketStorage(level);
+        var mock = placeMockServerPlayer(helper);
+        var uuid = mock.getUUID();
+        var service = new RequestProcessingService(server);
+        var gen = service.getGenerationService();
+        helper.assertTrue(gen != null, "generation service expected");
+        var state = service.registerPlayer(mock, LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+        helper.assertTrue(level.getChunkSource().getChunkNow(cx, cz) == null,
+                "premise: the requested chunk must not be loaded");
+        state.addRequest(PositionUtil.packPosition(cx, cz), 0L); // clientTimestamp 0 = generation
+
+        // Tick 1 registers the dimension context; the disk-notfound -> generation conversion
+        // needs further processing cycles driven by manual snapshots (no drain in between).
+        service.tick();
+
+        var phase = new AtomicInteger();
+        helper.succeedWhen(() -> {
+            if (phase.get() == 0) {
+                if (state.getHeldGenSlots() != 1) {
+                    service.getOffThreadProcessor().postSnapshot(new TickSnapshot(
+                            Map.of(uuid, LSSConstants.DIM_STR_OVERWORLD), Map.of(),
+                            LSSServerConfig.CONFIG.sendQueueLimitPerPlayer, false), List.of());
+                    helper.assertTrue(false,
+                            "waiting for the disk-notfound -> generation conversion (heldGenSlots=1)");
+                }
+                // Ticket request enqueued for the main-thread drain; discard the player
+                // BEFORE any drain can run. The player list still holds it (death shape).
+                mock.discard();
+                helper.assertTrue(mock.isRemoved() && playerList.getPlayer(uuid) != null,
+                        "premise: discarded but still listed");
+                phase.set(1);
+            }
+            service.tick();
+            var diag = service.getOffThreadProcessor().getDiagnostics();
+            helper.assertTrue(diag.getTotalGenDrained() >= 1,
+                    "waiting for the failure feed to drain as a generation outcome");
+            helper.assertTrue(gen.getTotalSubmitted() == 0,
+                    "a removed player's ticket request must never reach submitGeneration "
+                            + "(no MC ticket for an entity that cannot receive the column)");
+            helper.assertTrue(gen.getActiveCount() == 0 && lssTicketCount(tickets, cx, cz) == 0,
+                    "no generation entry or load ticket may exist for the dropped request");
+            helper.assertTrue(state.getHeldGenSlots() == 0,
+                    "the failure outcome must free the pending generation slot, held="
+                            + state.getHeldGenSlots());
+            helper.assertTrue(service.getOffThreadProcessor().pollGenerationTicketRequest() == null,
+                    "the ticket request must be consumed by the drain");
+            service.shutdown();
+            playerList.remove(mock);
+        });
+    }
+
+    /**
+     * FP-023: a queued re-request racing its own generation completion into the same
+     * processing cycle costs exactly ONE column payload. The completion (phase 3) marks
+     * the done-bit and enqueues the payload before routing (phase 4) consumes the
+     * re-request, which must resolve as a duplicate answer — and the completed position is
+     * excluded from that tick's probe pass by the genReadyPositions skip-set, so the probe
+     * cannot double-serve it either (in_memory stays 0). The load wait deliberately does
+     * NOT tick the service: generation completion only fires inside {@code service.tick()},
+     * so the re-request can always be queued before the completion tick.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty", maxTicks = 600)
+    public void sameTickGenerationCompletionAndQueuedReRequestServeExactlyOnePayload(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        var server = level.getServer();
+        var playerList = server.getPlayerList();
+        var origin = ChunkPos.containing(helper.absolutePos(BlockPos.ZERO));
+        int cx = origin.x() + GEN_REASK_CHUNK_OFFSET;
+        int cz = origin.z() + (int) Math.floorMod(System.nanoTime(), 64L);
+        long packed = PositionUtil.packPosition(cx, cz);
+        var mock = placeMockServerPlayer(helper);
+        var service = new RequestProcessingService(server);
+        var gen = service.getGenerationService();
+        helper.assertTrue(gen != null, "generation service expected");
+        var state = service.registerPlayer(mock, LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+        helper.assertTrue(level.getChunkSource().getChunkNow(cx, cz) == null,
+                "premise: the chunk must not be loaded (the request must take the "
+                        + "disk-notfound -> generation route)");
+        state.addRequest(packed, 0L);
+
+        var diag = service.getOffThreadProcessor().getDiagnostics();
+        var phase = new AtomicInteger();
+        helper.succeedWhen(() -> {
+            if (phase.get() == 0) {
+                service.tick();
+                helper.assertTrue(gen.getActiveCount() == 1,
+                        "waiting for the generation ticket submission");
+                phase.set(1);
+                helper.assertTrue(false, "ticket submitted, waiting for the chunk to load");
+            }
+            if (phase.get() == 1) {
+                // No service.tick() here: the chunk loads on the server's own chunk-system
+                // ticks, and refraining from ticking guarantees the completion has not fired.
+                helper.assertTrue(level.getChunkSource().getChunkNow(cx, cz) != null,
+                        "waiting for the ticketed chunk to load");
+                // ts>0 keeps the duplicate answer independent of the concurrent flush
+                // (a ts<=0 re-ask could legally re-resolve if the payload already left).
+                state.addRequest(packed, 5L);
+                service.tick(); // harvests the completion AND routes the re-request
+                phase.set(2);
+                helper.assertTrue(false, "completion tick executed, awaiting the outcome");
+            }
+            service.tick();
+            helper.assertTrue(diag.getTotalGenDrained() == 1 && state.getTotalSectionsSent() >= 1,
+                    "waiting for the generation outcome to drain and the payload to flush");
+            helper.assertTrue(state.getTotalSectionsSent() == 1,
+                    "the completion + same-tick re-request must serve exactly ONE payload, got "
+                            + state.getTotalSectionsSent());
+            helper.assertTrue(gen.getTotalCompleted() == 1,
+                    "exactly one generation completion expected");
+            helper.assertTrue(diag.getTotalInMemory() == 0,
+                    "the re-request must not be probe-served: the completed position is "
+                            + "skip-set-excluded from the probe pass and resolves as a duplicate");
+            helper.assertTrue(diag.getTotalRequestsRouted() == 2,
+                    "both the original and the re-request must route exactly once, got "
+                            + diag.getTotalRequestsRouted());
+            helper.assertTrue(state.getHeldSyncSlots() == 0 && state.getHeldGenSlots() == 0,
+                    "all slots must be free at rest");
+            service.shutdown();
+            playerList.remove(mock);
+        });
+    }
+
+    /**
+     * FP-032 (T2 leg): an End-void generation completion is a COMPLETION (columnData
+     * present, all-air serialization, real timestamp) and seeds the dirty filter with the
+     * ALL_AIR sentinel at the completion call-site, so the chunk's following unload-save
+     * hashes equal and stays quiet. The virgin-filter control proves the quiet came from
+     * the seed. A regression classifying all-air completions as failures parks the void
+     * forever; a lost sentinel seed re-marks every void column after every save.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty", maxTicks = 600)
+    public void endVoidGenerationCompletionSeedsTheAllAirSentinel(GameTestHelper helper) {
+        ServerLevel endLevel = helper.getLevel().getServer().getLevel(Level.END);
+        helper.assertTrue(endLevel != null, "the End dimension must exist on the gametest server");
+        var dim = LSSConstants.DIM_STR_THE_END;
+        // Void guarantee band (see SerializerParityGameTests): density contributes nothing
+        // between the main island and the outer islands; salted, disjoint from other tests.
+        var origin = ChunkPos.containing(helper.absolutePos(BlockPos.ZERO));
+        int salt = Math.floorMod(origin.x() * 31 + origin.z(), 64);
+        int cx = 48 + (salt & 7);
+        int cz = 18 + ((salt >> 3) & 7);
+        var gen = newGenService(3, 2, 60);
+        var filter = new DirtyContentFilter();
+        gen.setDirtyContentFilter(filter);
+        var player = UUID.randomUUID();
+        helper.assertTrue(gen.submitGeneration(player, endLevel, cx, cz, 1L),
+                "premise: submission accepted");
+
+        var outcomes = new AtomicReference<List<TickSnapshot.GenerationReadyData>>();
+        helper.succeedWhen(() -> {
+            if (outcomes.get() == null) {
+                var ready = gen.tick();
+                helper.assertTrue(!ready.isEmpty(), "waiting for the End chunk to generate");
+                outcomes.set(List.copyOf(ready));
+            }
+            var outcome = outcomes.get().get(0);
+            helper.assertTrue(outcome.columnData() != null,
+                    "an all-air End completion must carry column data — null means failure, "
+                            + "which would loop the void through NOT_GENERATED forever");
+            helper.assertTrue(outcome.columnData().serializedSections() == null,
+                    "premise: the void chunk must serialize as all-air");
+            helper.assertTrue(outcome.columnTimestamp() > 0,
+                    "the completion must carry a real timestamp for the up-to-date economy");
+            helper.assertTrue(gen.getTotalCompleted() == 1 && gen.getTotalRemovedInFlight() == 0,
+                    "all-air completion books as completed, not removed");
+
+            var chunk = endLevel.getChunkSource().getChunkNow(cx, cz);
+            helper.assertTrue(chunk != null, "premise: the generated chunk is still loaded");
+            helper.assertTrue(!filter.contentChanged(endLevel, chunk, dim),
+                    "the completion must seed the ALL_AIR sentinel: the chunk's following "
+                            + "unload-save must hash equal and stay quiet");
+            helper.assertTrue(new DirtyContentFilter().contentChanged(endLevel, chunk, dim),
+                    "control: a virgin filter marks the same save — the quiet above must come "
+                            + "from the completion-time seed");
+            gen.shutdown();
+        });
+    }
+
+    /**
+     * FP-033: a Throwable (here an Error) thrown by the column serializer during a
+     * generation completion. The catch books removedInFlight and fans a failure outcome to
+     * every piggybacked callback; the finally releases the load ticket and drops the
+     * active entry — pinned here because a skipped release force-loads the chunk forever
+     * and re-throws every server tick (D7: the release already sits in a finally; this
+     * test is the regression pin).
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty", maxTicks = 600)
+    public void serializationThrowableDuringCompletionReleasesTicketAndBalancesBooks(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        var origin = ChunkPos.containing(helper.absolutePos(BlockPos.ZERO));
+        int cx = origin.x() + SERIALIZER_FAULT_CHUNK_OFFSET;
+        int cz = origin.z() + 5;
+        var tickets = ticketStorage(level);
+        var config = new LSSServerConfig();
+        config.generationConcurrencyLimitGlobal = 3;
+        config.generationConcurrencyLimitPerPlayer = 2;
+        config.generationTimeoutSeconds = 60;
+        var gen = new ChunkGenerationService(config,
+                (lvl, chunk, x, z) -> {
+                    throw new AssertionError("injected serialization failure");
+                });
+        var playerA = UUID.randomUUID();
+        var playerB = UUID.randomUUID();
+        helper.assertTrue(gen.submitGeneration(playerA, level, cx, cz, 7L), "seed the entry");
+        helper.assertTrue(gen.submitGeneration(playerB, level, cx, cz, 8L), "piggyback the entry");
+        helper.assertTrue(lssTicketCount(tickets, cx, cz) == 1, "premise: ticket held");
+
+        var outcomes = new AtomicReference<List<TickSnapshot.GenerationReadyData>>();
+        helper.succeedWhen(() -> {
+            if (outcomes.get() == null) {
+                var ready = gen.tick();
+                helper.assertTrue(!ready.isEmpty(), "waiting for the chunk to load into the fault");
+                outcomes.set(List.copyOf(ready));
+            }
+            var ready = outcomes.get();
+            helper.assertTrue(ready.size() == 2,
+                    "the serialization fault must fail EVERY piggybacked callback, got "
+                            + ready.size());
+            for (var outcome : ready) {
+                helper.assertTrue(outcome.columnData() == null,
+                        "fault outcomes must carry null column data (the failure marker)");
+            }
+            helper.assertTrue(gen.getTotalRemovedInFlight() == 1,
+                    "the faulted entry books removedInFlight ONCE (the A4 re-balancing term), got "
+                            + gen.getTotalRemovedInFlight());
+            helper.assertTrue(gen.getTotalCompleted() == 0 && gen.getTotalTimeouts() == 0,
+                    "a serialization fault is neither a completion nor a timeout");
+            helper.assertTrue(gen.getActiveCount() == 0,
+                    "the faulted entry must leave the active set (a retained entry re-throws "
+                            + "every tick)");
+            helper.assertTrue(lssTicketCount(tickets, cx, cz) == 0,
+                    "the finally must release the load ticket even on an Error — a skipped "
+                            + "release force-loads the chunk forever");
+            helper.assertTrue(gen.getTotalSubmitted() == gen.getTotalCompleted()
+                            + gen.getTotalTimeouts() + gen.getTotalRemovedInFlight() + gen.getActiveCount(),
+                    "soak law A4 identity must hold after the fault");
+            // The catch must also free the per-player concurrency counts (cap is 2).
+            helper.assertTrue(gen.submitGeneration(playerA, level, cx + 1, cz, 9L)
+                            && gen.submitGeneration(playerA, level, cx + 2, cz, 10L),
+                    "the fault must free the per-player concurrency counts");
+            gen.shutdown();
+            helper.assertTrue(lssTicketCount(tickets, cx + 1, cz) == 0
+                            && lssTicketCount(tickets, cx + 2, cz) == 0,
+                    "shutdown must release the post-fault entries' tickets");
+        });
+    }
+
+    /**
+     * FP-041 (non-air leg): the completion-time {@code DirtyContentFilter.seed} call-site,
+     * wired to the LIVE service's filter so the REAL save hook consults the seeded hash:
+     * a generation-served superflat chunk's immediate save must produce zero dirty marks
+     * (the B5 class — losing this seed re-sends every generated column once, +73 MB on a
+     * fresh backfill). Same-callback save keeps the serialized content identical to the
+     * completion-time seed; cross-tick byte determinism is pinned separately by
+     * SerializerParityGameTests. Salted coords: a rerun would load the chunk
+     * already-generated and not-unsaved, and the save pass would skip it vacuously.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty", maxTicks = 600)
+    public void generationServeSeedSuppressesTheFollowingSave(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        var liveService = LSSServerNetworking.getRequestService();
+        helper.assertTrue(liveService != null, "live service required (the save hook feeds it)");
+        var origin = ChunkPos.containing(helper.absolutePos(BlockPos.ZERO));
+        int cx = origin.x() + SEED_SUPPRESS_CHUNK_OFFSET;
+        int cz = origin.z() + (int) Math.floorMod(System.nanoTime(), 64L);
+        long packed = PositionUtil.packPosition(cx, cz);
+        var dim = LSSConstants.DIM_STR_OVERWORLD;
+        var gen = newGenService(3, 2, 60);
+        gen.setDirtyContentFilter(liveService.getDirtyContentFilter());
+        var player = UUID.randomUUID();
+        helper.assertTrue(level.getChunkSource().getChunkNow(cx, cz) == null,
+                "premise: the chunk must generate fresh (a reloaded chunk is not unsaved and "
+                        + "the save pass would skip it)");
+        helper.assertTrue(gen.submitGeneration(player, level, cx, cz, 1L), "premise: submitted");
+
+        helper.succeedWhen(() -> {
+            var ready = gen.tick();
+            helper.assertTrue(!ready.isEmpty(), "waiting for the chunk to generate");
+            var outcome = ready.get(0);
+            helper.assertTrue(outcome.columnData() != null
+                            && outcome.columnData().serializedSections() != null,
+                    "premise: a superflat completion serves non-air content");
+
+            var chunk = level.getChunkSource().getChunkNow(cx, cz);
+            helper.assertTrue(chunk != null, "premise: the generated chunk is still loaded");
+            helper.assertTrue(new DirtyContentFilter().contentChanged(level, chunk, dim),
+                    "control: a virgin filter marks this save — quiet below must come from "
+                            + "the completion-time seed");
+
+            // Same-callback drain-save-drain: no other test's marks can interleave, and the
+            // chunk's content cannot drift between the seed and the save.
+            var tracker = liveService.getDirtyTracker();
+            tracker.drainDirty(dim);
+            level.save(null, true, false);
+            long[] dirty = tracker.drainDirty(dim);
+            helper.assertTrue(!containsPosition(dirty, packed),
+                    "a generation-served chunk's save must NOT re-mark dirty: the completion "
+                            + "seeds the filter with the served bytes (losing the seed re-sends "
+                            + "every generated column a second time)");
+            gen.shutdown();
+        });
+    }
+
+    private static boolean containsPosition(long[] positions, long packed) {
+        if (positions == null) return false;
+        for (long p : positions) {
+            if (p == packed) return true;
+        }
+        return false;
     }
 }

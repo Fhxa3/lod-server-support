@@ -1,9 +1,19 @@
 package dev.vox.lss.test;
 
 import dev.vox.lss.common.LSSConstants;
+import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.common.SharedBandwidthLimiter;
+import dev.vox.lss.common.processing.LoadedColumnData;
+import dev.vox.lss.common.processing.TickDiagnostics;
+import dev.vox.lss.common.processing.TickSnapshot;
+import dev.vox.lss.config.LSSServerConfig;
 import dev.vox.lss.networking.server.ChunkDiskReader;
 import dev.vox.lss.networking.server.DirtyContentFilter;
+import dev.vox.lss.networking.server.FabricOffThreadProcessor;
+import dev.vox.lss.networking.server.RequestProcessingService;
 import dev.vox.lss.networking.server.SectionSerializer;
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import net.fabricmc.fabric.api.gametest.v1.GameTest;
 import net.minecraft.core.BlockPos;
 import net.minecraft.gametest.framework.GameTestHelper;
@@ -13,7 +23,10 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -41,6 +54,16 @@ public class SerializerParityGameTests {
     /** Distinct far-away chunk offsets per test so concurrently running batch tests never share state. */
     private static final int PARITY_CHUNK_OFFSET = 64;
     private static final int DIRTY_FILTER_CHUNK_OFFSET = 96;
+    private static final int READ_AFTER_SAVE_CHUNK_OFFSET = 104;
+    private static final int DISK_SEED_CHUNK_OFFSET = 112;
+    private static final int ALL_AIR_TRANSITION_CHUNK_OFFSET = 128;
+
+    /** Deprecated upstream without a replacement; it is the only factory that places a real
+     *  ServerPlayer (player list entry + embedded-channel connection) inside a gametest. */
+    @SuppressWarnings("removal")
+    private static net.minecraft.server.level.ServerPlayer placeMockServerPlayer(GameTestHelper helper) {
+        return helper.makeMockServerPlayerInLevel();
+    }
     // End void: between the main island (~chunk 22) and the outer islands (chunk 64+) the island
     // density function contributes nothing (max |chunk/2 + 12|^2 sum < 4096), so chunks there are
     // guaranteed all-air in every vanilla seed. The disk-read test may use a fixed position
@@ -271,6 +294,270 @@ public class SerializerParityGameTests {
                     "all-air result must carry a real timestamp so the client can mark the column up-to-date");
             helper.assertTrue(reader.getDiag().getAllAirCount() == 1, "diagnostics must triage the read as all-air");
             helper.assertTrue(reader.getDiag().getNotFoundCount() == 0, "diagnostics must not count the read as not-found");
+        });
+    }
+
+    /**
+     * FP-028: a disk read fired right after a forced save — WITHOUT unloading the chunk —
+     * must observe the saved edit, never silently-stale bytes (the IO-worker pending-write
+     * visibility window). Baseline bytes are read after a first save, the chunk is edited
+     * and force-saved while still loaded, and the second read must differ from the
+     * baseline. Both reads run against the same settled-light chunk, so the edit is the
+     * only delta between them.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty", maxTicks = 400)
+    public void readAfterSaveWithoutUnloadSeesTheLatestBytes(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        var origin = ChunkPos.containing(helper.absolutePos(BlockPos.ZERO));
+        int cx = origin.x() + READ_AFTER_SAVE_CHUNK_OFFSET;
+        int cz = origin.z() + 3;
+        var chunkPos = new ChunkPos(cx, cz);
+        var chunkSource = level.getChunkSource();
+        var editPos = new BlockPos(cx * 16 + 4, -61, cz * 16 + 4);
+
+        // Held for the whole test: the read must hit disk state while the chunk is loaded.
+        chunkSource.addTicketWithRadius(TicketType.PLAYER_LOADING, chunkPos, 0);
+        level.getChunk(cx, cz);
+
+        var reader = new ChunkDiskReader(1);
+        var readerId = UUID.randomUUID();
+        reader.registerPlayer(readerId);
+        var step = new AtomicInteger();
+        var baseline = new AtomicReference<byte[]>();
+
+        helper.succeedWhen(() -> {
+            helper.assertTrue(helper.getTick() >= 4, "waiting for generation light to settle");
+            switch (step.get()) {
+                case 0 -> {
+                    level.save(null, true, false);
+                    reader.submitReadDirect(readerId, LSSConstants.DIM_STR_OVERWORLD, level, cx, cz, 0);
+                    step.set(1);
+                    helper.assertTrue(false, "baseline read submitted");
+                }
+                case 1 -> {
+                    var result = reader.getPlayerQueue(readerId).poll();
+                    helper.assertTrue(result != null, "waiting for the baseline read");
+                    helper.assertTrue(!result.notFound() && result.sectionBytes() != null,
+                            "premise: the saved superflat chunk must read back with content");
+                    baseline.set(result.sectionBytes());
+                    // Edit while loaded, force-save, read again — all within one callback so
+                    // nothing else can touch the chunk between the save and the read.
+                    var edit = level.getBlockState(editPos).is(Blocks.STONE)
+                            ? Blocks.COBBLESTONE : Blocks.STONE;
+                    level.setBlock(editPos, edit.defaultBlockState(), 3);
+                    level.save(null, true, false);
+                    reader.submitReadDirect(readerId, LSSConstants.DIM_STR_OVERWORLD, level, cx, cz, 1);
+                    step.set(2);
+                    helper.assertTrue(false, "post-edit read submitted");
+                }
+                case 2 -> {
+                    var result = reader.getPlayerQueue(readerId).poll();
+                    helper.assertTrue(result != null, "waiting for the post-edit read");
+                    reader.shutdown();
+                    helper.assertTrue(!result.notFound() && result.sectionBytes() != null,
+                            "the post-edit read must resolve with content");
+                    helper.assertTrue(!Arrays.equals(baseline.get(), result.sectionBytes()),
+                            "a read fired right after a forced save of a still-loaded chunk "
+                                    + "must see the edit — byte-identical results mean the "
+                                    + "read silently served stale pre-save state");
+                    chunkSource.removeTicketWithRadius(TicketType.PLAYER_LOADING, chunkPos, 0);
+                }
+                default -> helper.fail("unexpected read-after-save step " + step.get());
+            }
+        });
+    }
+
+    /**
+     * FP-042: disk-read serves do NOT seed the {@code DirtyContentFilter} — a conscious pin
+     * of current behavior. The consequence is the warm-rejoin re-send wave: the first save
+     * after a disk serve counts as "first observed save" and re-marks the column even
+     * though the client already holds identical bytes. If seeding is ever added (the fix),
+     * this test fails and must be flipped deliberately. The reloaded chunk hashes equal to
+     * the disk-served bytes (pinned by the parity test), so a seeded filter would return
+     * false here.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty", maxTicks = 1200)
+    public void diskReadServesDoNotSeedTheDirtyContentFilter(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        var server = level.getServer();
+        var playerList = server.getPlayerList();
+        var origin = ChunkPos.containing(helper.absolutePos(BlockPos.ZERO));
+        int cx = origin.x() + DISK_SEED_CHUNK_OFFSET;
+        int cz = origin.z() + 9;
+        var chunkPos = new ChunkPos(cx, cz);
+        var chunkSource = level.getChunkSource();
+        var dim = LSSConstants.DIM_STR_OVERWORLD;
+        long packed = PositionUtil.packPosition(cx, cz);
+
+        // Generate, then let the chunk unload so the serve must come from disk.
+        chunkSource.addTicketWithRadius(TicketType.PLAYER_LOADING, chunkPos, 0);
+        level.getChunk(cx, cz);
+        helper.runAfterDelay(4, () -> chunkSource.removeTicketWithRadius(TicketType.PLAYER_LOADING, chunkPos, 0));
+
+        var mock = placeMockServerPlayer(helper);
+        var service = new RequestProcessingService(server);
+        var state = service.registerPlayer(mock, LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+        var step = new AtomicInteger();
+        var settle = new AtomicInteger();
+
+        helper.succeedWhen(() -> {
+            helper.assertTrue(helper.getTick() >= 6, "waiting for the ticket release");
+            switch (step.get()) {
+                case 0 -> {
+                    helper.assertTrue(chunkSource.getChunkNow(cx, cz) == null,
+                            "waiting for the chunk to unload");
+                    level.save(null, true, false);
+                    state.addRequest(packed, -1L);
+                    step.set(1);
+                    helper.assertTrue(false, "request queued, awaiting the disk serve");
+                }
+                case 1 -> {
+                    service.tick();
+                    helper.assertTrue(state.getTotalSectionsSent() >= 1,
+                            "waiting for the disk serve to flush");
+                    helper.assertTrue(
+                            service.getDiskReader().getDiag().getSuccessfulReadCount() == 1
+                                    && service.getOffThreadProcessor().getDiagnostics().getTotalInMemory() == 0,
+                            "premise: the serve must come from DISK, not the in-memory probe");
+                    // Reload for the filter check; settle light before hashing.
+                    chunkSource.addTicketWithRadius(TicketType.PLAYER_LOADING, chunkPos, 0);
+                    level.getChunk(cx, cz);
+                    step.set(2);
+                    helper.assertTrue(false, "chunk reloading for the filter probe");
+                }
+                case 2 -> {
+                    helper.assertTrue(settle.incrementAndGet() >= 2,
+                            "waiting for post-reload light to settle (byte determinism)");
+                    var chunk = level.getChunk(cx, cz);
+                    var filter = service.getDirtyContentFilter();
+                    helper.assertTrue(filter.contentChanged(level, chunk, dim),
+                            "PINNED GAP: a disk-read serve must NOT seed the dirty filter "
+                                    + "(today's behavior — the warm-rejoin re-send wave source). "
+                                    + "If seeding was added intentionally, flip this pin.");
+                    helper.assertTrue(!filter.contentChanged(level, chunk, dim),
+                            "control: the check above must have baselined the live filter");
+                    chunkSource.removeTicketWithRadius(TicketType.PLAYER_LOADING, chunkPos, 0);
+                    service.shutdown();
+                    playerList.remove(mock);
+                }
+                default -> helper.fail("unexpected disk-seed step " + step.get());
+            }
+        });
+    }
+
+    /**
+     * FP-054: a served column that becomes ALL-AIR re-resolves — after the dirty
+     * invalidation + done-bit clear the broadcaster performs — as a single UP_TO_DATE
+     * status with NO column payload: the server never ships an empty-section
+     * VoxelColumn frame ({@code enqueueLoadedColumn} rejects null/empty bytes). Pinned at
+     * the captured SendAction; consumer-visible emptiness therefore depends entirely on
+     * the client's handling of up-to-date for a dirty position (cross-ref CL-074, the
+     * H-11/H-25 stale-geometry class). The send-action drain is captured manually — the
+     * service is never ticked, so the recorder is the only drainer.
+     */
+    @GameTest(structure = "fabric-gametest-api-v1:empty", maxTicks = 600)
+    public void becomesAllAirReServeResolvesUpToDateWithNoColumnPayload(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        var server = level.getServer();
+        var playerList = server.getPlayerList();
+        var origin = ChunkPos.containing(helper.absolutePos(BlockPos.ZERO));
+        int cx = origin.x() + ALL_AIR_TRANSITION_CHUNK_OFFSET;
+        int cz = origin.z() + 11;
+        var chunkPos = new ChunkPos(cx, cz);
+        var chunkSource = level.getChunkSource();
+        var dim = LSSConstants.DIM_STR_OVERWORLD;
+        long packed = PositionUtil.packPosition(cx, cz);
+
+        chunkSource.addTicketWithRadius(TicketType.PLAYER_LOADING, chunkPos, 0);
+        level.getChunk(cx, cz);
+
+        var mock = placeMockServerPlayer(helper);
+        var service = new RequestProcessingService(server);
+        var state = service.registerPlayer(mock, LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+        var proc = (FabricOffThreadProcessor) service.getOffThreadProcessor();
+        var uuid = mock.getUUID();
+        var limiter = new SharedBandwidthLimiter(1_073_741_824L);
+        var flushDiag = new TickDiagnostics();
+        var recordedTypes = new ArrayList<Byte>();
+        var recordedPositions = new ArrayList<Long>();
+        var step = new AtomicInteger();
+
+        helper.succeedWhen(() -> {
+            helper.assertTrue(helper.getTick() >= 2, "waiting for generation light to settle");
+            switch (step.get()) {
+                case 0 -> {
+                    var chunk = level.getChunk(cx, cz);
+                    var built = SectionSerializer.serializeColumn(level, chunk, cx, cz);
+                    helper.assertTrue(built.serializedSections() != null,
+                            "premise: the superflat column serves non-air content first");
+                    state.addRequest(packed, -1L);
+                    Long2ObjectMap<LoadedColumnData> probes = new Long2ObjectOpenHashMap<>();
+                    probes.put(packed, built);
+                    proc.postSnapshot(new TickSnapshot(Map.of(uuid, dim), Map.of(uuid, probes),
+                            LSSServerConfig.CONFIG.sendQueueLimitPerPlayer, false), List.of());
+                    step.set(1);
+                    helper.assertTrue(false, "first serve posted, awaiting flush");
+                }
+                case 1 -> {
+                    state.flushSendQueue(1_073_741_824L, limiter, flushDiag, p -> {});
+                    helper.assertTrue(state.getTotalSectionsSent() == 1,
+                            "waiting for the built column to serve and flush");
+                    // The column becomes all-air: strip every superflat layer.
+                    for (int x = 0; x < 16; x++) {
+                        for (int z = 0; z < 16; z++) {
+                            for (int y = -64; y <= -61; y++) {
+                                level.setBlock(new BlockPos(cx * 16 + x, y, cz * 16 + z),
+                                        Blocks.AIR.defaultBlockState(), 3);
+                            }
+                        }
+                    }
+                    var chunk = level.getChunk(cx, cz);
+                    var emptied = SectionSerializer.serializeColumn(level, chunk, cx, cz);
+                    helper.assertTrue(emptied.serializedSections() == null,
+                            "premise: the stripped column must serialize as all-air");
+                    // Broadcaster-equivalent dirty events, then the client's re-request with
+                    // its stored stamp; all posted before one snapshot = one mailbox take.
+                    proc.invalidateTimestamps(dim, new long[]{packed});
+                    proc.clearDiskReadDone(uuid, new long[]{packed});
+                    state.addRequest(packed, LSSConstants.epochSeconds() + 10_000);
+                    Long2ObjectMap<LoadedColumnData> probes = new Long2ObjectOpenHashMap<>();
+                    probes.put(packed, emptied);
+                    proc.postSnapshot(new TickSnapshot(Map.of(uuid, dim), Map.of(uuid, probes),
+                            LSSServerConfig.CONFIG.sendQueueLimitPerPlayer, false), List.of());
+                    step.set(2);
+                    helper.assertTrue(false, "all-air re-serve posted, awaiting the answer");
+                }
+                case 2 -> {
+                    proc.drainSendActions((st, types, positions, count) -> {
+                        for (int i = 0; i < count; i++) {
+                            recordedTypes.add(types[i]);
+                            recordedPositions.add(positions[i]);
+                        }
+                    });
+                    helper.assertTrue(!recordedPositions.isEmpty(),
+                            "waiting for the all-air re-serve to answer");
+                    helper.assertTrue(recordedPositions.size() == 1
+                                    && recordedPositions.get(0) == packed
+                                    && recordedTypes.get(0) == LSSConstants.RESPONSE_UP_TO_DATE,
+                            "the became-all-air re-serve must answer exactly one UP_TO_DATE "
+                                    + "for the position, got types=" + recordedTypes
+                                    + " positions=" + recordedPositions);
+                    helper.assertTrue(!state.hasEnqueuedColumn(packed),
+                            "no column payload may ship for an all-air column (the server "
+                                    + "never sends empty-section frames)");
+                    state.flushSendQueue(1_073_741_824L, limiter, flushDiag, p -> {});
+                    helper.assertTrue(state.getTotalSectionsSent() == 1,
+                            "the re-serve must not flush a second payload — emptiness travels "
+                                    + "as a status, not as bytes");
+                    helper.assertTrue(proc.getDiagnostics().getTotalInMemory() == 2,
+                            "premise: both requests must have taken the probe route, got "
+                                    + proc.getDiagnostics().getTotalInMemory());
+                    chunkSource.removeTicketWithRadius(TicketType.PLAYER_LOADING, chunkPos, 0);
+                    service.shutdown();
+                    playerList.remove(mock);
+                }
+                default -> helper.fail("unexpected all-air transition step " + step.get());
+            }
         });
     }
 

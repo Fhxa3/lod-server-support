@@ -52,6 +52,22 @@ public class PaperChunkGenerationService {
     private final int maxPerPlayerActive;
     private final int timeoutTicks;
 
+    /** Test seam: hands the async-load completion back to the main thread. Production
+     *  default is Bukkit's scheduler, which throws once the plugin is disabled —
+     *  tests inject throwing schedulers to pin that rejection containment. */
+    @FunctionalInterface
+    interface MainThreadScheduler {
+        void schedule(Runnable task) throws Exception;
+    }
+
+    // Wired in the constructor (default references the blank-final plugin field, which is
+    // not definitely assigned until the constructor body runs).
+    private MainThreadScheduler mainThreadScheduler;
+
+    void setMainThreadScheduler(MainThreadScheduler scheduler) {
+        this.mainThreadScheduler = scheduler;
+    }
+
     // Volatile is sufficient — only written from the main tick thread, read by /stats commands.
     private volatile long totalSubmitted = 0;
     private volatile long totalCompleted = 0;
@@ -63,6 +79,7 @@ public class PaperChunkGenerationService {
         this.maxConcurrent = config.generationConcurrencyLimitGlobal;
         this.maxPerPlayerActive = config.generationConcurrencyLimitPerPlayer;
         this.timeoutTicks = config.generationTimeoutSeconds * LSSConstants.TICKS_PER_SECOND;
+        this.mainThreadScheduler = task -> Bukkit.getScheduler().runTask(this.plugin, task);
     }
 
     /**
@@ -110,7 +127,7 @@ public class PaperChunkGenerationService {
             var readyChunk = ex == null ? chunk : null;
             // Ensure callback runs on the main thread — whenComplete does not guarantee thread
             try {
-                Bukkit.getScheduler().runTask(this.plugin, () ->
+                this.mainThreadScheduler.schedule(() ->
                         onChunkReady(key, level, readyChunk, cx, cz));
             } catch (Exception scheduleEx) {
                 // Plugin disabled during shutdown — do not call onChunkReady inline

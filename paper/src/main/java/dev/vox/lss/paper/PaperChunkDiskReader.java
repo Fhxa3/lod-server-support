@@ -2,6 +2,7 @@ package dev.vox.lss.paper;
 
 import dev.vox.lss.common.processing.AbstractChunkDiskReader;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.ChunkPos;
 
 import java.util.UUID;
 
@@ -12,15 +13,30 @@ import java.util.UUID;
  */
 public class PaperChunkDiskReader extends AbstractChunkDiskReader {
 
+    // Test seam: when set, replaces the chunkMap.read NMS call (always null in production).
+    // Volatile: set on the test thread, read on the submitting thread.
+    private volatile PaperNbtSectionSerializer.ChunkNbtRead readOverride;
+
     public PaperChunkDiskReader(int threadCount) {
         super(threadCount);
+    }
+
+    void setReadOverride(PaperNbtSectionSerializer.ChunkNbtRead read) {
+        this.readOverride = read;
     }
 
     public void submitReadDirect(UUID playerUuid, String dimension, ServerLevel level,
                                   int chunkX, int chunkZ, long submissionOrder) {
         var registryAccess = level.registryAccess();
-        var chunkMap = level.getChunkSource().chunkMap;
+        var override = this.readOverride;
+        PaperNbtSectionSerializer.ChunkNbtRead read;
+        if (override != null) {
+            read = override;
+        } else {
+            var chunkMap = level.getChunkSource().chunkMap;
+            read = (cx, cz) -> chunkMap.read(new ChunkPos(cx, cz));
+        }
         submitRead(playerUuid, chunkX, chunkZ, dimension, submissionOrder,
-                () -> PaperNbtSectionSerializer.readAndSerializeSections(chunkMap, registryAccess, chunkX, chunkZ));
+                () -> PaperNbtSectionSerializer.readAndSerializeSections(read, registryAccess, chunkX, chunkZ));
     }
 }

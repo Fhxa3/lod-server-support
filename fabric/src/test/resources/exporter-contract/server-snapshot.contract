@@ -1,0 +1,58 @@
+# Server snapshot schema contract — flattened "dotted.key=javatype" lines, sorted.
+# Shared lockstep literal for BenchmarkMetricsExporter.buildServerMetrics (Fabric) and
+# PaperSoakMetricsExporter.buildServerMetrics (Paper): ExporterContractTest and
+# PaperExporterContractTest both flatten a fully-populated snapshot map (one player,
+# disk reader present, probes armed as exactly "7:-3", timestamp cache holding one
+# "minecraft:overworld" entry) and require EXACT equality with these lines.
+# Editing this file is a wire-adjacent schema change: scripts/check_soak.py KNOWN keys
+# and docs/soak-test-design.md (PKG-CHK) must move in lockstep.
+bandwidth.total_bytes=long
+dedup.groups=int
+dirty.broadcast_positions=long
+dirty.marked_total=long
+dirty.pending=int
+disk.all_air=long
+disk.completed=long
+disk.errors=long
+disk.not_found=long
+disk.pending=int
+disk.pending_hw=int
+disk.read_ms_total=long
+disk.saturated=long
+disk.submitted=long
+disk.successful=long
+generation.active=int
+generation.active_hw=int
+generation.completed=long
+generation.removed_in_flight=long
+generation.submitted=long
+generation.timeouts=long
+jvm.gc_count=long
+jvm.gc_time_ms=long
+jvm.heap_used_mb=double
+mailbox_depth_hw=int
+mspt_avg_window=double
+players[].bytes=long
+players[].held_gen=int
+players[].held_sync=int
+players[].incoming_dropped=long
+players[].name=string
+players[].requests=long
+players[].send_queue=int
+players[].send_queue_hw=int
+players[].sent=long
+probe_hashes.7:-3=long
+service.bytes_sent=long
+service.columns_sent=long
+service.disk_resolved=long
+service.duplicate_skips=long
+service.gen_drained=long
+service.gen_rate_limited=long
+service.in_memory=long
+service.queue_full=long
+service.re_resolved=long
+service.requests_received=long
+service.sync_rate_limited=long
+service.up_to_date=long
+tscache.evictions=long
+tscache.size_per_dimension.minecraft:overworld=int

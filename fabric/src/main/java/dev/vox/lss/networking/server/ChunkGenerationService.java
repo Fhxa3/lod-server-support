@@ -39,12 +39,22 @@ public class ChunkGenerationService {
         }
     }
 
+    /** Serializes a completed chunk into wire-format column data. Test seam (D9): injectable
+     *  so a Throwable mid-serialization can be exercised against the release-in-finally
+     *  contract without corrupting a real chunk; production always wires
+     *  {@link SectionSerializer#serializeColumn}. */
+    @FunctionalInterface
+    public interface ColumnSerializer {
+        LoadedColumnData serialize(ServerLevel level, LevelChunk chunk, int cx, int cz);
+    }
+
     private final LinkedHashMap<PendingGenerationKey, PendingGeneration> active = new LinkedHashMap<>();
     private final Map<UUID, Integer> perPlayerActiveCount = new HashMap<>();
 
     private final int maxConcurrent;
     private final int maxPerPlayerActive;
     private final int timeoutTicks;
+    private final ColumnSerializer columnSerializer;
     private DirtyContentFilter dirtyContentFilter;
 
     // Volatile is sufficient — only written from the main tick thread, read by /stats commands.
@@ -54,9 +64,16 @@ public class ChunkGenerationService {
     private volatile long totalRemovedInFlight = 0;
 
     public ChunkGenerationService(LSSServerConfig config) {
+        this(config, SectionSerializer::serializeColumn);
+    }
+
+    /** Test seam constructor (see {@link ColumnSerializer}); zero behavior change when
+     *  default-wired through the production constructor above. */
+    public ChunkGenerationService(LSSServerConfig config, ColumnSerializer columnSerializer) {
         this.maxConcurrent = config.generationConcurrencyLimitGlobal;
         this.maxPerPlayerActive = config.generationConcurrencyLimitPerPlayer;
         this.timeoutTicks = config.generationTimeoutSeconds * LSSConstants.TICKS_PER_SECOND;
+        this.columnSerializer = columnSerializer;
     }
 
     /** Wired by RequestProcessingService after construction (it owns the filter). */
@@ -127,7 +144,7 @@ public class ChunkGenerationService {
                 if (ready == null) ready = new ArrayList<>();
                 try {
                     long columnTimestamp = LSSConstants.epochSeconds();
-                    LoadedColumnData columnData = SectionSerializer.serializeColumn(
+                    LoadedColumnData columnData = this.columnSerializer.serialize(
                             gen.level, chunk, gen.pos.x(), gen.pos.z());
                     String dimension = gen.level.dimension().identifier().toString();
 

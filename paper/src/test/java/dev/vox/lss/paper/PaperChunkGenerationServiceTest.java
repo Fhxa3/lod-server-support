@@ -21,6 +21,7 @@ import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.lighting.LayerLightEventListener;
 import net.minecraft.world.level.lighting.LevelLightEngine;
 import org.bukkit.Chunk;
+import org.bukkit.craftbukkit.CraftWorld;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -28,7 +29,10 @@ import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.RejectedExecutionException;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -435,5 +439,188 @@ class PaperChunkGenerationServiceTest {
         // A4 books balance: submitted == completed + timeouts + removed_in_flight
         assertEquals(svc.getTotalSubmitted(),
                 svc.getTotalCompleted() + svc.getTotalTimeouts() + svc.getTotalRemovedInFlight());
+    }
+
+    // ---- at-cap piggyback (PP-031) ----
+
+    @Test
+    void atCapPlayerStillPiggybacksOnAnActiveLaunch() {
+        var svc = new CapturingGenService(config(32, 1, 60)); // per-player cap 1
+        var level = overworldLevel();
+        UUID a = UUID.randomUUID(), b = UUID.randomUUID();
+
+        assertTrue(svc.submitGeneration(a, level, 0, 0, 1L));
+        assertTrue(svc.submitGeneration(b, level, 1, 0, 2L));
+        assertFalse(svc.submitGeneration(b, level, 2, 0, 3L), "b is at cap for fresh launches");
+        assertTrue(svc.submitGeneration(b, level, 0, 0, 4L),
+                "the existingActive branch runs BEFORE the cap checks: an at-cap player still "
+                        + "piggybacks (the column is being generated anyway — bouncing would only "
+                        + "delay the answer)");
+        assertEquals(2, svc.launches.size(), "the piggyback launched nothing new");
+    }
+
+    @Test
+    void piggybackCountsAgainstThePerPlayerCapUntilTheLaunchCompletes() {
+        var svc = new CapturingGenService(config(32, 2, 60)); // per-player cap 2
+        var level = overworldLevel();
+        UUID a = UUID.randomUUID(), b = UUID.randomUUID();
+
+        assertTrue(svc.submitGeneration(a, level, 0, 0, 1L)); // a: 1
+        assertTrue(svc.submitGeneration(b, level, 1, 0, 2L)); // b: 1
+        assertTrue(svc.submitGeneration(a, level, 1, 0, 3L)); // a piggybacks b's launch -> a: 2
+        assertFalse(svc.submitGeneration(a, level, 2, 0, 4L),
+                "the piggyback consumed a's second slot — fresh launches reject at cap");
+
+        svc.onChunkReady(svc.launches.get(1).key(), level, null, 1, 0);
+        assertEquals(2, svc.tick().size(), "completion fans out to b and the piggybacked a");
+        assertTrue(svc.submitGeneration(a, level, 2, 0, 5L), "completion freed the piggybacked slot");
+    }
+
+    // ---- timeout/resubmit stale-future race (PP-033 — pinned AS IS, no token redesign) ----
+
+    @Test
+    void staleCompletionAfterTimeoutConsumesTheResubmittedEntryBoundedAtOneLostAnswer() {
+        var svc = new CapturingGenService(config(32, 1, 1)); // cap 1, 1s timeout -> 20 ticks
+        var level = overworldLevel();
+        UUID a = UUID.randomUUID();
+
+        assertTrue(svc.submitGeneration(a, level, 0, 0, 1L)); // entry A
+        for (int t = 0; t < 21; t++) svc.tick();              // A times out; its failure drains
+        assertEquals(1L, svc.getTotalTimeouts());
+        assertEquals(0, svc.getActiveCount());
+
+        assertTrue(svc.submitGeneration(a, level, 0, 0, 2L)); // entry B: SAME PendingGenerationKey value
+        assertEquals(2, svc.launches.size());
+
+        // A's stale async load completes late and FAILED: key equality makes it consume
+        // entry B, answering B's waiter not-generated although B's own load would succeed.
+        svc.onChunkReady(svc.launches.get(0).key(), level, null, 0, 0);
+        var ready = svc.tick();
+        assertEquals(1, ready.size());
+        assertNull(ready.get(0).columnData());
+        assertEquals(2L, ready.get(0).submissionOrder(), "the stale completion consumed the NEW entry");
+
+        // B's real completion finds the entry gone: inert. The race loses AT MOST this one
+        // answer — the client's retry loop re-requests the position on a later scan.
+        svc.onChunkReady(svc.launches.get(1).key(), level, bukkitChunk(), 0, 0);
+        assertTrue(svc.tick().isEmpty(), "the discarded success emits nothing (<=1 answer lost)");
+        assertEquals(0, svc.getActiveCount());
+        assertEquals(svc.getTotalSubmitted(),
+                svc.getTotalCompleted() + svc.getTotalTimeouts() + svc.getTotalRemovedInFlight(),
+                "A4 books balance across the race (2 == 0 + 1 + 1)");
+        assertTrue(svc.submitGeneration(a, level, 9, 9, 3L),
+                "per-player counts intact: cap 1 admits a fresh launch (a leaked count would bounce it)");
+    }
+
+    @Test
+    void staleSuccessfulCompletionIsAdoptedByTheResubmittedEntry() {
+        var svc = new CapturingGenService(config(32, 1, 1));
+        UUID a = UUID.randomUUID();
+
+        // Success-path wiring (same as successFansOutSharedColumnDataToAllCallbacks)
+        var section = new LevelChunkSection(FACTORY);
+        section.setBlockState(0, 0, 0, Blocks.STONE.defaultBlockState());
+        var nmsChunk = mock(LevelChunk.class);
+        when(nmsChunk.getSections()).thenReturn(new LevelChunkSection[]{section});
+        var lightEngine = mock(LevelLightEngine.class);
+        when(lightEngine.getLayerListener(any())).thenReturn(mock(LayerLightEventListener.class));
+        var chunkSource = mock(ServerChunkCache.class);
+        when(chunkSource.getChunkNow(0, 0)).thenReturn(nmsChunk);
+        var level = overworldLevel();
+        when(level.getChunkSource()).thenReturn(chunkSource);
+        when(level.getLightEngine()).thenReturn(lightEngine);
+
+        assertTrue(svc.submitGeneration(a, level, 0, 0, 1L)); // entry A
+        for (int t = 0; t < 21; t++) svc.tick();              // A times out
+        assertTrue(svc.submitGeneration(a, level, 0, 0, 2L)); // entry B
+
+        svc.onChunkReady(svc.launches.get(0).key(), level, bukkitChunk(), 0, 0); // stale SUCCESS
+        var ready = svc.tick();
+        assertEquals(1, ready.size());
+        assertNotNull(ready.get(0).columnData(),
+                "B's waiter adopts A's stale data — same coordinates, zero answers lost");
+        assertEquals(2L, ready.get(0).submissionOrder());
+        assertEquals(1L, svc.getTotalCompleted());
+
+        svc.onChunkReady(svc.launches.get(1).key(), level, bukkitChunk(), 0, 0); // B's own: inert
+        assertTrue(svc.tick().isEmpty());
+        assertEquals(svc.getTotalSubmitted(),
+                svc.getTotalCompleted() + svc.getTotalTimeouts() + svc.getTotalRemovedInFlight(),
+                "A4 books balance (2 == 1 + 1 + 0)");
+    }
+
+    // ---- scheduler-rejection containment through the REAL launchAsyncLoad (PP-030) ----
+
+    @Test
+    void schedulerRejectionAfterAsyncCompletionNeverRunsTheCallbackInline() {
+        var svc = new PaperChunkGenerationService(config(32, 4, 60), null); // real launchAsyncLoad
+        var future = new CompletableFuture<Chunk>();
+        var level = overworldLevel();
+        var world = mock(CraftWorld.class);
+        when(level.getWorld()).thenReturn(world);
+        when(world.getChunkAtAsync(7, -3, true, false)).thenReturn(future);
+        svc.setMainThreadScheduler(task -> { throw new RejectedExecutionException("plugin disabled"); });
+
+        UUID a = UUID.randomUUID();
+        assertTrue(svc.submitGeneration(a, level, 7, -3, 1L));
+        assertEquals(1, svc.getActiveCount());
+
+        // The async load completes while the plugin is shutting down: schedule() throws.
+        assertDoesNotThrow(() -> future.complete(bukkitChunk()),
+                "the rejection must be contained inside the completion callback");
+        assertEquals(1, svc.getActiveCount(),
+                "onChunkReady must NOT run inline on the async thread (active map is main-thread-only)");
+        assertTrue(svc.tick().isEmpty(), "no outcome was fabricated off-thread");
+
+        svc.shutdown(); // shutdown() owns the cleanup the skipped callback would have raced
+        assertEquals(0, svc.getActiveCount());
+    }
+
+    @Test
+    void realLaunchRoutesTheCompletionThroughTheMainThreadScheduler() {
+        var svc = new PaperChunkGenerationService(config(32, 4, 60), null); // real launchAsyncLoad
+        var future = new CompletableFuture<Chunk>();
+        var level = overworldLevel();
+        var world = mock(CraftWorld.class);
+        when(level.getWorld()).thenReturn(world);
+        when(world.getChunkAtAsync(2, 2, true, false)).thenReturn(future);
+        var scheduled = new ArrayList<Runnable>();
+        svc.setMainThreadScheduler(scheduled::add);
+
+        UUID a = UUID.randomUUID();
+        assertTrue(svc.submitGeneration(a, level, 2, 2, 5L));
+        assertTrue(scheduled.isEmpty(), "nothing is scheduled until the async load completes");
+
+        future.completeExceptionally(new RuntimeException("load failed"));
+        assertEquals(1, scheduled.size(), "completion hands exactly one task to the main thread");
+        assertEquals(1, svc.getActiveCount(), "the entry is consumed by the TASK, not the completion");
+
+        scheduled.get(0).run(); // main-thread tick runs the callback
+        var ready = svc.tick();
+        assertEquals(1, ready.size());
+        assertNull(ready.get(0).columnData(), "an exceptionally-completed load is a failure outcome");
+        assertEquals(a, ready.get(0).playerUuid());
+        assertEquals(0, svc.getActiveCount());
+        assertEquals(1L, svc.getTotalRemovedInFlight());
+    }
+
+    // ---- shutdown vs in-flight callbacks (PP-038 unit leg) ----
+
+    @Test
+    void shutdownClearsActiveAndLateAsyncCallbacksAreInert() {
+        var svc = new CapturingGenService(config(32, 4, 60));
+        var level = overworldLevel();
+        UUID a = UUID.randomUUID(), b = UUID.randomUUID();
+        assertTrue(svc.submitGeneration(a, level, 0, 0, 1L));
+        assertTrue(svc.submitGeneration(b, level, 1, 0, 2L));
+
+        svc.shutdown();
+        assertEquals(0, svc.getActiveCount());
+
+        // The in-flight async callbacks fire after onDisable: both shapes must be no-ops.
+        assertDoesNotThrow(() -> svc.onChunkReady(svc.launches.get(0).key(), level, bukkitChunk(), 0, 0));
+        assertDoesNotThrow(() -> svc.onChunkReady(svc.launches.get(1).key(), level, null, 1, 0));
+        assertTrue(svc.tick().isEmpty(), "late callbacks emit nothing into a cleared service");
+        assertEquals(0L, svc.getTotalCompleted());
     }
 }

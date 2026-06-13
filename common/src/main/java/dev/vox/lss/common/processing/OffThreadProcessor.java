@@ -493,6 +493,36 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
         return this.ctx.diagnostics();
     }
 
+    /**
+     * Read-only internals view for the dev-only soak/benchmark exporters (dedup group
+     * count, mailbox depth, timestamp-cache occupancy/evictions). Harness seam only —
+     * production code never calls this. The dedup tracker is processing-thread-owned, so
+     * its size is read best-effort: a racing structural change reports {@code -1} instead
+     * of throwing into the caller's tick.
+     */
+    public HarnessInternals getHarnessInternals() {
+        int dedupGroups;
+        try {
+            dedupGroups = this.dedupTracker.size();
+        } catch (java.util.ConcurrentModificationException e) {
+            dedupGroups = -1;
+        }
+        int mailboxDepth;
+        synchronized (this.mailboxLock) {
+            mailboxDepth = (this.pendingSnapshot != null ? 1 : 0)
+                    + this.pendingGenerationReady.size()
+                    + this.pendingRemovals.size()
+                    + this.pendingInvalidations.size()
+                    + this.pendingDirtyClears.size();
+        }
+        return new HarnessInternals(dedupGroups, mailboxDepth,
+                this.timestampCache.getEvictionCount(), this.timestampCache.sizesPerDimension());
+    }
+
+    /** @see #getHarnessInternals() */
+    public record HarnessInternals(int dedupGroups, int mailboxDepth, long tscacheEvictions,
+                                   Map<String, Integer> tscacheSizePerDimension) {}
+
     public void shutdown() {
         this.postSnapshot(TickSnapshot.shutdownSentinel(), List.of());
         try {

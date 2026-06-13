@@ -18,6 +18,28 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class LSSApi {
     private static final List<VoxelColumnConsumer> columnConsumers = new CopyOnWriteArrayList<>();
 
+    /**
+     * Receives {@link #dispatchColumn}'s implicit ingest-failure reports (a throwing
+     * consumer). Test seam — production default restored by {@link #resetReportSink()};
+     * package-private so only same-package tests can swap it.
+     */
+    @FunctionalInterface
+    interface ReportSink {
+        void report(ResourceKey<Level> dimension, int chunkX, int chunkZ);
+    }
+
+    // Test seam, default-wired to production (zero behavior change when default-wired).
+    static ReportSink reportSink;
+
+    static {
+        resetReportSink();
+    }
+
+    /** Restores production wiring for the test seam. */
+    static void resetReportSink() {
+        reportSink = LSSClientNetworking::reportIngestFailure;
+    }
+
     private LSSApi() {}
 
     /**
@@ -91,9 +113,10 @@ public final class LSSApi {
                 LSSLogger.error("Voxel column consumer threw exception", e);
                 // A throw means the column was not ingested — treat it like an explicit
                 // reportIngestFailure so the position is re-served instead of becoming a
-                // permanent hole. Chronic throwers are bounded by the per-position
-                // failure cap before the position parks.
-                LSSClientNetworking.reportIngestFailure(dimension, chunkX, chunkZ);
+                // permanent hole: exactly one report per failing consumer per delivery.
+                // Chronic throwers are bounded by the per-position failure cap before
+                // the position parks.
+                reportSink.report(dimension, chunkX, chunkZ);
             }
         }
     }

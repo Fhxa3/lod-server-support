@@ -2,12 +2,17 @@ package dev.vox.lss.networking.client;
 
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.compat.ModCompat;
 import dev.vox.lss.config.LSSClientConfig;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import me.cortex.voxy.client.config.VoxyConfig;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
+import java.util.function.LongPredicate;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -55,6 +60,70 @@ class SpiralScannerTest {
             queue.skip();
         }
         return out;
+    }
+
+    /** fireScan with full control of center, budget-scale inputs, and the in-flight predicate. */
+    private static int fireScanFull(SpiralScanner s, int cx, int cz, int viewDistance,
+                                    int columnQueueSize, int columnQueueHaltThreshold, int missingVanilla,
+                                    ColumnStateMap columns, LongPredicate isInFlight, RequestQueue queue) {
+        for (int i = 0; i < LSSConstants.TICKS_PER_SECOND + 1; i++) {
+            int n = s.maybeScan(cx, cz, viewDistance, columnQueueSize, columnQueueHaltThreshold,
+                    () -> missingVanilla, columns, isInFlight, queue);
+            if (n >= 0) return n;
+        }
+        throw new AssertionError("scan cadence never fired");
+    }
+
+    /** Seed every position in rings rFrom..rTo around (CX, CZ) as received + validated. */
+    private static void seedSatisfied(ColumnStateMap columns, int rFrom, int rTo) {
+        int[] c = new int[2];
+        for (int r = rFrom; r <= rTo; r++) {
+            for (int i = 0; i < 8 * r; i++) {
+                SpiralScanner.ringIndexToCoord(r, i, CX, CZ, c);
+                long packed = PositionUtil.packPosition(c[0], c[1]);
+                columns.onReceived(packed, 1000L);
+                columns.markSent(packed);
+                columns.onUpToDate(packed);
+            }
+        }
+    }
+
+    private static long ringPos(int r, int i) {
+        int[] c = new int[2];
+        SpiralScanner.ringIndexToCoord(r, i, CX, CZ, c);
+        return PositionUtil.packPosition(c[0], c[1]);
+    }
+
+    private static boolean allSatisfied(ColumnStateMap columns, int rFrom, int rTo) {
+        int[] c = new int[2];
+        for (int r = rFrom; r <= rTo; r++) {
+            for (int i = 0; i < 8 * r; i++) {
+                SpiralScanner.ringIndexToCoord(r, i, CX, CZ, c);
+                if (columns.classify(PositionUtil.packPosition(c[0], c[1]), true) != ColumnStateMap.SATISFIED) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Flips the private ModCompat gate the scanner's voxy-distance query checks first. */
+    private static void setVoxyLoaded(boolean value) throws Exception {
+        var field = ModCompat.class.getDeclaredField("voxyLoaded");
+        field.setAccessible(true);
+        field.setBoolean(null, value);
+    }
+
+    /**
+     * Drives a full invocation-based staleness window (20 calls) so the returned value
+     * reflects the live VoxyConfig regardless of the counter's current phase.
+     */
+    private static int refreshedEffectiveDistance(SpiralScanner s) {
+        int last = -1;
+        for (int i = 0; i < LSSConstants.TICKS_PER_SECOND; i++) {
+            last = s.getEffectiveLodDistance();
+        }
+        return last;
     }
 
     @Test
@@ -267,6 +336,391 @@ class SpiralScannerTest {
                         "duplicate position in ring " + r);
             }
             assertEquals(8 * r, seen.size());
+        }
+    }
+
+    // ---- cadence priming (CL-001) ----
+
+    @Test
+    void firstMaybeScanAfterResetFiresImmediately() {
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+
+        // A fresh scanner is primed: the very FIRST cadence call must fire (join burst),
+        // not the 20th — the fireScan helper used elsewhere cannot tell those apart.
+        int first = s.maybeScan(CX, CZ, 2, 0, 1000, () -> 0, new ColumnStateMap(), pos -> false, queue);
+        assertEquals(8 * 3 + 8 * 4, first, "first maybeScan on a fresh scanner must fire and queue the annulus");
+
+        // reset() (new session / flushCache) re-primes: again a single call fires.
+        s.reset();
+        int afterReset = s.maybeScan(CX, CZ, 2, 0, 1000, () -> 0, new ColumnStateMap(), pos -> false, queue);
+        assertEquals(8 * 3 + 8 * 4, afterReset, "first maybeScan after reset() must fire immediately");
+    }
+
+    // ---- zero-budget remainder preservation (CL-005) ----
+
+    @Test
+    void zeroBudgetScanPreservesCommittedRemainder() {
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+        var columns = new ColumnStateMap();
+        assertEquals(56, fireScan(s, 2, columns, queue), "precondition: a committed scan result");
+        queue.skip(); // the manager drains a couple of entries...
+        queue.skip(); // ...and the rest must keep draining on later ticks
+        long expectedHead = queue.peekPosition();
+        int expectedRemaining = queue.remaining();
+
+        // Next cadence firing computes budget 0 (whole vanilla exclusion disc missing) and
+        // must return before any queue write — a commit(0) here would wipe the remainder.
+        assertEquals(0, fireScan(s, 2, 0, 1000, 25, columns, queue), "zero-budget scan queues nothing");
+
+        assertEquals(expectedRemaining, queue.remaining(),
+                "a zero-budget scan must not commit(0)-wipe the undrained remainder");
+        assertEquals(expectedHead, queue.peekPosition(), "remainder content untouched");
+    }
+
+    // ---- degenerate exclusion coverage (CL-007) ----
+
+    @Test
+    void viewDistanceCoveringLodDistanceConfirmsWithoutRequests() {
+        // vd == lod: vanilla already renders the whole disc — nothing to request.
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+        assertEquals(0, fireScan(s, 4, new ColumnStateMap(), queue), "vanilla covers the whole disc");
+        assertEquals(5, s.getConfirmedRing(), "exclusion-skipped disc confirms to lodDistance+1");
+        assertEquals(0, fireScan(s, 4, new ColumnStateMap(), queue), "no spin: stays settled");
+        assertEquals(5, s.getConfirmedRing());
+
+        // vd > lod: confirmation still caps at lod+1, never tracks the overshooting exclusion.
+        var s2 = scanner(4, 100, 100);
+        assertEquals(0, fireScan(s2, 6, new ColumnStateMap(), queue));
+        assertEquals(5, s2.getConfirmedRing(), "confirmation caps at lodDistance+1 when vd overshoots");
+    }
+
+    // ---- backoff latch is level-triggered (CL-008) ----
+
+    @Test
+    void multipleRateLimitNoticesBeforeOneScanConsumeExactlyOneSkip() {
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+        s.noteRateLimited();
+        s.noteRateLimited();
+        s.noteRateLimited();
+        assertEquals(0, fireScan(s, 2, new ColumnStateMap(), queue), "one skipped scan");
+        assertTrue(fireScan(s, 2, new ColumnStateMap(), queue) > 0,
+                "level-triggered latch: N rate-limit notices cost exactly one skip, not N");
+    }
+
+    // ---- reset matrix: movement / dimension change / disconnect (CL-016) ----
+
+    @Test
+    void movementResetZeroesConfirmedRingRestartsCadenceAndKeepsMarks() {
+        var columns = new ColumnStateMap();
+        seedSatisfied(columns, 3, 4);
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+        assertEquals(0, fireScan(s, 2, columns, queue));
+        assertEquals(5, s.getConfirmedRing(), "precondition: disc confirmed");
+        long retried = ringPos(4, 0);
+        columns.markRetry(retried);
+        s.noteRateLimited();
+
+        s.resetScanCounter(); // the movement path (LodRequestManager.tick: prune + resetScanCounter)
+
+        assertEquals(0, s.getConfirmedRing(),
+                "movement reset must zero ring confirmation (SpiralScanner.resetScanCounter)");
+        assertEquals(-1, s.maybeScan(CX, CZ, 2, 0, 1000, () -> 0, columns, p -> false, queue),
+                "resetScanCounter restarts the full 20-tick cadence (a debounce, unlike reset())");
+        assertTrue(columns.hasRetries(), "movement preserves in-range retry marks");
+        assertEquals(0, fireScan(s, 2, columns, queue), "pending rate-limit backoff survives movement");
+        assertEquals(1, fireScan(s, 2, columns, queue), "next scan re-walks the disc and queues the retry");
+        assertEquals(List.of(retried), drain(queue));
+    }
+
+    @Test
+    void dimensionChangeClearsMapMarksBackoffQueueAndRecomputesScanStats() {
+        var columns = new ColumnStateMap();
+        int[] c = new int[2];
+        for (int i = 0; i < 8 * 3; i++) { // ring 3: not-generated stamps (gen candidates)
+            SpiralScanner.ringIndexToCoord(3, i, CX, CZ, c);
+            columns.onNotGenerated(PositionUtil.packPosition(c[0], c[1]));
+        }
+        seedSatisfied(columns, 4, 4);
+        var s = scanner(4, 100, 1); // genCap 4
+        var queue = new RequestQueue();
+        assertEquals(4, fireScan(s, 2, columns, queue), "precondition: gen-capped scan");
+        assertEquals(4, s.getLastGenQueued());
+        columns.markRetry(ringPos(4, 0));
+        s.noteRateLimited();
+
+        // The production dimension-change sequence (LodRequestManager.onDimensionChange).
+        columns.clear();
+        queue.clear();
+        s.resetScanCounter();
+        s.clearSkipNextScan();
+
+        assertEquals(0, s.getConfirmedRing(), "dimension change must zero ring confirmation");
+        assertFalse(columns.hasRetries(), "map clear drops retry marks with the old dimension");
+        assertFalse(queue.hasNext(), "the old dimension's queued requests are dropped");
+        int n = fireScan(s, 2, columns, queue);
+        assertEquals(8 * 3 + 8 * 4, n, "no backoff pending; the full annulus re-requests as unknown");
+        assertEquals(0, s.getLastGenQueued(), "scan stats recomputed for the fresh scan, never stale");
+        assertEquals(n, s.getLastSyncQueued(), "everything re-asks sync after the map clear");
+        while (queue.hasNext()) {
+            assertEquals(-1L, queue.peekTimestamp(), "cleared map re-requests with ts=-1, not stale stamps");
+            queue.skip();
+        }
+    }
+
+    @Test
+    void disconnectRejoinFullResetPrimesImmediateScanAndDropsBackoff() {
+        var columns = new ColumnStateMap();
+        seedSatisfied(columns, 3, 4);
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+        assertEquals(0, fireScan(s, 2, columns, queue));
+        assertEquals(5, s.getConfirmedRing(), "precondition: disc confirmed");
+        columns.markRetry(ringPos(3, 5));
+        s.noteRateLimited();
+
+        // Production disconnect→rejoin: disconnect() clears only the tracker; the new
+        // session's onSessionConfig runs resetRequestState() (columns.clear) + scanner.reset().
+        columns.clear();
+        s.reset();
+
+        assertEquals(0, s.getConfirmedRing(), "reset() zeroes ring confirmation");
+        assertFalse(columns.hasRetries(), "session state cleared with the map");
+        int first = s.maybeScan(CX, CZ, 2, 0, 1000, () -> 0, columns, p -> false, queue);
+        assertEquals(8 * 3 + 8 * 4, first,
+                "reset() primes the cadence: the rejoin scan fires on the FIRST call with the backoff discarded");
+    }
+
+    // ---- lod distance shrink/grow (CL-015) ----
+
+    @Test
+    void lodDistanceShrinkThenGrowRescansTheOuterBandWithoutStranding() {
+        int saved = LSSClientConfig.CONFIG.lodDistanceChunks;
+        try {
+            LSSClientConfig.CONFIG.lodDistanceChunks = 0; // server distance (8) in effect
+            var columns = new ColumnStateMap();
+            seedSatisfied(columns, 3, 8);
+            var s = scanner(8, 100, 100);
+            var queue = new RequestQueue();
+            assertEquals(0, fireScan(s, 2, columns, queue));
+            assertEquals(9, s.getConfirmedRing(), "precondition: confirmed at d=8");
+
+            LSSClientConfig.CONFIG.lodDistanceChunks = 4; // shrink
+            assertEquals(0, fireScan(s, 2, columns, queue), "shrunk scan is a clean no-op");
+            assertEquals(9, s.getConfirmedRing(), "confirmation may sit beyond the shrunk distance");
+
+            // Two ring-7 columns get ingest-rejected while shrunk: unstamped + retry-marked,
+            // but ring 7 sits beyond the shrunk distance, so scans cannot reach them yet —
+            // the exact "stranded past the old confirmed radius" candidate.
+            long a = ringPos(7, 0);
+            long b = ringPos(7, 21);
+            columns.onIngestFailed(a);
+            columns.onIngestFailed(b);
+            assertEquals(0, fireScan(s, 2, columns, queue), "retries beyond the shrunk lod are not requested");
+            assertTrue(columns.hasRetries(), "...but must not be lost while out of scan range");
+
+            LSSClientConfig.CONFIG.lodDistanceChunks = 0; // grow back to the server's 8
+            assertEquals(2, fireScan(s, 2, columns, queue), "grown scan re-walks and re-queues the outer band");
+            var requeued = new java.util.HashSet<Long>();
+            while (queue.hasNext()) {
+                requeued.add(queue.peekPosition());
+                assertEquals(-1L, queue.peekTimestamp(), "unstamped positions re-ask as unknown");
+                queue.skip();
+            }
+            assertEquals(java.util.Set.of(a, b), requeued, "exactly the stranded outer-band positions re-queue");
+
+            columns.markSent(a);
+            columns.onReceived(a, 9000L);
+            columns.markSent(b);
+            columns.onReceived(b, 9000L);
+            assertEquals(0, fireScan(s, 2, columns, queue));
+            assertEquals(9, s.getConfirmedRing(), "nothing strands past the old confirmed radius");
+        } finally {
+            LSSClientConfig.CONFIG.lodDistanceChunks = saved;
+        }
+    }
+
+    // ---- dirty under the vanilla exclusion (CL-018) ----
+
+    @Test
+    void dirtyUnderVanillaExclusionParksUntilTheExclusionMovesOff() {
+        var columns = new ColumnStateMap();
+        long covered = ringPos(2, 0); // inside the viewDistance-2 exclusion square
+        columns.onReceived(covered, 4321L);
+        seedSatisfied(columns, 3, 4);
+        var s = scanner(4, 100, 100);
+        var queue = new RequestQueue();
+        assertEquals(0, fireScan(s, 2, columns, queue));
+
+        assertTrue(columns.markDirtyIfKnown(covered));
+        s.resetScanCounter(); // production dirty-broadcast path (LodRequestManager.onDirtyColumns)
+
+        assertEquals(0, fireScan(s, 2, columns, queue),
+                "a dirty column under vanilla coverage must not be re-requested (vanilla renders it live)");
+        assertEquals(1, columns.dirtyCount(), "the mark parks instead of being consumed or dropped");
+        assertEquals(0, fireScan(s, 2, columns, queue), "stays parked while covered");
+        assertEquals(1, columns.dirtyCount());
+
+        // The player moves +1 chunk: the exclusion square moves off the dirty column.
+        columns.pruneOutOfRange(1, 0, 64); // production movement order: prune...
+        s.resetScanCounter();              // ...then resetScanCounter (LodRequestManager.tick)
+        int queued = fireScanFull(s, 1, 0, 2, 0, 1000, 0, columns, pos -> false, queue);
+        assertTrue(queued > 0, "the un-covered scan must queue something");
+        boolean foundCovered = false;
+        while (queue.hasNext()) {
+            if (queue.peekPosition() == covered) {
+                foundCovered = true;
+                assertEquals(4321L, queue.peekTimestamp(),
+                        "the drained dirty re-request must carry the STORED timestamp (resync, not refetch)");
+            }
+            queue.skip();
+        }
+        assertTrue(foundCovered, "the parked dirty column must drain once the exclusion moves off");
+        assertEquals(1, columns.dirtyCount(), "scanning queues it; only the actual send consumes the mark");
+        columns.markSent(covered);
+        assertEquals(0, columns.dirtyCount());
+    }
+
+    // ---- voxy distance arm (CL-011, CL-012) ----
+
+    @Test
+    void voxyDistanceRefreshIsInvocationCountBasedNotTickBased() throws Exception {
+        // Pins the staleness counter at SpiralScanner.getCachedVoxyDistance as INVOCATION
+        // based: the 20th getEffectiveLodDistance call refreshes, regardless of game ticks
+        // (the "rechecked once per second" comment holds only while exactly one caller
+        // queries once per scan). ModCompat's gate is flipped reflectively and MUST be
+        // restored — a leak makes VoxyCompatTest#modCompatStaysInertWithoutVoxyMod and
+        // #effectiveLodDistanceIsMinOfServerAndClientOverride order-dependent.
+        int savedClient = LSSClientConfig.CONFIG.lodDistanceChunks;
+        setVoxyLoaded(true);
+        try {
+            LSSClientConfig.CONFIG.lodDistanceChunks = 0;
+            VoxyConfig.reset();
+            VoxyConfig.CONFIG.sectionRenderDistance = 0.25f; // 8 chunks
+            var s = scanner(10, 100, 100);
+            for (int call = 1; call < LSSConstants.TICKS_PER_SECOND; call++) {
+                assertEquals(10, s.getEffectiveLodDistance(),
+                        "call " + call + " still serves the stale not-present cache");
+            }
+            assertEquals(8, s.getEffectiveLodDistance(), "the 20th invocation refreshes from VoxyConfig");
+
+            VoxyConfig.CONFIG.sectionRenderDistance = 0.125f; // 4 chunks — invisible until the next window
+            for (int call = 1; call < LSSConstants.TICKS_PER_SECOND; call++) {
+                assertEquals(8, s.getEffectiveLodDistance(),
+                        "call " + call + " of the next window serves the cached 8");
+            }
+            assertEquals(4, s.getEffectiveLodDistance(), "refresh window is a fresh 20 invocations");
+        } finally {
+            setVoxyLoaded(false);
+            VoxyConfig.reset();
+            LSSClientConfig.CONFIG.lodDistanceChunks = savedClient;
+        }
+    }
+
+    @Test
+    void voxyDistanceParticipatesInMinLadderOnlyWhenPositive() throws Exception {
+        int savedClient = LSSClientConfig.CONFIG.lodDistanceChunks;
+        setVoxyLoaded(true);
+        try {
+            LSSClientConfig.CONFIG.lodDistanceChunks = 0;
+            VoxyConfig.reset(); // sectionRenderDistance 0 → voxy distance 0
+            var s = scanner(10, 100, 100);
+            assertEquals(10, refreshedEffectiveDistance(s), "voxy distance 0 is ignored (not-configured sentinel)");
+
+            VoxyConfig.CONFIG.sectionRenderDistance = 0.25f; // 8 chunks
+            assertEquals(8, refreshedEffectiveDistance(s), "voxy>0 below the server distance clamps it down");
+
+            VoxyConfig.CONFIG.sectionRenderDistance = 1.0f; // 32 chunks
+            assertEquals(10, refreshedEffectiveDistance(s), "voxy above the effective distance has no effect");
+        } finally {
+            setVoxyLoaded(false);
+            VoxyConfig.reset();
+            LSSClientConfig.CONFIG.lodDistanceChunks = savedClient;
+        }
+    }
+
+    // ---- orphan-freedom property (CL-014) ----
+
+    /**
+     * Property test over seeded-random interleavings of the four hazards that historically
+     * orphaned positions (budget exhaustion, gen-cap skips, rate-limit backoff, timeout
+     * eviction), driving the scanner exactly the way LodRequestManager does (drainQueue
+     * skip rules, markSent, response handlers, sweepTimeouts marking retries). After any
+     * chaos prefix, once responses flow normally every in-range position must be re-emitted
+     * and converge: a single silently-orphaned position (e.g. ring confirmation advancing
+     * past an unserved position) never converges and fails the scan bound.
+     */
+    @Test
+    void anyChaosInterleavingLeavesNoPositionPermanentlyOrphaned() {
+        final int vd = 2, lod = 6;
+        for (long seed : new long[] {1L, 7L, 42L}) {
+            var rng = new Random(seed);
+            var columns = new ColumnStateMap();
+            var queue = new RequestQueue();
+            var s = scanner(lod, 10, 2); // budget 40, genCap 8
+            var inFlight = new LongOpenHashSet();
+            record Scheduled(long pos, int dueCycle, boolean evict) {}
+            var scheduled = new ArrayList<Scheduled>();
+
+            for (int cycle = 0; cycle < 30; cycle++) {
+                for (var iter = scheduled.iterator(); iter.hasNext(); ) {
+                    var ev = iter.next();
+                    if (ev.dueCycle() > cycle) continue;
+                    iter.remove();
+                    inFlight.remove(ev.pos());
+                    if (ev.evict()) columns.markRetry(ev.pos());       // sweepTimeouts eviction
+                    else columns.onReceived(ev.pos(), 1_000L + cycle); // late response
+                }
+                fireScanFull(s, CX, CZ, vd, rng.nextInt(900), 1000, rng.nextInt(26),
+                        columns, inFlight::contains, queue);
+                int cyc = cycle;
+                while (queue.hasNext()) {
+                    long pos = queue.peekPosition();
+                    queue.skip();
+                    int cheb = Math.max(Math.abs(PositionUtil.unpackX(pos) - CX),
+                            Math.abs(PositionUtil.unpackZ(pos) - CZ));
+                    assertTrue(cheb > vd && cheb <= lod,
+                            "seed " + seed + ": scan emitted out-of-range Chebyshev " + cheb);
+                    if (inFlight.contains(pos)) continue;                                  // drainQueue skip
+                    if (columns.classify(pos, true) == ColumnStateMap.SATISFIED) continue; // drainQueue skip
+                    columns.markSent(pos);
+                    inFlight.add(pos);
+                    int roll = rng.nextInt(100);
+                    if (roll < 30) { inFlight.remove(pos); columns.onReceived(pos, 1_000L + cyc); }
+                    else if (roll < 45) { inFlight.remove(pos); columns.markRetry(pos); s.noteRateLimited(); }
+                    else if (roll < 60) { inFlight.remove(pos); columns.onNotGenerated(pos); }
+                    else if (roll < 70) { inFlight.remove(pos); columns.onUpToDate(pos); }
+                    else if (roll < 85) { scheduled.add(new Scheduled(pos, cyc + 1 + rng.nextInt(3), false)); }
+                    else { scheduled.add(new Scheduled(pos, cyc + 2, true)); }
+                }
+            }
+            // Chaos over: flush still-in-flight requests as worst-case timeout evictions.
+            for (var ev : scheduled) {
+                inFlight.remove(ev.pos());
+                columns.markRetry(ev.pos());
+            }
+            scheduled.clear();
+            assertTrue(inFlight.isEmpty(), "seed " + seed + ": simulation leaked an in-flight position");
+
+            // Convergence: responses now always succeed; every position must be re-emitted.
+            boolean converged = false;
+            for (int i = 0; i < 40 && !converged; i++) {
+                int n = fireScanFull(s, CX, CZ, vd, 0, 1000, 0, columns, inFlight::contains, queue);
+                while (queue.hasNext()) {
+                    long pos = queue.peekPosition();
+                    queue.skip();
+                    if (columns.classify(pos, true) == ColumnStateMap.SATISFIED) continue;
+                    columns.markSent(pos);
+                    columns.onReceived(pos, 5_000L + i);
+                }
+                converged = n == 0 && s.getConfirmedRing() == lod + 1 && allSatisfied(columns, vd + 1, lod);
+            }
+            assertTrue(converged, "seed " + seed + ": chaos interleaving permanently orphaned a position"
+                    + " (confirmedRing=" + s.getConfirmedRing() + ")");
         }
     }
 }
