@@ -66,4 +66,79 @@ class RequestMetricsTest {
                 "requested positions count at send time (recordSendCycle)");
         assertEquals(2, m.getTotalSendCycles());
     }
+
+    // ---- RTT distribution (request->receive latency) ----
+
+    @Test
+    void rttPercentilesAreMinusOneWithNoSamples() {
+        var m = new RequestMetrics();
+        assertEquals(-1.0, m.getRttP50Ms(), "no samples -> sentinel, never a fabricated 0");
+        assertEquals(-1.0, m.getRttP95Ms());
+    }
+
+    @Test
+    void matchedSendThenReceiveRecordsOneRttSampleAndCountsTheColumn() {
+        var m = new RequestMetrics();
+        long p = 0x1234L;
+        m.recordRequestSent(p, 1_000L);
+        m.recordColumnReceived(p, 1_100L);
+        assertEquals(100.0, m.getRttP50Ms(), "sample == receive - send");
+        assertEquals(1, m.getTotalColumnsReceived(), "the position-keyed receive also counts the column");
+    }
+
+    @Test
+    void reSendOverwritesStampSoTheSampleMeasuresTheLatestAttempt() {
+        var m = new RequestMetrics();
+        long p = 0x55L;
+        m.recordRequestSent(p, 1_000L);
+        m.recordRequestSent(p, 1_500L); // re-send before any reply
+        m.recordColumnReceived(p, 1_600L);
+        assertEquals(100.0, m.getRttP50Ms(), "latest send (1500) is measured, not the original (1000)");
+    }
+
+    @Test
+    void receiveWithoutAPriorSendStampRecordsNoSampleButStillCountsTheColumn() {
+        var m = new RequestMetrics();
+        m.recordColumnReceived(0x99L, 1_100L); // never sent (e.g. a dirty-push delivery)
+        assertEquals(-1.0, m.getRttP50Ms(), "no stamp -> no RTT sample");
+        assertEquals(1, m.getTotalColumnsReceived());
+    }
+
+    @Test
+    void receiveBeforeTheStampedSendTimeIsDiscardedNotNegative() {
+        var m = new RequestMetrics();
+        long p = 7L;
+        m.recordRequestSent(p, 2_000L);
+        m.recordColumnReceived(p, 1_900L); // clock went backwards
+        assertEquals(-1.0, m.getRttP50Ms(), "a negative interval is dropped, never stored");
+    }
+
+    @Test
+    void resetClearsRttSamplesAndPendingStamps() {
+        var m = new RequestMetrics();
+        m.recordRequestSent(1L, 1_000L);
+        m.recordColumnReceived(1L, 1_050L);
+        assertEquals(50.0, m.getRttP50Ms(), "premise: one live sample");
+
+        m.recordRequestSent(2L, 1_000L); // a stamp that outlives the reset
+        m.reset();
+
+        assertEquals(-1.0, m.getRttP50Ms(), "reset clears the sample ring");
+        m.recordColumnReceived(2L, 1_500L); // the pre-reset stamp must be gone
+        assertEquals(-1.0, m.getRttP50Ms(), "a stamp cleared by reset yields no sample on later receipt");
+    }
+
+    @Test
+    void percentilesAreNearestRankOverAKnownSampleSet() {
+        var m = new RequestMetrics();
+        // Ten samples 10,20,...,100 ms (distinct positions). Send base is non-zero: epoch ms 0
+        // is the "absent stamp" sentinel, so a 0 send time would record no sample.
+        for (int i = 1; i <= 10; i++) {
+            m.recordRequestSent(i, 1_000L);
+            m.recordColumnReceived(i, 1_000L + i * 10L);
+        }
+        // nearest-rank: p50 -> ceil(0.50*10)-1 = index 4 -> 50; p95 -> ceil(0.95*10)-1 = index 9 -> 100
+        assertEquals(50.0, m.getRttP50Ms());
+        assertEquals(100.0, m.getRttP95Ms());
+    }
 }

@@ -41,6 +41,11 @@ public class DirtyContentFilter {
     private final Map<String, Long2LongOpenHashMap> hashesByDimension = new HashMap<>();
     private final ColumnSerializer serializer;
 
+    // Saves whose LOD-visible content matched the stored hash — the metadata-only re-saves this
+    // filter exists to suppress (vanilla's ~10s inhabitedTime re-saves). Closes the dirty
+    // conservation view: saves-observed == dirty.marked_total + dirty.suppressed_total.
+    private long totalSuppressed;
+
     /** Serializes a column to exactly the section bytes LSS serves (the hash input).
      *  Injectable for tests only — lets the exception fail-open path run without MC
      *  level/chunk objects; production always wires {@link SectionSerializer#serializeColumn}. */
@@ -93,6 +98,7 @@ public class DirtyContentFilter {
 
         long packed = PositionUtil.packPosition(cx, cz);
         boolean changed = storeHash(dimension, packed, hash);
+        if (!changed) this.totalSuppressed++; // metadata-only re-save the filter suppressed
         if (changed && Boolean.getBoolean("lss.soak.dirtydebug")) {
             LSSLogger.info("[DirtyDebug] re-marked " + cx + "," + cz
                     + " hash=" + Long.toHexString(hash) + " len=" + lastLen);
@@ -114,6 +120,11 @@ public class DirtyContentFilter {
         }
         long previous = hashes.put(packed, hash);
         return previous != hash;
+    }
+
+    /** Cumulative count of suppressed metadata-only re-saves (see {@link #totalSuppressed}). */
+    public synchronized long getTotalSuppressed() {
+        return this.totalSuppressed;
     }
 
     private static long hashContent(byte[] bytes) {

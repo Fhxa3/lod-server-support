@@ -10,6 +10,7 @@ import dev.vox.lss.common.tracking.DirtyColumnTracker;
 import dev.vox.lss.common.voxel.ColumnTimestampCache;
 import dev.vox.lss.networking.client.LodRequestManager;
 import dev.vox.lss.networking.server.ChunkGenerationService;
+import dev.vox.lss.networking.server.DirtyContentFilter;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -80,6 +81,7 @@ class ExporterContractTest {
         final TickDiagnostics tickDiag = new TickDiagnostics();
         TestDiskReader diskReader;
         final DirtyColumnTracker dirtyTracker = new DirtyColumnTracker();
+        final DirtyContentFilter dirtyContentFilter = new DirtyContentFilter();
         final SharedBandwidthLimiter bandwidthLimiter = new SharedBandwidthLimiter(1_000_000);
         final Map<UUID, TestState> players;
         final TestState state;
@@ -97,6 +99,7 @@ class ExporterContractTest {
         @Override public AbstractChunkDiskReader diskReader() { return this.diskReader; }
         @Override public ChunkGenerationService generationService() { return null; }
         @Override public DirtyColumnTracker dirtyTracker() { return this.dirtyTracker; }
+        @Override public DirtyContentFilter dirtyContentFilter() { return this.dirtyContentFilter; }
         @Override public SharedBandwidthLimiter bandwidthLimiter() { return this.bandwidthLimiter; }
         @Override public Collection<? extends AbstractPlayerRequestState<?>> players() {
             return this.players.values();

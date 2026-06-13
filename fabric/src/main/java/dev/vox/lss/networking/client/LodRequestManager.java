@@ -265,6 +265,10 @@ public class LodRequestManager {
     private void sendRequests(long[] positionBuffer, long[] timestampBuffer, int count) {
         try {
             this.batchSender.send(new BatchChunkRequestC2SPayload(positionBuffer, timestampBuffer, count));
+            long nowMs = System.currentTimeMillis();
+            for (int i = 0; i < count; i++) {
+                this.metrics.recordRequestSent(positionBuffer[i], nowMs); // RTT send stamp per position
+            }
         } catch (Exception e) {
             LSSLogger.error("Failed to send batch chunk request", e);
             for (int i = 0; i < count; i++) {
@@ -290,7 +294,7 @@ public class LodRequestManager {
         // timeout → silent-duplicate → second-timeout stall.
         this.tracker.removeByPosition(packed);
         this.columns.onReceived(packed, columnTimestamp);
-        this.metrics.recordColumnReceived();
+        this.metrics.recordColumnReceived(packed, System.currentTimeMillis()); // RTT sample + counter
     }
 
     public void onDirtyColumns(long[] dirtyPositions) {
@@ -452,6 +456,10 @@ public class LodRequestManager {
     // Rolling rates
     public double getReceiveRate() { return this.metrics.getReceiveRate(); }
     public double getRequestRate() { return this.metrics.getRequestRate(); }
+
+    // RTT distribution (nearest-rank percentiles over the retained sample ring; -1 when empty)
+    public double getRttP50Ms() { return this.metrics.getRttP50Ms(); }
+    public double getRttP95Ms() { return this.metrics.getRttP95Ms(); }
 
     // Concurrency
     public int getPendingCount() { return this.tracker.size(); }

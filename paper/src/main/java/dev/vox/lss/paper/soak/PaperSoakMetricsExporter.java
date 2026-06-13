@@ -227,6 +227,9 @@ public final class PaperSoakMetricsExporter {
         dirtyMap.put("pending", dirtyTracker.pendingCount());
         dirtyMap.put("broadcast_positions", dirtyTracker.getTotalDrained());
         dirtyMap.put("marked_total", dirtyTracker.getTotalMarked());
+        // Paper detects dirt by event (PaperWorldHandler), not content-hash — no suppression
+        // counter exists; zero-fill keeps the server snapshot schema identical to Fabric's.
+        dirtyMap.put("suppressed_total", 0L);
         result.put("dirty", dirtyMap);
 
         var bandwidthMap = new LinkedHashMap<String, Object>();

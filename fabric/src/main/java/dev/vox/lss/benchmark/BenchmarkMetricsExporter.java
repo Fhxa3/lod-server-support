@@ -11,6 +11,7 @@ import dev.vox.lss.common.processing.AbstractPlayerRequestState;
 import dev.vox.lss.common.processing.OffThreadProcessor;
 import dev.vox.lss.common.processing.TickDiagnostics;
 import dev.vox.lss.common.tracking.DirtyColumnTracker;
+import dev.vox.lss.networking.server.DirtyContentFilter;
 import dev.vox.lss.networking.client.LSSClientNetworking;
 import dev.vox.lss.networking.client.LodRequestManager;
 import dev.vox.lss.networking.server.ChunkGenerationService;
@@ -60,6 +61,8 @@ public final class BenchmarkMetricsExporter {
         /** Null when {@code enableChunkGeneration=false} — {@code generation.*} is then zero-filled. */
         ChunkGenerationService generationService();
         DirtyColumnTracker dirtyTracker();
+        /** Fabric's content-hash dirty filter; Paper has none (event-driven) and zero-fills. */
+        DirtyContentFilter dirtyContentFilter();
         SharedBandwidthLimiter bandwidthLimiter();
         Collection<? extends AbstractPlayerRequestState<?>> players();
     }
@@ -71,6 +74,7 @@ public final class BenchmarkMetricsExporter {
             @Override public AbstractChunkDiskReader diskReader() { return service.getDiskReader(); }
             @Override public ChunkGenerationService generationService() { return service.getGenerationService(); }
             @Override public DirtyColumnTracker dirtyTracker() { return service.getDirtyTracker(); }
+            @Override public DirtyContentFilter dirtyContentFilter() { return service.getDirtyContentFilter(); }
             @Override public SharedBandwidthLimiter bandwidthLimiter() { return service.getBandwidthLimiter(); }
             @Override public Collection<? extends AbstractPlayerRequestState<?>> players() {
                 return service.getPlayers().values();
@@ -278,6 +282,8 @@ public final class BenchmarkMetricsExporter {
         dirtyMap.put("pending", dirtyTracker.pendingCount());
         dirtyMap.put("broadcast_positions", dirtyTracker.getTotalDrained());
         dirtyMap.put("marked_total", dirtyTracker.getTotalMarked());
+        var contentFilter = src.dirtyContentFilter();
+        dirtyMap.put("suppressed_total", contentFilter != null ? contentFilter.getTotalSuppressed() : 0L);
         result.put("dirty", dirtyMap);
 
         var bandwidthMap = new LinkedHashMap<String, Object>();
@@ -413,6 +419,12 @@ public final class BenchmarkMetricsExporter {
         result.put("tracker_in_flight", manager != null ? manager.getPendingCount() : 0);
         // Positions parked in the RequestQueue between scanner accept and send drip
         result.put("request_queue", manager != null ? manager.getQueueRemaining() : 0);
+
+        // Request→receive round-trip latency distribution (-1.0 doubles when no samples yet)
+        var rtt = new LinkedHashMap<String, Object>();
+        rtt.put("p50_ms", manager != null ? manager.getRttP50Ms() : -1.0);
+        rtt.put("p95_ms", manager != null ? manager.getRttP95Ms() : -1.0);
+        result.put("rtt", rtt);
 
         var probes = soakProbes;
         if (!probes.isEmpty()) {
