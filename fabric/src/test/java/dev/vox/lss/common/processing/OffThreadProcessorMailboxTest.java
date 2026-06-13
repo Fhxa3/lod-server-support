@@ -134,6 +134,44 @@ class OffThreadProcessorMailboxTest {
         }
     }
 
+    // ---- SP-042: a buffered removal must not kill a re-registered same-UUID session ----
+
+    @Test
+    void aBufferedRemovalDoesNotKillAReRegisteredSameUuidSession() throws Exception {
+        var uuid = UUID.randomUUID();
+        var oldState = new TestState(uuid);
+        oldState.markHandshakeComplete();
+        oldState.setCapabilities(LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+        var players = new ConcurrentHashMap<UUID, TestState>();
+        players.put(uuid, oldState);
+        var proc = new TestProcessor(players);
+        try {
+            proc.start();
+
+            // The old session admits a request, creating a dedup group for (5,5).
+            oldState.enqueue(new IncomingRequest(5, 5, 1L));
+            proc.postSnapshot(snapshot(uuid), List.of());
+            waitFor(() -> oldState.getHeldSyncSlots() == 1, "old session admitted");
+
+            // In ONE take: buffer the old session's removal AND register a fresh same-UUID
+            // session with its own request. The phase-1 removal tears down the old UUID's dedup
+            // groups; phase-4 routing then serves the fresh session — the removal must not reach
+            // forward and clobber it.
+            proc.notifyPlayerRemoved(uuid);
+            var newState = new TestState(uuid);
+            newState.markHandshakeComplete();
+            newState.setCapabilities(LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+            players.put(uuid, newState); // replaces oldState under the same UUID
+            newState.enqueue(new IncomingRequest(9, 9, 1L));
+            proc.postSnapshot(snapshot(uuid), List.of());
+
+            waitFor(() -> newState.getHeldSyncSlots() == 1,
+                    "the fresh same-UUID session's request is admitted despite the buffered removal");
+        } finally {
+            proc.shutdown();
+        }
+    }
+
     private static void waitFor(java.util.function.BooleanSupplier condition, String what)
             throws InterruptedException {
         long deadline = System.nanoTime() + 5_000_000_000L;
