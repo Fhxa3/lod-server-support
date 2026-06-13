@@ -276,10 +276,16 @@ detection) — see the CHECKS dict in scripts/check_soak.py.
 
 **Modes:** `--validate <scenario>` (pre-boot, seconds),
 `check_soak.py <results-dir> <scenario>` → `verdict.json` + human-readable violations,
-exit 1 on any failure, and `--selftest` — 93 in-memory pass/catch cases: every law
-(A1-A7, B1, B2), the quiescence predicate, disc completeness, window floors, the config
-allowlist, action segmentation, and every named check each pass consistent data and catch
-a doctored inconsistency. Unrecognized new fields → one-line warning, never a failure.
+exit 1 on any failure, and `--selftest` — 96 in-memory pass/catch cases: every law
+(A1-A7, B1, B2, incl. the re_resolved / suppressed_total monotonic guards), the quiescence
+predicate, disc completeness, window floors, the config allowlist, action segmentation, and
+every named check each pass consistent data and catch a doctored inconsistency. Unrecognized
+new fields → one-line warning, never a failure.
+
+**Post-run digest:** `scripts/soak_report.py <results-dir>` (also auto-written to
+`report.md` per run) is a lens, never a gate — it surfaces rate spikes/stalls, unexpected
+concerning counters, high-water marks, cadence gaps, law margins, and cross-identity drift
+so a reviewer can spot problems a law can't name. `--strict` exits nonzero on any anomaly.
 
 ## Scenarios (lodDistanceChunks=24, genPerPlayer=40, genGlobal=64, dirtyBroadcast=5s)
 
