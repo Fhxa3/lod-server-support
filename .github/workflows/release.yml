@@ -20,6 +20,12 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
 
+          # actions/checkout leaves a LIGHTWEIGHT tag on tag-triggered runs, which drops the
+          # annotated tag's message (our release notes) and makes objecttype read 'commit'. Re-fetch
+          # the real annotated object so the notes below are used instead of the commit-subject
+          # fallback. Non-fatal (|| true): a fetch hiccup degrades to the fallback, never blocks publish.
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" || true
+
           # Annotated tags have objecttype 'tag'; lightweight have 'commit'
           TAG_TYPE=$(git for-each-ref --format='%(objecttype)' "refs/tags/${TAG}")
           if [ "$TAG_TYPE" = "tag" ]; then
