@@ -9,8 +9,13 @@ base {
     archivesName = project.archives_base_name
 }
 
+// CI builds carry the full version in the filename (lod-server-support-fabric-0.4.0+26.1.2.jar),
+// derived from mod_version (overridden from the tag by release.yml) + minecraft_version.
+// Local dev builds keep the stable unversioned name so run configs and scripts never chase it.
+def ciArchiveVersion = providers.environmentVariable('CI').map { it == 'true' }.getOrElse(false)
+        ? "${project.mod_version}+${project.minecraft_version}" : ''
 tasks.withType(AbstractArchiveTask).configureEach {
-    archiveVersion = ''
+    archiveVersion = ciArchiveVersion
 }
 
 repositories {
@@ -35,8 +40,8 @@ dependencies {
     testImplementation "net.fabricmc:fabric-loader-junit:${project.loader_version}"
     implementation project(':common')
     include project(':common')
-    compileOnly "maven.modrinth:sodium:mc26.1.1-0.8.9-fabric"
-    compileOnly "maven.modrinth:modmenu:18.0.0-alpha.8"
+    compileOnly "maven.modrinth:sodium:mc26.1.2-0.8.12-fabric"
+    compileOnly "maven.modrinth:modmenu:18.0.0-beta.1"
 }
 
 test {
@@ -71,6 +76,32 @@ loom {
             programArg "--quickPlayMultiplayer"
             programArg "localhost:25565"
         }
+        // Soak harness runs (scripts/soak.sh) — no JFR: profiling overhead would skew the
+        // long-run behavior the soak observes
+        register("soakServer") {
+            server()
+            runDir "build/run/soak-server"
+            vmArg "-Dlss.soak.scenario=${findProperty('soak.scenario') ?: ''}"
+            vmArg "-Dlss.soak.dirtydebug=${findProperty('soak.dirtydebug') ?: 'false'}"
+            programArg "--nogui"
+        }
+        register("soakClient") {
+            client()
+            runDir "build/run/soak-client"
+            vmArg "-Dlss.soak=true"
+            // Stable identity: the dev client otherwise randomizes its offline username per
+            // launch, so a rejoin scenario's run 2 is a DIFFERENT player — fresh playerdata,
+            // overworld spawn instead of restoring into the dimension run 1 was kicked in.
+            programArg "--username"
+            programArg "SoakPlayer"
+            // Per-scenario client instrumentation (soak.sh passes these as -P properties):
+            // probes = per-position timestamp probes "x:z,..."; clientActionAt = one
+            // scripted client-side action "SECONDS:ACTION" (e.g. "60:clearcache")
+            vmArg "-Dlss.soak.probes=${findProperty('soak.probes') ?: ''}"
+            vmArg "-Dlss.soak.clientActionAt=${findProperty('soak.clientActionAt') ?: ''}"
+            programArg "--quickPlayMultiplayer"
+            programArg "localhost:25565"
+        }
     }
 }
 
@@ -99,6 +130,11 @@ tasks.withType(JavaCompile).configureEach {
 
 jar {
     inputs.property "archivesName", project.base.archivesName
+
+    // The benchmark harness is a dev-only tool (-Dlss.benchmark); keep it out of release
+    // jars. Dev/benchmark runs execute from class directories, so they are unaffected,
+    // and BenchmarkBridge no-ops when the classes are absent.
+    exclude 'dev/vox/lss/benchmark/**'
 
     from(rootProject.file("LICENSE")) {
         rename { "${it}_${inputs.properties.archivesName}" }

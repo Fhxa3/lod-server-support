@@ -1,0 +1,494 @@
+package dev.vox.lss.common.processing;
+
+import dev.vox.lss.common.LSSConstants;
+import dev.vox.lss.common.PositionUtil;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Pins the deliverDiskResult ladder and its escalation/staleness edges by injecting
+ * {@link ChunkReadResult}s straight into the stub reader's per-player queue:
+ * saturated results bounce retryable (RateLimited, nothing marked served), all-air
+ * results serve up-to-date and stamp the timestamp cache (the End-void retry-storm
+ * fix), data results become column payloads, not-found swaps a GENERATION request's
+ * sync slot for a generation ticket with every outcome freeing the slot, and disk
+ * results or generation outcomes carrying a stale dimension are inert.
+ */
+class OffThreadProcessorDiskResultTest {
+
+    private static final String DIM = LSSConstants.DIM_STR_OVERWORLD;
+    private static final String END = LSSConstants.DIM_STR_THE_END;
+    private static final long COLUMN_TS = 1_700_000_000L;
+
+    private static final class TestState extends AbstractPlayerRequestState<Object> {
+        TestState(UUID uuid, int syncCap, int genCap) { super(uuid, syncCap, genCap); }
+        @Override public String getPlayerName() { return "test"; }
+        void enqueue(IncomingRequest r) { enqueueIncomingRequest(r); }
+    }
+
+    /** No abstract members — subclassing only unlocks instantiation; tests bypass the
+     *  executor entirely and inject results via the public per-player queue. */
+    private static final class StubDiskReader extends AbstractChunkDiskReader {
+        StubDiskReader() { super(1); }
+    }
+
+    private static final class TestProcessor extends OffThreadProcessor<TestState> {
+        record DiskSubmit(UUID player, String dimension, int cx, int cz) {}
+        record EnqueuedColumn(UUID player, int cx, int cz, String dimension,
+                              long columnTimestamp, byte[] bytes) {}
+
+        final ConcurrentLinkedQueue<DiskSubmit> diskSubmits = new ConcurrentLinkedQueue<>();
+        final ConcurrentLinkedQueue<EnqueuedColumn> enqueuedColumns = new ConcurrentLinkedQueue<>();
+        volatile boolean rejectEnqueue; // models the platform oversized-payload drop
+
+        TestProcessor(Map<UUID, TestState> players, AbstractChunkDiskReader reader,
+                      boolean generationAvailable) {
+            super(players, reader, generationAvailable, null, 1);
+        }
+
+        @Override
+        protected boolean submitDiskRead(UUID playerUuid, String dimension, int cx, int cz, long order) {
+            diskSubmits.add(new DiskSubmit(playerUuid, dimension, cx, cz));
+            return true;
+        }
+
+        @Override
+        protected boolean buildAndEnqueueColumnPayload(TestState state, int cx, int cz, String dimension,
+                                                     long columnTimestamp, long submissionOrder,
+                                                     byte[] sectionBytes, int estimatedBytes) {
+            if (rejectEnqueue) return false;
+            enqueuedColumns.add(new EnqueuedColumn(state.getPlayerUUID(), cx, cz, dimension,
+                    columnTimestamp, sectionBytes));
+            return true;
+        }
+    }
+
+    /** One player + stub reader + started processor, wired the way the platform services wire them. */
+    private static final class Rig {
+        final UUID uuid = UUID.randomUUID();
+        final ConcurrentHashMap<UUID, TestState> players = new ConcurrentHashMap<>();
+        final StubDiskReader reader = new StubDiskReader();
+        final TestState state;
+        final TestProcessor proc;
+
+        Rig(boolean generationAvailable) { this(generationAvailable, 4, 4); }
+
+        Rig(boolean generationAvailable, int syncCap, int genCap) {
+            this.state = newPlayer(uuid, syncCap, genCap);
+            this.players.put(uuid, state);
+            this.reader.registerPlayer(uuid);
+            this.proc = new TestProcessor(players, reader, generationAvailable);
+            this.proc.start();
+        }
+
+        TestState addPlayer(UUID u) {
+            var s = newPlayer(u, 4, 4);
+            players.put(u, s);
+            reader.registerPlayer(u);
+            return s;
+        }
+
+        void inject(ChunkReadResult result) {
+            reader.getPlayerQueue(result.playerUuid()).add(result);
+        }
+    }
+
+    private static TestState newPlayer(UUID uuid, int syncCap, int genCap) {
+        var s = new TestState(uuid, syncCap, genCap);
+        s.markHandshakeComplete();
+        s.setCapabilities(LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+        return s;
+    }
+
+    private static TickSnapshot snapshot(String dimension, UUID... uuids) {
+        var dims = new HashMap<UUID, String>();
+        for (var u : uuids) dims.put(u, dimension);
+        return new TickSnapshot(dims, Map.of(), 0, false);
+    }
+
+    private static ChunkReadResult dataResult(UUID u, int cx, int cz, String dim,
+                                              byte[] bytes, long ts, long order) {
+        return new ChunkReadResult(u, cx, cz, bytes, dim,
+                bytes.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES, ts, false, false, order);
+    }
+
+    /** Mirrors AbstractChunkDiskReader's all-air triage: found on disk, no bytes to send. */
+    private static ChunkReadResult allAirResult(UUID u, int cx, int cz, String dim, long ts, long order) {
+        return new ChunkReadResult(u, cx, cz, null, dim, 0, ts, false, false, order);
+    }
+
+    private record Response(UUID player, byte type, long packed) {}
+
+    /** Poll drainSendActions until {@code done} holds over everything drained so far. */
+    private static List<Response> drainUntil(TestProcessor proc, Predicate<List<Response>> done)
+            throws InterruptedException {
+        var collected = new ArrayList<Response>();
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (!done.test(collected)) {
+            if (System.nanoTime() > deadline) fail("timed out draining responses; got " + collected);
+            proc.drainSendActions((state, types, positions, count) -> {
+                for (int i = 0; i < count; i++) {
+                    collected.add(new Response(state.getPlayerUUID(), types[i], positions[i]));
+                }
+            });
+            Thread.sleep(10);
+        }
+        return collected;
+    }
+
+    private static Predicate<List<Response>> received(byte type, long packed) {
+        return rs -> rs.stream().anyMatch(r -> r.type() == type && r.packed() == packed);
+    }
+
+    private static Predicate<List<Response>> received(UUID player, byte type, long packed) {
+        return rs -> rs.stream().anyMatch(r -> r.player().equals(player)
+                && r.type() == type && r.packed() == packed);
+    }
+
+    private static void waitFor(java.util.function.BooleanSupplier condition, String what)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() > deadline) fail("timed out waiting for: " + what);
+            Thread.sleep(10);
+        }
+    }
+
+    // ---- deliverDiskResult ladder ----
+
+    @Test
+    void saturatedResultBouncesRetryableWithRateLimited() throws Exception {
+        var rig = new Rig(false);
+        try {
+            rig.state.enqueue(new IncomingRequest(5, 5, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 1, "first disk submit");
+
+            rig.inject(ChunkReadResult.saturated(rig.uuid, 5, 5, DIM, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+
+            long packed = PositionUtil.packPosition(5, 5);
+            // Misclassifying saturated as notFound would answer NotGenerated instead,
+            // making the client give up on a retryable position — this drain would time out.
+            drainUntil(rig.proc, received(LSSConstants.RESPONSE_RATE_LIMITED, packed));
+            assertEquals(0, rig.state.getHeldSyncSlots(), "saturated delivery must free the sync slot");
+            assertFalse(rig.state.hasDiskReadDone(5, 5),
+                    "saturated is retryable — must not be marked served");
+
+            // The retry must reach the disk again: nothing stamped or marked by the bounce
+            rig.state.enqueue(new IncomingRequest(5, 5, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 2, "retry resubmits the disk read");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
+    void rejectedEnqueueAnswersUpToDateInsteadOfSilence() throws Exception {
+        // An oversized column can't go on the wire. The old path dropped it silently with
+        // diskReadDone already set — the client retried an unserveable position forever
+        // (or, post-honest-re-resolution, re-read the disk forever). The terminal answer
+        // is up-to-date.
+        var rig = new Rig(false);
+        try {
+            rig.proc.rejectEnqueue = true;
+            rig.state.enqueue(new IncomingRequest(9, 9, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 1, "disk submit");
+
+            rig.inject(dataResult(rig.uuid, 9, 9, DIM, new byte[]{1, 2, 3}, COLUMN_TS, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+
+            long packed = PositionUtil.packPosition(9, 9);
+            drainUntil(rig.proc, received(rig.uuid, LSSConstants.RESPONSE_UP_TO_DATE, packed));
+            assertTrue(rig.state.hasDiskReadDone(9, 9), "unserveable position resolves terminally");
+            assertEquals(0, rig.state.getHeldSyncSlots(), "delivery must free the slot");
+            assertTrue(rig.proc.enqueuedColumns.isEmpty());
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
+    void allAirResultServesUpToDateAndStampsTimestampCache() throws Exception {
+        // Generation available so a regression to "not found" would emit a generation
+        // ticket — the End-void retry storm fixed in 761b3fb, pinned here deterministically.
+        var rig = new Rig(true);
+        try {
+            rig.state.enqueue(new IncomingRequest(8, 8, 0L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 1, "disk-first submit");
+
+            rig.inject(allAirResult(rig.uuid, 8, 8, DIM, COLUMN_TS, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+
+            long packed = PositionUtil.packPosition(8, 8);
+            drainUntil(rig.proc, received(rig.uuid, LSSConstants.RESPONSE_UP_TO_DATE, packed));
+            assertTrue(rig.state.hasDiskReadDone(8, 8), "all-air resolves as served");
+            assertEquals(0, rig.state.getHeldSyncSlots(), "all-air delivery must free the slot");
+            assertEquals(0, rig.state.getHeldGenSlots(), "all-air must not escalate to generation");
+            assertNull(rig.proc.pollGenerationTicketRequest(),
+                    "all-air must not trigger a generation retry");
+            assertTrue(rig.proc.enqueuedColumns.isEmpty(), "all-air has nothing visible to send");
+
+            // The drain pass stamps the timestamp cache: another player's resync at the served
+            // timestamp resolves up-to-date without disk IO.
+            var u2 = UUID.randomUUID();
+            var p2 = rig.addPlayer(u2);
+            p2.enqueue(new IncomingRequest(8, 8, COLUMN_TS));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid, u2), List.of());
+            drainUntil(rig.proc, received(u2, LSSConstants.RESPONSE_UP_TO_DATE, packed));
+            assertEquals(1, rig.proc.diskSubmits.size(), "warm request must not submit another disk read");
+            assertEquals(0, p2.getHeldSyncSlots(), "warm resolution must not consume a slot");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
+    void dataResultEnqueuesColumnPayloadAndFreesSlot() throws Exception {
+        var rig = new Rig(false);
+        try {
+            rig.state.enqueue(new IncomingRequest(2, 3, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 1, "disk submit");
+
+            byte[] bytes = {10, 20, 30};
+            rig.inject(dataResult(rig.uuid, 2, 3, DIM, bytes, COLUMN_TS, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> !rig.proc.enqueuedColumns.isEmpty(), "column payload enqueued");
+
+            var col = rig.proc.enqueuedColumns.poll();
+            assertEquals(rig.uuid, col.player());
+            assertEquals(2, col.cx());
+            assertEquals(3, col.cz());
+            assertEquals(DIM, col.dimension());
+            assertEquals(COLUMN_TS, col.columnTimestamp());
+            assertArrayEquals(bytes, col.bytes());
+            assertTrue(rig.proc.enqueuedColumns.isEmpty(), "exactly one payload per result");
+            assertEquals(0, rig.state.getHeldSyncSlots(), "data delivery must free the slot");
+            assertTrue(rig.state.hasDiskReadDone(2, 3));
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    // ---- not-found → generation escalation ----
+
+    /** Routes a GENERATION request (clientTimestamp 0) through the disk-first path,
+     *  injects not-found, and returns the escalated generation ticket. */
+    private static OffThreadProcessor.GenerationTicketRequest escalateToGenTicket(
+            Rig rig, int cx, int cz) throws InterruptedException {
+        int before = rig.proc.diskSubmits.size();
+        rig.state.enqueue(new IncomingRequest(cx, cz, 0L));
+        rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+        waitFor(() -> rig.proc.diskSubmits.size() == before + 1, "disk-first submit");
+
+        rig.inject(ChunkReadResult.empty(rig.uuid, cx, cz, DIM, 1L));
+        rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+
+        var ref = new AtomicReference<OffThreadProcessor.GenerationTicketRequest>();
+        waitFor(() -> {
+            var t = rig.proc.pollGenerationTicketRequest();
+            if (t != null) ref.set(t);
+            return ref.get() != null;
+        }, "escalated generation ticket");
+        return ref.get();
+    }
+
+    @Test
+    void notFoundEscalatesGenerationRequestToTicketAndSwapsSlot() throws Exception {
+        var rig = new Rig(true);
+        try {
+            var ticket = escalateToGenTicket(rig, 4, 6);
+            assertEquals(rig.uuid, ticket.playerUuid());
+            assertEquals(4, ticket.cx());
+            assertEquals(6, ticket.cz());
+            assertEquals(DIM, ticket.dimension());
+            assertEquals(0, rig.state.getHeldSyncSlots(), "disk slot freed on not-found delivery");
+            assertEquals(1, rig.state.getHeldGenSlots(), "escalation holds a generation slot");
+            assertFalse(rig.state.hasDiskReadDone(4, 6), "escalated position is not served yet");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
+    void escalatedGenerationSuccessDeliversColumnAndFreesGenSlot() throws Exception {
+        var rig = new Rig(true);
+        try {
+            var ticket = escalateToGenTicket(rig, 4, 6);
+
+            byte[] bytes = {1, 2};
+            var data = new LoadedColumnData(4, 6, bytes,
+                    bytes.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES);
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), new ArrayList<>(List.of(
+                    new TickSnapshot.GenerationReadyData(rig.uuid, 4, 6, DIM, data,
+                            COLUMN_TS, ticket.submissionOrder()))));
+            waitFor(() -> !rig.proc.enqueuedColumns.isEmpty(), "generated column payload");
+
+            var col = rig.proc.enqueuedColumns.poll();
+            assertEquals(4, col.cx());
+            assertEquals(6, col.cz());
+            assertEquals(DIM, col.dimension());
+            assertEquals(COLUMN_TS, col.columnTimestamp());
+            assertArrayEquals(bytes, col.bytes());
+            assertEquals(0, rig.state.getHeldGenSlots(), "generation outcome must free the gen slot");
+            assertTrue(rig.state.hasDiskReadDone(4, 6), "generated column counts as served");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
+    void escalatedGenerationFailureSendsNotGeneratedAndFreesGenSlot() throws Exception {
+        var rig = new Rig(true);
+        try {
+            var ticket = escalateToGenTicket(rig, 4, 6);
+
+            // Main thread could not submit/complete the ticket — fed back like any outcome
+            rig.proc.feedGenerationFailure(rig.uuid, 4, 6, DIM, ticket.submissionOrder());
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+
+            long packed = PositionUtil.packPosition(4, 6);
+            drainUntil(rig.proc, received(LSSConstants.RESPONSE_NOT_GENERATED, packed));
+            assertEquals(0, rig.state.getHeldGenSlots(), "failed generation must free the gen slot");
+            assertFalse(rig.state.hasDiskReadDone(4, 6), "failed position stays re-requestable");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
+    void notFoundSyncRequestBouncesStraightToNotGenerated() throws Exception {
+        // Generation IS available — a SYNC-typed request must still not escalate
+        var rig = new Rig(true);
+        try {
+            rig.state.enqueue(new IncomingRequest(1, 9, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 1, "disk submit");
+
+            rig.inject(ChunkReadResult.empty(rig.uuid, 1, 9, DIM, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+
+            long packed = PositionUtil.packPosition(1, 9);
+            drainUntil(rig.proc, received(LSSConstants.RESPONSE_NOT_GENERATED, packed));
+            assertNull(rig.proc.pollGenerationTicketRequest(),
+                    "SYNC not-found must not emit a generation ticket");
+            assertEquals(0, rig.state.getHeldSyncSlots());
+            assertEquals(0, rig.state.getHeldGenSlots(), "SYNC not-found must not occupy a gen slot");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
+    void notFoundEscalationBouncesToNotGeneratedWhenGenCapFull() throws Exception {
+        var rig = new Rig(true, 4, 1);
+        try {
+            escalateToGenTicket(rig, 1, 1); // holds the only gen slot
+            assertEquals(1, rig.state.getHeldGenSlots());
+
+            rig.state.enqueue(new IncomingRequest(2, 2, 0L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 2, "second disk-first submit");
+            rig.inject(ChunkReadResult.empty(rig.uuid, 2, 2, DIM, 2L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+
+            long packed = PositionUtil.packPosition(2, 2);
+            drainUntil(rig.proc, received(LSSConstants.RESPONSE_NOT_GENERATED, packed));
+            assertFalse(rig.state.hasPendingRequest(2, 2),
+                    "bounced escalation must leave no pending entry");
+            assertEquals(1, rig.state.getHeldGenSlots(), "the first escalation keeps its slot");
+            assertEquals(0, rig.state.getHeldSyncSlots());
+            assertNull(rig.proc.pollGenerationTicketRequest(), "no ticket for the bounced position");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    // ---- stale-dimension inertness ----
+
+    @Test
+    void staleDimensionDiskResultIsInert() throws Exception {
+        var rig = new Rig(true);
+        try {
+            // Live pending in the End at (3,3) — the state a dimension switch leaves behind
+            rig.state.enqueue(new IncomingRequest(3, 3, 1L));
+            rig.proc.postSnapshot(snapshot(END, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 1, "End disk submit");
+
+            // A result from before the switch (overworld) plus an End sentinel behind it:
+            // FIFO drain means the sentinel's payload proves the stale one was already handled.
+            rig.inject(dataResult(rig.uuid, 3, 3, DIM, new byte[]{9}, COLUMN_TS, 1L));
+            rig.inject(dataResult(rig.uuid, 4, 4, END, new byte[]{7}, COLUMN_TS, 2L));
+            rig.proc.postSnapshot(snapshot(END, rig.uuid), List.of());
+            waitFor(() -> !rig.proc.enqueuedColumns.isEmpty(), "sentinel End payload");
+
+            var sentinel = rig.proc.enqueuedColumns.poll();
+            assertEquals(4, sentinel.cx());
+            assertEquals(4, sentinel.cz());
+            assertEquals(END, sentinel.dimension());
+            assertTrue(rig.proc.enqueuedColumns.isEmpty(),
+                    "stale-dimension result must not produce a payload");
+            assertEquals(1, rig.state.getHeldSyncSlots(),
+                    "stale result must not resolve the live End pending");
+            assertFalse(rig.state.hasDiskReadDone(3, 3),
+                    "stale result must not mark the position served");
+
+            // The position still resolves when the real End result arrives
+            rig.inject(dataResult(rig.uuid, 3, 3, END, new byte[]{5}, COLUMN_TS + 1, 3L));
+            rig.proc.postSnapshot(snapshot(END, rig.uuid), List.of());
+            waitFor(() -> !rig.proc.enqueuedColumns.isEmpty(), "real End payload");
+            var col = rig.proc.enqueuedColumns.poll();
+            assertEquals(3, col.cx());
+            assertEquals(3, col.cz());
+            assertEquals(END, col.dimension());
+            assertEquals(0, rig.state.getHeldSyncSlots(), "real End result resolves the pending");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
+    void staleDimensionGenerationOutcomeIsInert() throws Exception {
+        var rig = new Rig(true);
+        try {
+            // Live End pending at (6,6)
+            rig.state.enqueue(new IncomingRequest(6, 6, 0L));
+            rig.proc.postSnapshot(snapshot(END, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 1, "End disk submit");
+
+            // Stale overworld outcome for the same position, with an End sentinel behind it
+            // in the same lossless event batch (processed in order within one cycle)
+            var staleData = new LoadedColumnData(6, 6, new byte[]{1},
+                    1 + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES);
+            rig.proc.postSnapshot(snapshot(END, rig.uuid), new ArrayList<>(List.of(
+                    new TickSnapshot.GenerationReadyData(rig.uuid, 6, 6, DIM, staleData, COLUMN_TS, 5L),
+                    new TickSnapshot.GenerationReadyData(rig.uuid, 7, 7, END, null, 0L, 6L))));
+
+            drainUntil(rig.proc, received(LSSConstants.RESPONSE_NOT_GENERATED,
+                    PositionUtil.packPosition(7, 7)));
+            assertEquals(1, rig.state.getHeldSyncSlots(),
+                    "stale outcome must not resolve the live End pending");
+            assertFalse(rig.state.hasDiskReadDone(6, 6),
+                    "stale outcome must not mark the position served");
+            assertTrue(rig.proc.enqueuedColumns.isEmpty(),
+                    "stale outcome must not enqueue its column");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+}

@@ -33,66 +33,58 @@ public final class PaperPayloadHandler {
 
     // ---- S2C Encoding ----
 
-    public static void sendSessionConfig(Player player,
-                                          int protocolVersion, boolean enabled,
-                                          int lodDistanceChunks, int serverCapabilities,
-                                          int syncOnLoadRateLimitPerPlayer, int syncOnLoadConcurrencyLimitPerPlayer,
-                                          int generationRateLimitPerPlayer, int generationConcurrencyLimitPerPlayer,
-                                          boolean generationEnabled, long playerBandwidthLimit) {
-        sendEncoded(player, ID_SESSION_CONFIG, buf -> {
+    public static byte[] encodeSessionConfig(int protocolVersion, boolean enabled,
+                                             int lodDistanceChunks,
+                                             int syncOnLoadConcurrencyLimitPerPlayer,
+                                             int generationConcurrencyLimitPerPlayer,
+                                             boolean generationEnabled) {
+        return encodeToBytes(buf -> {
             buf.writeVarInt(protocolVersion);
             buf.writeBoolean(enabled);
             buf.writeVarInt(lodDistanceChunks);
-            buf.writeVarInt(serverCapabilities);
-            buf.writeVarInt(syncOnLoadRateLimitPerPlayer);
             buf.writeVarInt(syncOnLoadConcurrencyLimitPerPlayer);
-            buf.writeVarInt(generationRateLimitPerPlayer);
             buf.writeVarInt(generationConcurrencyLimitPerPlayer);
             buf.writeBoolean(generationEnabled);
-            buf.writeVarLong(playerBandwidthLimit);
         });
     }
 
-    public static void sendBatchResponse(Player player, byte[] responseTypes, int[] requestIds, int count) {
-        sendEncoded(player, ID_BATCH_RESPONSE, buf -> {
+    public static void sendSessionConfig(Player player,
+                                          int protocolVersion, boolean enabled,
+                                          int lodDistanceChunks,
+                                          int syncOnLoadConcurrencyLimitPerPlayer,
+                                          int generationConcurrencyLimitPerPlayer,
+                                          boolean generationEnabled) {
+        sendRawNmsPayload(player, ID_SESSION_CONFIG, encodeSessionConfig(
+                protocolVersion, enabled, lodDistanceChunks,
+                syncOnLoadConcurrencyLimitPerPlayer, generationConcurrencyLimitPerPlayer,
+                generationEnabled));
+    }
+
+    public static byte[] encodeBatchResponse(byte[] responseTypes, long[] packedPositions, int count) {
+        return encodeToBytes(buf -> {
             buf.writeVarInt(count);
             for (int i = 0; i < count; i++) {
                 buf.writeByte(responseTypes[i]);
-                buf.writeVarInt(requestIds[i]);
+                buf.writeLong(packedPositions[i]);
             }
         });
     }
 
-    /**
-     * Returns the cached {@link Identifier} for a channel string constant.
-     * Used by callers that need to send pre-encoded payloads via {@link #sendRawNmsPayload}.
-     */
-    public static Identifier channelId(String channel) {
-        return switch (channel) {
-            case LSSConstants.CHANNEL_SESSION_CONFIG -> ID_SESSION_CONFIG;
-            case LSSConstants.CHANNEL_DIRTY_COLUMNS -> ID_DIRTY_COLUMNS;
-            case LSSConstants.CHANNEL_VOXEL_COLUMN -> ID_VOXEL_COLUMN;
-            case LSSConstants.CHANNEL_BATCH_RESPONSE -> ID_BATCH_RESPONSE;
-            default -> Identifier.parse(channel);
-        };
+    public static void sendBatchResponse(Player player, byte[] responseTypes, long[] packedPositions, int count) {
+        sendRawNmsPayload(player, ID_BATCH_RESPONSE, encodeBatchResponse(responseTypes, packedPositions, count));
     }
 
     /**
      * Encode a column payload with serialized section bytes.
      * Writes the per-request header, then writes sectionBytes as a length-prefixed byte array.
      */
-    public static byte[] encodeVoxelColumnPreEncoded(int requestId, int chunkX, int chunkZ,
+    public static byte[] encodeVoxelColumnPreEncoded(int chunkX, int chunkZ,
                                                       String dimensionStr, long columnTimestamp,
                                                       byte[] sectionBytes) {
-        return encodeToBytes(buf -> {
-            buf.writeVarInt(requestId);
+        return encodeToBytes(sectionBytes.length + 64, buf -> {
             buf.writeInt(chunkX);
             buf.writeInt(chunkZ);
-            int ordinal = LSSConstants.dimensionStringToOrdinal(dimensionStr);
-            buf.writeVarInt(ordinal);
-            if (ordinal == LSSConstants.DIM_CUSTOM) {
-                buf.writeUtf(dimensionStr);
-            }
+            buf.writeUtf(dimensionStr, LSSConstants.MAX_DIMENSION_STRING_LENGTH);
             buf.writeLong(columnTimestamp);
             buf.writeByteArray(sectionBytes);
         });
@@ -133,7 +125,7 @@ public final class PaperPayloadHandler {
         });
     }
 
-    public record DecodedBatchChunkRequest(int[] requestIds, long[] packedPositions, long[] clientTimestamps, int count) {}
+    public record DecodedBatchChunkRequest(long[] packedPositions, long[] clientTimestamps, int count) {}
 
     public static DecodedBatchChunkRequest decodeBatchChunkRequest(byte[] data) {
         if (data == null || data.length == 0) {
@@ -146,30 +138,14 @@ public final class PaperPayloadHandler {
                 LSSLogger.warn("Batch chunk request count out of range: " + count);
                 return null;
             }
-            int[] requestIds = new int[count];
             long[] packedPositions = new long[count];
             long[] clientTimestamps = new long[count];
             for (int i = 0; i < count; i++) {
-                requestIds[i] = buf.readVarInt();
                 packedPositions[i] = buf.readLong();
                 clientTimestamps[i] = buf.readLong();
             }
-            return new DecodedBatchChunkRequest(requestIds, packedPositions, clientTimestamps, count);
+            return new DecodedBatchChunkRequest(packedPositions, clientTimestamps, count);
         });
-    }
-
-    public record DecodedCancelRequest(int requestId) {}
-
-    public static DecodedCancelRequest decodeCancelRequest(byte[] data) {
-        if (data == null || data.length == 0) return null;
-        return withReadBuffer(data, buf -> new DecodedCancelRequest(buf.readVarInt()));
-    }
-
-    public record DecodedBandwidthUpdate(long desiredRate) {}
-
-    public static DecodedBandwidthUpdate decodeBandwidthUpdate(byte[] data) {
-        if (data == null || data.length == 0) return null;
-        return withReadBuffer(data, buf -> new DecodedBandwidthUpdate(buf.readVarLong()));
     }
 
     // ---- Helpers ----
@@ -183,16 +159,12 @@ public final class PaperPayloadHandler {
         }
     }
 
-    private static void sendEncoded(Player player, Identifier channelId, Consumer<FriendlyByteBuf> writer) {
-        byte[] bytes = encodeToBytes(writer);
-        var nmsPlayer = ((CraftPlayer) player).getHandle();
-        if (nmsPlayer.connection == null) return;
-        nmsPlayer.connection.send(new ClientboundCustomPayloadPacket(
-                new DiscardedPayload(channelId, bytes)));
+    private static byte[] encodeToBytes(Consumer<FriendlyByteBuf> writer) {
+        return encodeToBytes(256, writer);
     }
 
-    private static byte[] encodeToBytes(Consumer<FriendlyByteBuf> writer) {
-        var buf = new FriendlyByteBuf(Unpooled.buffer());
+    private static byte[] encodeToBytes(int initialCapacity, Consumer<FriendlyByteBuf> writer) {
+        var buf = new FriendlyByteBuf(Unpooled.buffer(initialCapacity));
         try {
             writer.accept(buf);
             byte[] bytes = new byte[buf.readableBytes()];

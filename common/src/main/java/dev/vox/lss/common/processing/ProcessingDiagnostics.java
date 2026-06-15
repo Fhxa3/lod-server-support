@@ -15,19 +15,17 @@ public class ProcessingDiagnostics {
     private volatile int procTickInMemory;
     private volatile int procTickSkippedDuplicate;
     private volatile int procTickUpToDate;
-    private volatile int procTickSyncRateLimited;
-    private volatile int procTickGenRateLimited;
-    private volatile int procTickQueueFull;
-    private volatile int procTickQueued;
 
     // Cumulative counters — never reset
     private volatile long totalQueueFull;
-    private volatile long totalQueued;
     private volatile long totalInMemory;
     private volatile long totalUpToDate;
     private volatile long totalGenDrained;
     private volatile long totalSyncRateLimited;
     private volatile long totalGenRateLimited;
+    private volatile long totalDuplicateSkips;
+    private volatile long totalRequestsRouted;
+    private volatile long totalReResolved;
 
     public void resetTickCounters() {
         procTickDiskQueued = 0;
@@ -36,16 +34,19 @@ public class ProcessingDiagnostics {
         procTickInMemory = 0;
         procTickSkippedDuplicate = 0;
         procTickUpToDate = 0;
-        procTickSyncRateLimited = 0;
-        procTickGenRateLimited = 0;
-        procTickQueueFull = 0;
-        procTickQueued = 0;
     }
 
     // Per-tick increment methods
     public void incrementDiskQueued() { procTickDiskQueued++; }
     public void incrementDiskDrained() { procTickDiskDrained++; }
-    public void incrementSkippedDuplicate() { procTickSkippedDuplicate++; }
+
+    public void incrementSkippedDuplicate() {
+        procTickSkippedDuplicate++;
+        totalDuplicateSkips++;
+    }
+
+    /** One increment per request polled off a player's incoming queue (whether answered or dropped). */
+    public void incrementRequestRouted() { totalRequestsRouted++; }
 
     public void incrementGenDrained() {
         procTickGenDrained++;
@@ -63,23 +64,15 @@ public class ProcessingDiagnostics {
     }
 
     public void incrementSyncRateLimited() {
-        procTickSyncRateLimited++;
         totalSyncRateLimited++;
     }
 
     public void incrementGenRateLimited() {
-        procTickGenRateLimited++;
         totalGenRateLimited++;
     }
 
     public void incrementQueueFull() {
-        procTickQueueFull++;
         totalQueueFull++;
-    }
-
-    public void incrementQueued() {
-        procTickQueued++;
-        totalQueued++;
     }
 
     public void incrementRateLimited(RequestType type) {
@@ -88,6 +81,11 @@ public class ProcessingDiagnostics {
         } else {
             incrementGenRateLimited();
         }
+    }
+
+    /** A ts&le;0 re-request cleared a stale diskReadDone entry and re-entered resolution. */
+    public void incrementReResolved() {
+        totalReResolved++;
     }
 
     // Per-tick getters (read by main thread)
@@ -104,5 +102,7 @@ public class ProcessingDiagnostics {
     public long getTotalSyncRateLimited() { return totalSyncRateLimited; }
     public long getTotalGenRateLimited() { return totalGenRateLimited; }
     public long getTotalQueueFull() { return totalQueueFull; }
-    public long getTotalQueued() { return totalQueued; }
+    public long getTotalDuplicateSkips() { return totalDuplicateSkips; }
+    public long getTotalRequestsRouted() { return totalRequestsRouted; }
+    public long getTotalReResolved() { return totalReResolved; }
 }

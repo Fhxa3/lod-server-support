@@ -1,7 +1,10 @@
 package dev.vox.lss.paper;
 
+import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
+import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.processing.OffThreadProcessor;
+import dev.vox.lss.common.processing.QueuedPayload;
 import net.minecraft.server.level.ServerLevel;
 
 import java.nio.file.Path;
@@ -13,9 +16,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * Paper-specific off-thread processor. Produces encoded byte[] payloads
  * that will be sent via Plugin Messaging on the main thread.
  */
-public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerRequestState, PaperChunkDiskReader.SimpleReadResult> {
+public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerRequestState> {
     private final PaperChunkDiskReader diskReader;
-    private final PaperChunkGenerationService generationService;
 
     // Stored dimension strings for disk read submission. Grows but never prunes — acceptable because
     // vanilla only has 3 permanent dimensions, and the map is cleared on shutdown.
@@ -23,12 +25,11 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
 
     public PaperOffThreadProcessor(Map<UUID, PaperPlayerRequestState> players,
                                     PaperChunkDiskReader diskReader,
-                                    PaperChunkGenerationService generationService,
+                                    boolean generationAvailable,
                                     Path dataDir, int perDimensionTimestampCacheSizeMB) {
         super(players,
-                diskReader != null, generationService != null, dataDir, perDimensionTimestampCacheSizeMB);
+                diskReader, generationAvailable, dataDir, perDimensionTimestampCacheSizeMB);
         this.diskReader = diskReader;
-        this.generationService = generationService;
     }
 
     public void updateDimensionContext(String dimension, ServerLevel level) {
@@ -36,53 +37,45 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
     }
 
     @Override
-    protected PaperChunkDiskReader.SimpleReadResult pollDiskResult(PaperPlayerRequestState state) {
-        if (this.diskReader == null) return null;
-        var queue = this.diskReader.getPlayerQueue(state.getPlayerUUID());
-        if (queue == null) return null;
-        return queue.poll();
-    }
-
-    @Override
-    protected PaperChunkDiskReader.SimpleReadResult pollGenerationResult(PaperPlayerRequestState state) {
-        if (this.generationService == null) return null;
-        var queue = this.generationService.getPlayerQueue(state.getPlayerUUID());
-        if (queue == null) return null;
-        return queue.poll();
-    }
-
-    @Override
-    protected void enqueueResultPayloads(PaperPlayerRequestState state, PaperChunkDiskReader.SimpleReadResult result) {
-        if (result.sectionBytes() != null) {
-            buildAndEnqueueColumnPayload(state, result.chunkX(), result.chunkZ(),
-                    result.dimension(), result.requestId(), result.columnTimestamp(),
-                    result.submissionOrder(), result.sectionBytes(), result.estimatedBytes());
-        }
-    }
-
-    @Override
-    protected void submitDiskRead(UUID playerUuid, int requestId, String dimension,
+    protected boolean submitDiskRead(UUID playerUuid, String dimension,
                                     int cx, int cz,
                                     long submissionOrder) {
-        if (this.diskReader == null) return;
+        if (this.diskReader == null) return false;
         var level = this.dimensionLevelMap.get(dimension);
         if (level == null) {
             LSSLogger.debug("No dimension context for " + dimension + ", skipping disk read for " + cx + "," + cz);
-            return;
+            return false;
         }
-        this.diskReader.submitReadDirect(playerUuid, requestId, level,
+        this.diskReader.submitReadDirect(playerUuid, dimension, level,
                 cx, cz, submissionOrder);
+        return true;
     }
 
     @Override
-    protected void buildAndEnqueueColumnPayload(PaperPlayerRequestState state, int cx, int cz,
-                                                 String dimension, int requestId,
-                                                 long columnTimestamp, long submissionOrder,
-                                                 byte[] sectionBytes, int estimatedBytes) {
+    protected boolean buildAndEnqueueColumnPayload(PaperPlayerRequestState state, int cx, int cz,
+                                                    String dimension,
+                                                    long columnTimestamp, long submissionOrder,
+                                                    byte[] sectionBytes, int estimatedBytes) {
+        if (sectionBytes.length > LSSConstants.MAX_SECTIONS_SIZE) {
+            LSSLogger.warn("Dropping oversized column [" + cx + ", " + cz + "] in " + dimension
+                    + ": " + sectionBytes.length + " bytes exceeds wire limit "
+                    + LSSConstants.MAX_SECTIONS_SIZE + " (client decoder would reject it)");
+            return false;
+        }
+        if (dimension.length() > LSSConstants.MAX_DIMENSION_STRING_LENGTH) {
+            // Drop just this column (like an oversized one): without the guard
+            // encodeVoxelColumnPreEncoded's writeUtf throws out of this method and aborts the
+            // WHOLE processing cycle. No real dimension id is this long; the !sent path answers
+            // the client up-to-date so it stops asking.
+            LSSLogger.warn("Dropping column [" + cx + ", " + cz + "] with oversized dimension id ("
+                    + dimension.length() + " chars > " + LSSConstants.MAX_DIMENSION_STRING_LENGTH + ")");
+            return false;
+        }
         byte[] encoded = PaperPayloadHandler.encodeVoxelColumnPreEncoded(
-                requestId, cx, cz, dimension, columnTimestamp, sectionBytes);
-        state.addReadyPayload(new PaperPlayerRequestState.QueuedPayload(
-                encoded, requestId, estimatedBytes, submissionOrder));
+                cx, cz, dimension, columnTimestamp, sectionBytes);
+        state.addReadyPayload(new QueuedPayload<>(encoded, estimatedBytes, submissionOrder,
+                PositionUtil.packPosition(cx, cz)));
+        return true;
     }
 
     @Override

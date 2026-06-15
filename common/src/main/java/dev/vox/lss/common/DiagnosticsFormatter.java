@@ -1,6 +1,12 @@
 package dev.vox.lss.common;
 
+import dev.vox.lss.common.processing.AbstractPlayerRequestState;
+import dev.vox.lss.common.processing.AbstractChunkDiskReader;
+import dev.vox.lss.common.processing.ProcessingDiagnostics;
+import dev.vox.lss.common.processing.TickDiagnostics;
+
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 public final class DiagnosticsFormatter {
@@ -15,7 +21,7 @@ public final class DiagnosticsFormatter {
             boolean enabled, int lodDist,
             long bwPerPlayer, long bwGlobal,
             long uptimeSec, long totalSent, long totalBytes,
-            long cumInMem, long cumUtd, long cumGen,
+            long cumInMem, long cumUtd, long cumGen, long cumReResolved,
             long diskCompleted,
             String tickDiagnostics,
             String diskReaderDiagnostics,
@@ -51,8 +57,8 @@ public final class DiagnosticsFormatter {
 
         // Sources (total)
         lines.add(String.format(
-                "Sources (total): in_mem=%d, disk=%d, up_to_date=%d, gen=%d",
-                d.cumInMem, Math.max(0, d.diskCompleted), d.cumUtd, d.cumGen
+                "Sources (total): in_mem=%d, disk=%d, up_to_date=%d, gen=%d, re_resolved=%d",
+                d.cumInMem, Math.max(0, d.diskCompleted), d.cumUtd, d.cumGen, d.cumReResolved
         ));
 
         // Sources (tick)
@@ -86,6 +92,78 @@ public final class DiagnosticsFormatter {
         }
 
         return lines;
+    }
+
+    /** The /lsslod stats per-player line, shared by both platform command handlers. */
+    public static String formatStatsLine(AbstractPlayerRequestState<?> state) {
+        return String.format(
+                "%s: handshake=%s, sent=%d sections (%s), pending_sync=%d, pending_gen=%d, send_queue=%d, requests=%d",
+                state.getPlayerName(),
+                state.hasCompletedHandshake() ? "yes" : "no",
+                state.getTotalSectionsSent(),
+                formatBytes(state.getTotalBytesSent()),
+                state.getHeldSyncSlots(),
+                state.getHeldGenSlots(),
+                state.getSendQueueSize(),
+                state.getTotalRequestsReceived()
+        );
+    }
+
+    /** Collect the /lsslod diag data from common-typed sources, shared by both platforms.
+     *  A null {@code diskReader} (reader not running) renders the DiskReader line as
+     *  "disabled" and contributes zero completed reads — the command must answer in every
+     *  service state, never throw at the admin. */
+    public static DiagData collectDiagData(boolean enabled, int lodDistanceChunks,
+                                           long bwPerPlayer, long bwGlobal, int sendQueueLimitPerPlayer,
+                                           long uptimeSec, String tickDiagnostics, long windowBandwidthRate,
+                                           ProcessingDiagnostics diag, AbstractChunkDiskReader diskReader,
+                                           SharedBandwidthLimiter bwLimiter,
+                                           String generationDiagnosticsOrNull,
+                                           Collection<? extends AbstractPlayerRequestState<?>> states) {
+        long totalSent = 0;
+        long totalBytes = 0;
+        var players = new ArrayList<PlayerDiag>();
+        for (var state : states) {
+            totalSent += state.getTotalSectionsSent();
+            totalBytes += state.getTotalBytesSent();
+            players.add(new PlayerDiag(
+                    state.getPlayerName(),
+                    state.getSendQueueSize(), sendQueueLimitPerPlayer,
+                    state.getHeldSyncSlots(), state.getHeldGenSlots(),
+                    state.getTotalSectionsSent(), state.getTotalBytesSent()
+            ));
+        }
+
+        return new DiagData(
+                enabled, lodDistanceChunks,
+                bwPerPlayer, bwGlobal,
+                uptimeSec, totalSent, totalBytes,
+                diag.getTotalInMemory(), diag.getTotalUpToDate(), diag.getTotalGenDrained(),
+                diag.getTotalReResolved(),
+                diskReader != null ? diskReader.getDiag().getSuccessfulReadCount() : 0,
+                tickDiagnostics,
+                diskReader != null ? diskReader.getDiagnostics() : "disabled",
+                generationDiagnosticsOrNull, generationDiagnosticsOrNull != null,
+                bwLimiter.getTotalBytesSent(),
+                windowBandwidthRate,
+                players
+        );
+    }
+
+    /** The periodic server debug summary, shared by both platform tick loops. */
+    public static void logDebugSummary(TickDiagnostics diag, long uptimeSec, long globalByteLimit,
+                                       SharedBandwidthLimiter bwLimiter,
+                                       Collection<? extends AbstractPlayerRequestState<?>> states) {
+        if (!LSSLogger.isDebugEnabled()) return;
+        long bwRate = uptimeSec > 0 ? bwLimiter.getTotalBytesSent() / uptimeSec : 0;
+        LSSLogger.debug(diag.formatSummary(bwRate, globalByteLimit));
+        for (var state : states) {
+            if (!state.hasCompletedHandshake()) continue;
+            LSSLogger.debug(String.format("  %s: sq=%d, syncSlots=%d/%d, genSlots=%d/%d",
+                    state.getPlayerName(), state.getSendQueueSize(),
+                    state.getHeldSyncSlots(), state.getSyncSlotCap(),
+                    state.getHeldGenSlots(), state.getGenSlotCap()));
+        }
     }
 
     public static String formatRate(double rate) {

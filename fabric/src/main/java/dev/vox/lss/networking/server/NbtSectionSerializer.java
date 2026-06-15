@@ -42,8 +42,15 @@ final class NbtSectionSerializer {
         var future = chunkMap.read(new ChunkPos(cx, cz));
         var optionalTag = future.get(LSSConstants.DISK_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         if (optionalTag.isEmpty()) return null;
-        var chunkNbt = optionalTag.get();
+        return serializeChunkNbt(optionalTag.get(), registryAccess);
+    }
 
+    /**
+     * Serialize a chunk's NBT (as read from a region file) into MC-native wire format.
+     * Returns {@code null} if the chunk is not FULL or has no sections, an empty array if every
+     * section is empty, or the serialized section bytes. Package-visible for testing.
+     */
+    static byte[] serializeChunkNbt(CompoundTag chunkNbt, RegistryAccess registryAccess) {
         var statusStr = chunkNbt.getStringOr("Status", null);
         if (statusStr == null || ChunkStatus.byName(statusStr) != ChunkStatus.FULL) return null;
 
@@ -87,13 +94,18 @@ final class NbtSectionSerializer {
                 buf.writeByte(p.sectionY);
                 p.section.write(buf);
 
-                boolean hasBlockLight = p.blockLight.length == 2048;
+                // All-zero layers are skipped to match SectionSerializer exactly: the live path
+                // omits them ("absent" means all-zero on the wire), and vanilla saves the light
+                // engine's allocated-but-zeroed arrays (e.g. after a light source is removed), so
+                // shipping them would make disk serves byte-diverge from live serves of the same
+                // content — breaking the up-to-date economy and DirtyContentFilter seeding.
+                boolean hasBlockLight = p.blockLight.length == 2048 && hasNonZeroNibble(p.blockLight);
                 buf.writeBoolean(hasBlockLight);
                 if (hasBlockLight) {
                     buf.writeBytes(p.blockLight);
                 }
 
-                boolean hasSkyLight = p.skyLight.length == 2048;
+                boolean hasSkyLight = p.skyLight.length == 2048 && hasNonZeroNibble(p.skyLight);
                 buf.writeBoolean(hasSkyLight);
                 if (hasSkyLight) {
                     buf.writeBytes(p.skyLight);
@@ -146,17 +158,18 @@ final class NbtSectionSerializer {
         }
 
         if (section.hasOnlyAir()) {
-            if (blockLightData.length != 2048) {
+            if (blockLightData.length != 2048 || !hasNonZeroNibble(blockLightData)) {
                 return null;
             }
-            // Check if block light has any non-zero nibbles
-            boolean hasLight = false;
-            for (byte b : blockLightData) {
-                if (b != 0) { hasLight = true; break; }
-            }
-            if (!hasLight) return null;
         }
 
         return section;
+    }
+
+    private static boolean hasNonZeroNibble(byte[] light) {
+        for (byte b : light) {
+            if (b != 0) return true;
+        }
+        return false;
     }
 }

@@ -17,9 +17,12 @@ public record DirtyColumnsS2CPayload(
     public static final StreamCodec<FriendlyByteBuf, DirtyColumnsS2CPayload> CODEC =
             StreamCodec.of(
                     (buf, payload) -> {
-                        buf.writeVarInt(payload.dirtyPositions.length);
-                        for (long pos : payload.dirtyPositions) {
-                            buf.writeLong(pos);
+                        // Clamp on encode to match the decoder cap (and the Paper encoder),
+                        // so an over-long array can never produce a frame the peer rejects.
+                        int len = Math.min(payload.dirtyPositions.length, MAX_POSITIONS);
+                        buf.writeVarInt(len);
+                        for (int i = 0; i < len; i++) {
+                            buf.writeLong(payload.dirtyPositions[i]);
                         }
                     },
                     buf -> {

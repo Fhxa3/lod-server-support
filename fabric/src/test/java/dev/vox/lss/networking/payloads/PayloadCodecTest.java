@@ -51,20 +51,18 @@ class PayloadCodecTest {
 
     @Test
     void sessionConfigRoundtrip() {
-        var original = new SessionConfigS2CPayload(9, true, 128, 1, 50, 100, 20, 40, true, 8_388_608L);
+        // Must use the live protocol version: the decoder treats any other version as a
+        // foreign layout and drains the frame instead of reading the fields.
+        var original = new SessionConfigS2CPayload(LSSConstants.PROTOCOL_VERSION, true, 128, 100, 40, true);
         var b = buf();
         SessionConfigS2CPayload.CODEC.encode(b, original);
         var decoded = SessionConfigS2CPayload.CODEC.decode(b);
         assertEquals(original.protocolVersion(), decoded.protocolVersion());
         assertEquals(original.enabled(), decoded.enabled());
         assertEquals(original.lodDistanceChunks(), decoded.lodDistanceChunks());
-        assertEquals(original.serverCapabilities(), decoded.serverCapabilities());
-        assertEquals(original.syncOnLoadRateLimitPerPlayer(), decoded.syncOnLoadRateLimitPerPlayer());
         assertEquals(original.syncOnLoadConcurrencyLimitPerPlayer(), decoded.syncOnLoadConcurrencyLimitPerPlayer());
-        assertEquals(original.generationRateLimitPerPlayer(), decoded.generationRateLimitPerPlayer());
         assertEquals(original.generationConcurrencyLimitPerPlayer(), decoded.generationConcurrencyLimitPerPlayer());
         assertEquals(original.generationEnabled(), decoded.generationEnabled());
-        assertEquals(original.playerBandwidthLimit(), decoded.playerBandwidthLimit());
         b.release();
     }
 
@@ -77,41 +75,21 @@ class PayloadCodecTest {
                 LSSConstants.RESPONSE_UP_TO_DATE,
                 LSSConstants.RESPONSE_NOT_GENERATED
         };
-        int[] requestIds = {42, 99, 77};
-        var original = new BatchResponseS2CPayload(types, requestIds, 3);
+        long[] positions = {
+                PositionUtil.packPosition(42, -1),
+                PositionUtil.packPosition(99, 3),
+                PositionUtil.packPosition(-77, 77)
+        };
+        var original = new BatchResponseS2CPayload(types, positions, 3);
         var b = buf();
         BatchResponseS2CPayload.CODEC.encode(b, original);
         var decoded = BatchResponseS2CPayload.CODEC.decode(b);
         assertEquals(3, decoded.count());
         for (int i = 0; i < 3; i++) {
             assertEquals(types[i], decoded.responseTypes()[i]);
-            assertEquals(requestIds[i], decoded.requestIds()[i]);
+            assertEquals(positions[i], decoded.packedPositions()[i]);
         }
         assertEquals(0, b.readableBytes());
-        b.release();
-    }
-
-    // --- CancelRequestC2SPayload ---
-
-    @Test
-    void cancelRequestRoundtrip() {
-        var original = new CancelRequestC2SPayload(55);
-        var b = buf();
-        CancelRequestC2SPayload.CODEC.encode(b, original);
-        var decoded = CancelRequestC2SPayload.CODEC.decode(b);
-        assertEquals(original.requestId(), decoded.requestId());
-        b.release();
-    }
-
-    // --- BandwidthUpdateC2SPayload ---
-
-    @Test
-    void bandwidthUpdateRoundtrip() {
-        var original = new BandwidthUpdateC2SPayload(1_000_000L);
-        var b = buf();
-        BandwidthUpdateC2SPayload.CODEC.encode(b, original);
-        var decoded = BandwidthUpdateC2SPayload.CODEC.decode(b);
-        assertEquals(original.desiredRate(), decoded.desiredRate());
         b.release();
     }
 
@@ -135,19 +113,17 @@ class PayloadCodecTest {
 
     @Test
     void batchChunkRequestRoundtrip() {
-        int[] requestIds = {7, 42, 99};
         long[] positions = {
                 PositionUtil.packPosition(10, 20),
                 PositionUtil.packPosition(-5, 100),
                 PositionUtil.packPosition(7, -3)
         };
         long[] timestamps = {1000L, 0L, -1L};
-        var original = new BatchChunkRequestC2SPayload(requestIds, positions, timestamps, 3);
+        var original = new BatchChunkRequestC2SPayload(positions, timestamps, 3);
         var b = buf();
         BatchChunkRequestC2SPayload.CODEC.encode(b, original);
         var decoded = BatchChunkRequestC2SPayload.CODEC.decode(b);
         assertEquals(3, decoded.count());
-        assertArrayEquals(requestIds, decoded.requestIds());
         assertArrayEquals(positions, decoded.packedPositions());
         assertArrayEquals(timestamps, decoded.clientTimestamps());
         b.release();
@@ -158,7 +134,7 @@ class PayloadCodecTest {
     @Test
     void voxelColumnOverworldDimensionRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(1, 10, 20, Level.OVERWORLD, 12345L, sections);
+        var original = new VoxelColumnS2CPayload(10, 20, Level.OVERWORLD, 12345L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);
@@ -173,7 +149,7 @@ class PayloadCodecTest {
     @Test
     void voxelColumnNetherDimensionRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(2, 5, -5, Level.NETHER, 99L, sections);
+        var original = new VoxelColumnS2CPayload(5, -5, Level.NETHER, 99L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);
@@ -184,7 +160,7 @@ class PayloadCodecTest {
     @Test
     void voxelColumnEndDimensionRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(3, 0, 0, Level.END, 0L, sections);
+        var original = new VoxelColumnS2CPayload(0, 0, Level.END, 0L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);

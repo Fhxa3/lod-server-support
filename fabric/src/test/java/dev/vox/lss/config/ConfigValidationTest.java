@@ -2,6 +2,11 @@ package dev.vox.lss.config;
 
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.Arrays;
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 class ConfigValidationTest {
@@ -109,18 +114,6 @@ class ConfigValidationTest {
     }
 
     @Test
-    void syncOnLoadRateLimitPerPlayerClamped() {
-        var c = serverConfig();
-        c.syncOnLoadRateLimitPerPlayer = 0;
-        c.validate();
-        assertEquals(1, c.syncOnLoadRateLimitPerPlayer);
-
-        c.syncOnLoadRateLimitPerPlayer = 9999;
-        c.validate();
-        assertEquals(1000, c.syncOnLoadRateLimitPerPlayer);
-    }
-
-    @Test
     void syncOnLoadConcurrencyLimitPerPlayerClamped() {
         var c = serverConfig();
         c.syncOnLoadConcurrencyLimitPerPlayer = 0;
@@ -133,18 +126,6 @@ class ConfigValidationTest {
     }
 
     @Test
-    void generationRateLimitPerPlayerClamped() {
-        var c = serverConfig();
-        c.generationRateLimitPerPlayer = 0;
-        c.validate();
-        assertEquals(1, c.generationRateLimitPerPlayer);
-
-        c.generationRateLimitPerPlayer = 9999;
-        c.validate();
-        assertEquals(1000, c.generationRateLimitPerPlayer);
-    }
-
-    @Test
     void generationConcurrencyLimitPerPlayerClamped() {
         var c = serverConfig();
         c.generationConcurrencyLimitPerPlayer = 0;
@@ -154,6 +135,69 @@ class ConfigValidationTest {
         c.generationConcurrencyLimitPerPlayer = 9999;
         c.validate();
         assertEquals(1000, c.generationConcurrencyLimitPerPlayer);
+    }
+
+    @Test
+    void perDimensionTimestampCacheSizeMBClamped() {
+        var c = serverConfig();
+        c.perDimensionTimestampCacheSizeMB = 0;
+        c.validate();
+        assertEquals(1, c.perDimensionTimestampCacheSizeMB);
+
+        c.perDimensionTimestampCacheSizeMB = 9999;
+        c.validate();
+        assertEquals(256, c.perDimensionTimestampCacheSizeMB);
+    }
+
+    // --- Reflective clamp sweep ---
+
+    private static List<Field> numericServerConfigFields() {
+        List<Field> fields = Arrays.stream(LSSServerConfig.class.getFields())
+                .filter(f -> !Modifier.isStatic(f.getModifiers()))
+                .filter(f -> f.getType().isPrimitive() && f.getType() != boolean.class)
+                .toList();
+        // Guard against the sweep going vacuous if fields get refactored to non-public.
+        assertTrue(fields.size() >= 11, "clamp sweep lost fields, found only: " + fields);
+        assertTrue(fields.stream().anyMatch(f -> f.getName().equals("perDimensionTimestampCacheSizeMB")),
+                "clamp sweep no longer sees perDimensionTimestampCacheSizeMB");
+        return fields;
+    }
+
+    /**
+     * Every numeric server-config field must be pulled back to a sane range by validate(),
+     * even from int extremes. Auto-catches future fields added without a clamp — the named
+     * tests above pin the exact bounds, this pins that bounds exist at all.
+     */
+    @Test
+    void everyNumericServerFieldClampedAtIntExtremes() throws Exception {
+        for (Field f : numericServerConfigFields()) {
+            assertEquals(int.class, f.getType(),
+                    f.getName() + ": extend the clamp sweep for non-int numeric fields");
+
+            var c = serverConfig();
+            f.setInt(c, Integer.MIN_VALUE);
+            c.validate();
+            assertTrue(f.getInt(c) >= 1,
+                    f.getName() + " not clamped up from Integer.MIN_VALUE, still " + f.getInt(c));
+
+            f.setInt(c, Integer.MAX_VALUE);
+            c.validate();
+            assertTrue(f.getInt(c) < Integer.MAX_VALUE,
+                    f.getName() + " not clamped down from Integer.MAX_VALUE");
+        }
+    }
+
+    /** Compiled defaults must already sit inside their clamp ranges: validate() may not move them. */
+    @Test
+    void defaultsSurviveValidateUnchanged() throws Exception {
+        var validated = serverConfig();
+        validated.validate();
+        var pristine = serverConfig();
+        for (Field f : LSSServerConfig.class.getFields()) {
+            if (Modifier.isStatic(f.getModifiers())) continue;
+            assertEquals(f.get(pristine), f.get(validated),
+                    "default for " + f.getName() + " is outside its clamp range");
+        }
     }
 
     // --- LSSClientConfig ---

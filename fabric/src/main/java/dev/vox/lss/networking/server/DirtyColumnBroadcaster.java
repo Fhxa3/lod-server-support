@@ -7,12 +7,17 @@ import dev.vox.lss.common.tracking.DirtyColumnTracker;
 import dev.vox.lss.config.LSSServerConfig;
 import dev.vox.lss.networking.payloads.DirtyColumnsS2CPayload;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.Level;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 /**
  * Periodically drains dirty chunk positions from {@link DirtyColumnTracker}
@@ -20,20 +25,58 @@ import java.util.UUID;
  */
 class DirtyColumnBroadcaster {
 
-    private final MinecraftServer server;
+    /**
+     * Test seam: the broadcaster's only reads of the live ServerPlayer (chunk position,
+     * removal) and the network send, injectable so unit tests can drive
+     * {@link DirtyColumnBroadcaster#tick} without a running server. Production uses
+     * {@link DirtyColumnBroadcaster#LIVE_PLAYER_VIEW}.
+     */
+    interface PlayerView {
+        boolean isRemoved(PlayerRequestState state);
+        int chunkX(PlayerRequestState state);
+        int chunkZ(PlayerRequestState state);
+        void send(PlayerRequestState state, DirtyColumnsS2CPayload payload) throws Exception;
+    }
+
+    private static final PlayerView LIVE_PLAYER_VIEW = new PlayerView() {
+        @Override public boolean isRemoved(PlayerRequestState state) { return state.getPlayer().isRemoved(); }
+        @Override public int chunkX(PlayerRequestState state) { return state.getPlayer().getBlockX() >> 4; }
+        @Override public int chunkZ(PlayerRequestState state) { return state.getPlayer().getBlockZ() >> 4; }
+        @Override public void send(PlayerRequestState state, DirtyColumnsS2CPayload payload) {
+            ServerPlayNetworking.send(state.getPlayer(), payload);
+        }
+    };
+
     private final Map<UUID, PlayerRequestState> players;
     private final FabricOffThreadProcessor offThreadProcessor;
     private final DirtyColumnTracker dirtyTracker;
+    private final Supplier<Iterable<ResourceKey<Level>>> dimensions;
+    private final PlayerView playerView;
 
     private int counter = 0;
     private long[] positionFilterBuffer = null;
 
     DirtyColumnBroadcaster(MinecraftServer server, Map<UUID, PlayerRequestState> players,
                            FabricOffThreadProcessor offThreadProcessor, DirtyColumnTracker dirtyTracker) {
-        this.server = server;
+        this(players, offThreadProcessor, dirtyTracker, () -> serverDimensions(server), LIVE_PLAYER_VIEW);
+    }
+
+    /** Test seam: injectable dimension source and {@link PlayerView}; the production
+     *  constructor above wires live defaults with identical behavior. */
+    DirtyColumnBroadcaster(Map<UUID, PlayerRequestState> players,
+                           FabricOffThreadProcessor offThreadProcessor, DirtyColumnTracker dirtyTracker,
+                           Supplier<Iterable<ResourceKey<Level>>> dimensions, PlayerView playerView) {
         this.players = players;
         this.offThreadProcessor = offThreadProcessor;
         this.dirtyTracker = dirtyTracker;
+        this.dimensions = dimensions;
+        this.playerView = playerView;
+    }
+
+    private static List<ResourceKey<Level>> serverDimensions(MinecraftServer server) {
+        var keys = new ArrayList<ResourceKey<Level>>(3);
+        for (var level : server.getAllLevels()) keys.add(level.dimension());
+        return keys;
     }
 
     void tick(LSSServerConfig config) {
@@ -43,8 +86,8 @@ class DirtyColumnBroadcaster {
 
         Set<UUID> failedPlayers = null;
 
-        for (var level : this.server.getAllLevels()) {
-            String dimensionStr = level.dimension().identifier().toString();
+        for (var dimension : this.dimensions.get()) {
+            String dimensionStr = dimension.identifier().toString();
             long[] dirty = this.dirtyTracker.drainDirty(dimensionStr);
             if (dirty == null || dirty.length == 0) continue;
 
@@ -58,32 +101,44 @@ class DirtyColumnBroadcaster {
             for (var state : this.players.values()) {
                 if (!state.hasCompletedHandshake()) continue;
 
-                var player = state.getPlayer();
-                if (failedPlayers != null && failedPlayers.contains(player.getUUID())) continue;
-                if (!state.getLastDimension().equals(level.dimension())) continue;
-                if (player.isRemoved()) continue;
-                int playerCx = player.getBlockX() >> 4;
-                int playerCz = player.getBlockZ() >> 4;
+                UUID uuid = state.getPlayerUUID();
+                if (failedPlayers != null && failedPlayers.contains(uuid)) continue;
+                if (!state.getLastDimension().equals(dimension)) continue;
+                if (this.playerView.isRemoved(state)) continue;
+                int playerCx = this.playerView.chunkX(state);
+                int playerCz = this.playerView.chunkZ(state);
+                // Raw lodDistanceChunks, no LOD_DISTANCE_BUFFER: columns held via the request
+                // gate's +32 buffer never receive dirty pushes.
                 int lodDist = config.lodDistanceChunks;
 
-                int count = 0;
-                for (long packed : dirty) {
-                    if (!PositionUtil.isOutOfRange(packed, playerCx, playerCz, lodDist)) {
-                        this.positionFilterBuffer[count++] = packed;
-                        if (count >= DirtyColumnsS2CPayload.MAX_POSITIONS) break;
+                // Paginate: a single DirtyColumns payload caps at MAX_POSITIONS, so when a player
+                // has more in-range dirty positions than the cap, send multiple payloads rather
+                // than dropping the overflow (which was already drained+invalidated and would
+                // otherwise stay stale on the client until rejoin). The global drain/mark
+                // accounting is untouched — only the number of packets changes.
+                int idx = 0;
+                while (idx < dirty.length) {
+                    int count = 0;
+                    while (idx < dirty.length && count < DirtyColumnsS2CPayload.MAX_POSITIONS) {
+                        long packed = dirty[idx++];
+                        if (!PositionUtil.isOutOfRange(packed, playerCx, playerCz, lodDist)) {
+                            this.positionFilterBuffer[count++] = packed;
+                        }
                     }
-                }
+                    if (count == 0) continue;
 
-                if (count > 0) {
                     long[] result = new long[count];
                     System.arraycopy(this.positionFilterBuffer, 0, result, 0, count);
-                    state.clearDiskReadDoneForPositions(result);
+                    // Done-bits clear before the send: a re-request racing the notification
+                    // re-serves at worst, never resolves to a stale up_to_date.
+                    this.offThreadProcessor.clearDiskReadDone(uuid, result);
                     try {
-                        ServerPlayNetworking.send(player, new DirtyColumnsS2CPayload(result));
+                        this.playerView.send(state, new DirtyColumnsS2CPayload(result));
                     } catch (Exception e) {
-                        LSSLogger.error("Failed to send dirty columns to " + player.getName().getString(), e);
+                        LSSLogger.error("Failed to send dirty columns to " + state.getPlayerName(), e);
                         if (failedPlayers == null) failedPlayers = new HashSet<>();
-                        failedPlayers.add(player.getUUID());
+                        failedPlayers.add(uuid);
+                        break; // stop paginating to this player for this broadcast
                     }
                 }
             }

@@ -1,33 +1,40 @@
 package dev.vox.lss.common.processing;
 
+import dev.vox.lss.common.PositionUtil;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 /**
- * Immutable snapshot built on the main thread each tick, consumed by the processing thread.
- * Contains all server-thread-only data needed for off-thread request processing.
+ * Per-tick state snapshot built on the main thread, consumed by the processing thread.
+ * The maps are allocated fresh each tick and ownership transfers at
+ * {@link OffThreadProcessor#postSnapshot}: the main thread never touches them again,
+ * so the processing thread can iterate without synchronization.
+ *
+ * <p>Snapshot state is latest-wins (an unconsumed snapshot is simply replaced by the
+ * next tick's); lossless events (generation outcomes, removals, invalidations,
+ * dirty-clears) travel through the {@link OffThreadProcessor} mailbox instead.
  */
 public record TickSnapshot(
-        Map<UUID, PlayerTickData> players,
+        Map<UUID, String> playerDimensions,
         Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes,
-        List<GenerationReadyData> generationReady,
-        List<UUID> removedPlayers,
         int maxSendQueueSize,
         boolean shutdown
 ) {
-    /** Per-player snapshot of server-thread-only data. */
-    public record PlayerTickData(
-            String dimension,
-            boolean dimensionChanged
-    ) {}
-
-    /** Generation service: extracted data for chunks that completed generation. */
+    /**
+     * A generation outcome for one player. {@code columnData == null} means the chunk
+     * could not be generated (timeout, extraction error, or capacity rejection) and the
+     * client should be told ColumnNotGenerated.
+     */
     public record GenerationReadyData(
             UUID playerUuid,
-            int requestId,
+            int cx,
+            int cz,
+            String dimension,
             LoadedColumnData columnData,
             long columnTimestamp,
             long submissionOrder
@@ -35,9 +42,20 @@ public record TickSnapshot(
 
     /** Shutdown sentinel — tells the processing thread to exit. */
     public static TickSnapshot shutdownSentinel() {
-        return new TickSnapshot(
-                Map.of(), Map.of(), List.of(), List.of(),
-                0, true
-        );
+        return new TickSnapshot(Map.of(), Map.of(), 0, true);
+    }
+
+    /**
+     * Group generation outcomes' packed positions by player, for skipping those positions
+     * in the loaded-chunk probe pass. Returns null when there is nothing to group.
+     */
+    public static Map<UUID, LongOpenHashSet> groupPositionsByPlayer(List<GenerationReadyData> generationReady) {
+        if (generationReady.isEmpty()) return null;
+        Map<UUID, LongOpenHashSet> grouped = new HashMap<>();
+        for (var genData : generationReady) {
+            grouped.computeIfAbsent(genData.playerUuid(), k -> new LongOpenHashSet())
+                    .add(PositionUtil.packPosition(genData.cx(), genData.cz()));
+        }
+        return grouped;
     }
 }

@@ -41,7 +41,7 @@ class VoxelSectionPayloadTest {
     void roundtripPreservesHeaderFields() {
         var dim = ResourceKey.create(Registries.DIMENSION, Identifier.parse(LSSConstants.DIM_STR_OVERWORLD));
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(1, 10, -20, dim, 99999L, sections);
+        var original = new VoxelColumnS2CPayload(10, -20, dim, 99999L, sections);
 
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
@@ -66,7 +66,7 @@ class VoxelSectionPayloadTest {
         wireBuf.readBytes(raw);
         wireBuf.release();
 
-        var original = new VoxelColumnS2CPayload(2, -5, 100, dim, 12345L, raw);
+        var original = new VoxelColumnS2CPayload(-5, 100, dim, 12345L, raw);
 
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
@@ -89,7 +89,7 @@ class VoxelSectionPayloadTest {
     void roundtripEmptyColumn() {
         var dim = ResourceKey.create(Registries.DIMENSION, Identifier.parse(LSSConstants.DIM_STR_THE_END));
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(3, 0, 0, dim, 0L, sections);
+        var original = new VoxelColumnS2CPayload(0, 0, dim, 0L, sections);
 
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
@@ -110,7 +110,7 @@ class VoxelSectionPayloadTest {
     void estimatedBytesPositive() {
         var dim = ResourceKey.create(Registries.DIMENSION, Identifier.parse(LSSConstants.DIM_STR_OVERWORLD));
         byte[] sections = emptyColumn();
-        var payload = new VoxelColumnS2CPayload(4, 0, 0, dim, 0L, sections);
+        var payload = new VoxelColumnS2CPayload(0, 0, dim, 0L, sections);
         assertTrue(payload.estimatedBytes() > 0);
     }
 
@@ -126,25 +126,23 @@ class VoxelSectionPayloadTest {
     }
 
     @Test
-    void sessionConfigWithCapabilitiesRoundtrip() {
-        var original = new SessionConfigS2CPayload(9, true, 128, 1, 50, 100, 20, 40, true, 8_388_608L);
+    void sessionConfigRoundtrip() {
+        // Must use the live protocol version: the decoder treats any other version as a
+        // foreign layout and drains the frame instead of reading the fields.
+        var original = new SessionConfigS2CPayload(LSSConstants.PROTOCOL_VERSION, true, 128, 100, 40, true);
         var b = buf();
         SessionConfigS2CPayload.CODEC.encode(b, original);
         var decoded = SessionConfigS2CPayload.CODEC.decode(b);
-        assertEquals(1, decoded.serverCapabilities());
-        assertEquals(50, decoded.syncOnLoadRateLimitPerPlayer());
         assertEquals(100, decoded.syncOnLoadConcurrencyLimitPerPlayer());
-        assertEquals(20, decoded.generationRateLimitPerPlayer());
         assertEquals(40, decoded.generationConcurrencyLimitPerPlayer());
         assertTrue(decoded.generationEnabled());
-        assertEquals(8_388_608L, decoded.playerBandwidthLimit());
         b.release();
     }
 
     @Test
     void dimensionOverworldRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(5, 1, 3, Level.OVERWORLD, 50000L, sections);
+        var original = new VoxelColumnS2CPayload(1, 3, Level.OVERWORLD, 50000L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);
@@ -155,7 +153,7 @@ class VoxelSectionPayloadTest {
     @Test
     void dimensionNetherRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(6, 0, 0, Level.NETHER, 0L, sections);
+        var original = new VoxelColumnS2CPayload(0, 0, Level.NETHER, 0L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);
@@ -166,7 +164,7 @@ class VoxelSectionPayloadTest {
     @Test
     void dimensionEndRoundtrip() {
         byte[] sections = emptyColumn();
-        var original = new VoxelColumnS2CPayload(7, 0, 0, Level.END, 0L, sections);
+        var original = new VoxelColumnS2CPayload(0, 0, Level.END, 0L, sections);
         var b = buf();
         VoxelColumnS2CPayload.CODEC.encode(b, original);
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);

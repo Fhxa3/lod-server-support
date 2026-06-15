@@ -18,6 +18,28 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class LSSApi {
     private static final List<VoxelColumnConsumer> columnConsumers = new CopyOnWriteArrayList<>();
 
+    /**
+     * Receives {@link #dispatchColumn}'s implicit ingest-failure reports (a throwing
+     * consumer). Test seam — production default restored by {@link #resetReportSink()};
+     * package-private so only same-package tests can swap it.
+     */
+    @FunctionalInterface
+    interface ReportSink {
+        void report(ResourceKey<Level> dimension, int chunkX, int chunkZ);
+    }
+
+    // Test seam, default-wired to production (zero behavior change when default-wired).
+    static ReportSink reportSink;
+
+    static {
+        resetReportSink();
+    }
+
+    /** Restores production wiring for the test seam. */
+    static void resetReportSink() {
+        reportSink = LSSClientNetworking::reportIngestFailure;
+    }
+
     private LSSApi() {}
 
     /**
@@ -58,6 +80,24 @@ public final class LSSApi {
     }
 
     /**
+     * Report that a delivered column could not be ingested (e.g. the consumer's storage
+     * was not ready or rejected the data). LSS forgets the column's received-stamp and
+     * re-requests it on a later scan, so the data is re-served instead of being treated
+     * as delivered. Without this report a rejected column becomes a permanent hole — LSS
+     * has no other way to distinguish "delivered and consumed" from "delivered and lost".
+     * Safe to call from any thread.
+     *
+     * <p>Throwing from {@link VoxelColumnConsumer#onVoxelColumnReceived} is treated as an
+     * implicit report. Either way the re-served column is re-dispatched to <em>every</em>
+     * registered consumer, so consumers must tolerate duplicate deliveries (the protocol
+     * is position-keyed and idempotent). Repeated failures for the same position are
+     * capped per session, after which the position is parked until its content changes.
+     */
+    public static void reportIngestFailure(ResourceKey<Level> dimension, int chunkX, int chunkZ) {
+        LSSClientNetworking.reportIngestFailure(dimension, chunkX, chunkZ);
+    }
+
+    /**
      * Internal dispatch method — not part of the public API.
      * Called by the client networking layer to fan out column data to consumers.
      * @hidden
@@ -67,8 +107,16 @@ public final class LSSApi {
         for (var consumer : columnConsumers) {
             try {
                 consumer.onVoxelColumnReceived(level, dimension, chunkX, chunkZ, columnData);
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // Isolate per consumer: one consumer's failure (incl. Errors such as a
+                // LinkageError from an incompatible LOD mod) must not skip the others.
                 LSSLogger.error("Voxel column consumer threw exception", e);
+                // A throw means the column was not ingested — treat it like an explicit
+                // reportIngestFailure so the position is re-served instead of becoming a
+                // permanent hole: exactly one report per failing consumer per delivery.
+                // Chronic throwers are bounded by the per-position failure cap before
+                // the position parks.
+                reportSink.report(dimension, chunkX, chunkZ);
             }
         }
     }

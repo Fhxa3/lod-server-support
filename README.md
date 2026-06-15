@@ -8,10 +8,11 @@ Supports both **Fabric** and **Paper** servers. The client is always a Fabric mo
 
 | LSS Version | Minecraft | Fabric | Paper | Voxy | Java |
 |---|---|---|---|---|---|
-| **v0.3.x** | **26.1.x** | Server + Client | *Coming soon* | 0.2.14-alpha+ | 25+ |
+| **v0.4.x** | **26.1.x** | Server + Client | Server | 0.2.16-beta+ | 25+ |
+| v0.3.x | 26.1.x | Server + Client | — | 0.2.14-alpha+ | 25+ |
 | v0.2.x | 1.21.11 | Server + Client | Server | 0.2.13-alpha | 21+ |
 
-Paper 26.1 support will ship in a future release once Paper 26.1 stabilizes. Paper server admins on 1.21.11 should continue using [v0.2.2](https://modrinth.com/plugin/lod-server-support/versions).
+Paper server support is available again as of v0.4.0, built against Paper 26.1.2 (and Purpur). Paper server admins on the older 1.21.11 line should continue using [v0.2.3](https://modrinth.com/plugin/lod-server-support/versions).
 
 https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 
@@ -20,7 +21,7 @@ https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 Without LSS, Voxy can only build LOD data from chunks the client has already loaded — limiting distant terrain rendering to areas the player has personally visited. LSS moves this work to the server:
 
 1. Client connects and performs a handshake with the server
-2. Server sends session config (distance limits, rate limits, generation settings)
+2. Server sends session config (distance limits, concurrency limits, generation settings)
 3. Client scans outward in an expanding spiral, batch-requesting chunks it doesn't have cached
 4. Server reads chunks from disk (or generates them on demand), serializes the raw MC section data (block states, biomes, lighting), and streams it back
 5. Client receives the section data and feeds it directly into Voxy's rendering engine via `rawIngest`
@@ -32,7 +33,7 @@ The result: players see fully rendered terrain out to hundreds of chunks on mult
 
 Download from [Modrinth](https://modrinth.com/plugin/lod-server-support):
 
-- **v0.3.x (MC 26.1):** `lod-server-support-fabric` — Fabric mod JAR (client + server)
+- **v0.4.x (MC 26.1.x):** `lod-server-support-fabric` — Fabric mod JAR (client + server) — and `lod-server-support-paper` — Paper/Purpur server plugin
 - **v0.2.x (MC 1.21.11):** `lod-server-support-fabric` + `lod-server-support-paper` — includes Paper plugin
 
 ## Installation
@@ -48,27 +49,31 @@ Download from [Modrinth](https://modrinth.com/plugin/lod-server-support):
 1. Install [Voxy](https://modrinth.com/mod/voxy) and place `lod-server-support-fabric.jar` in the client's `mods/` directory
 2. Join a server running LSS — client config is generated at `config/lss-client-config.json`
 
-### Paper Server (v0.2.x only — MC 1.21.11)
+### Paper Server
 
-Paper 26.1 support is not yet available. Paper server admins should use [v0.2.2](https://modrinth.com/plugin/lod-server-support/versions) with MC 1.21.11.
+Requires Paper (or Purpur) for Minecraft 26.1.2.
 
 1. Place `lod-server-support-paper.jar` in the server's `plugins/` directory
 2. Install the Fabric mod **and** [Voxy](https://modrinth.com/mod/voxy) on all clients
 3. Restart the server — config is generated at `plugins/LodServerSupport/lss-server-config.json`
 
-## Requirements (v0.3.x — MC 26.1)
+## Requirements (v0.4.x — MC 26.1.x)
 
 ### Fabric Server
-- Minecraft 26.1
+- Minecraft 26.1.x
 - Fabric Loader 0.18.4+
 - Fabric API
 - Java 25+
 
+### Paper Server
+- Paper (or Purpur) for Minecraft 26.1.2
+- Java 25+
+
 ### Client
-- Minecraft 26.1
+- Minecraft 26.1.x
 - Fabric Loader 0.18.4+
 - Fabric API
-- [Voxy](https://modrinth.com/mod/voxy) 0.2.14-alpha+
+- [Voxy](https://modrinth.com/mod/voxy) 0.2.16-beta+
 - Java 25+
 
 ## Commands
@@ -81,6 +86,7 @@ Paper 26.1 support is not yet available. Paper server admins should use [v0.2.2]
 ### Client (Fabric only)
 
 - `/lss clearcache` - Clear the local column cache, forcing all chunks to be re-requested from the server
+- `/lss diag` - Show client-side diagnostics (connection, throughput, scan progress, request budget)
 
 ## Configuration
 
@@ -98,9 +104,7 @@ Server config is generated on first run:
 | `bytesPerSecondLimitGlobal` | `104857600` | Total pre-compression bandwidth cap (100 MB/s) |
 | `diskReaderThreads` | `5` | Thread pool size for async disk reads |
 | `sendQueueLimitPerPlayer` | `4000` | Max queued sections per player |
-| `syncOnLoadRateLimitPerPlayer` | `800` | Sync-on-load requests per second per player |
 | `syncOnLoadConcurrencyLimitPerPlayer` | `200` | Max in-flight sync requests per player |
-| `generationRateLimitPerPlayer` | `80` | Generation requests per second per player |
 | `generationConcurrencyLimitPerPlayer` | `16` | Max in-flight generation requests per player |
 | `enableChunkGeneration` | `true` | Generate missing chunks on demand for LOD data |
 | `generationConcurrencyLimitGlobal` | `32` | Max chunks generating server-wide at once |
@@ -118,7 +122,6 @@ Client config is generated at `config/lss-client-config.json` on first run.
 |---------|---------|-------------|
 | `receiveServerLods` | `true` | Enable receiving LOD data from the server |
 | `lodDistanceChunks` | `0` | Max LOD request distance in chunks (0 = use server limit) |
-| `offThreadSectionProcessing` | `true` | Process received sections off the render thread |
 
 
 ## License

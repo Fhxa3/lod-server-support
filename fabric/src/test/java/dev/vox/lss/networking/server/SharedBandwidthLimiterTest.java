@@ -1,6 +1,7 @@
 package dev.vox.lss.networking.server;
 
 import dev.vox.lss.common.SharedBandwidthLimiter;
+import dev.vox.lss.common.processing.PlayerBandwidthTracker;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -85,5 +86,32 @@ class SharedBandwidthLimiterTest {
         assertEquals(3000, limiter.getTotalBytesSent(), "Total should accumulate sends");
         limiter.recordSend(500);
         assertEquals(3500, limiter.getTotalBytesSent(), "Total should keep accumulating");
+    }
+
+    // ---- PlayerBandwidthTracker burst cap ----
+
+    @Test
+    void playerBurstAfterIdleIsCappedAtQuarterAllocation() throws InterruptedException {
+        // An idle player accumulates refill; without the allocation/4 burst cap, the
+        // backlog flushes in one tick as a lag spike (invisible in per-second averages).
+        var tracker = new PlayerBandwidthTracker();
+        long allocation = 4_000_000; // burst cap = allocation / 4 = 1_000_000
+        int chunk = 50_000;
+
+        // Idle past the 250ms burst window: the uncapped refill (~1.6MB) exceeds the cap
+        Thread.sleep(400);
+
+        long sent = 0;
+        while (tracker.canSend(allocation) && sent < allocation) {
+            tracker.recordSend(chunk);
+            sent += chunk;
+        }
+
+        assertTrue(sent >= 1_000_000,
+                "post-idle tokens must cover the full burst cap (sent=" + sent + ")");
+        // Slack allows for refill drift if milliseconds elapse inside the loop (4000 bytes/ms);
+        // an uncapped refill would send >= 1_600_000.
+        assertTrue(sent <= 1_300_000,
+                "post-idle burst must be capped at allocation/4, not the raw refill (sent=" + sent + ")");
     }
 }

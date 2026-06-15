@@ -6,21 +6,29 @@ import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.voxel.ColumnTimestampCache;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Core processing loop running on a dedicated thread.
- * Receives snapshots from the main thread, processes pre-serialized column data,
- * and enqueues results to per-player output queues.
+ * Receives per-tick snapshots and lossless events from the main thread, processes
+ * pre-serialized column data, and enqueues results to per-player output queues.
  *
- * @param <PlayerState>  the platform-specific player state type (must implement {@link PlayerStateAccess})
- * @param <ReadResult>   the platform-specific disk reader result type (must implement {@link ReadResultAccess})
+ * <p>The main→processing mailbox has two kinds of input with one sentence of semantics:
+ * snapshot state is latest-wins (an unconsumed snapshot is replaced), events are lossless
+ * (generation outcomes, player removals, timestamp invalidations, and dirty-clears
+ * accumulate until consumed). All event producers run on the main thread.
+ *
+ * @param <PlayerState>  the platform-specific player state type
  */
-public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, ReadResult extends ReadResultAccess> {
+public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerRequestState<?>> {
 
     private static final int SNAPSHOT_POLL_MS = 50;
     private static final int SHUTDOWN_JOIN_MS = 5000;
@@ -28,23 +36,38 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
     private static final int SAVE_INTERVAL_CYCLES = 6000; // ~5 min at 20 TPS
 
     /** Request for the main thread to submit a generation ticket (requires MC world state). */
-    public record GenerationTicketRequest(UUID playerUuid, int requestId, int cx, int cz,
+    public record GenerationTicketRequest(UUID playerUuid, int cx, int cz, String dimension,
                                            long submissionOrder) {}
 
     private record TimestampInvalidation(String dimension, long[] positions) {}
 
-    private final Object snapshotLock = new Object();
+    /** Everything the processing thread takes from the mailbox in one cycle. */
+    private record MailboxTake(TickSnapshot snapshot,
+                               List<TickSnapshot.GenerationReadyData> generationReady,
+                               List<UUID> removals,
+                               List<TimestampInvalidation> invalidations,
+                               Map<UUID, ArrayList<long[]>> dirtyClears) {}
+
+    // Mailbox (guarded by mailboxLock). Snapshot: latest-wins. Event buffers: lossless,
+    // swapped out whole by the processing thread. Producers are main-thread-only.
+    private final Object mailboxLock = new Object();
     private TickSnapshot pendingSnapshot;
+    private ArrayList<TickSnapshot.GenerationReadyData> pendingGenerationReady = new ArrayList<>();
+    private ArrayList<UUID> pendingRemovals = new ArrayList<>();
+    private ArrayList<TimestampInvalidation> pendingInvalidations = new ArrayList<>();
+    private HashMap<UUID, ArrayList<long[]>> pendingDirtyClears = new HashMap<>();
+
+    // Processing thread → main thread (thread-safe output)
     private final ConcurrentLinkedQueue<SendAction> sendActions = new ConcurrentLinkedQueue<>();
     private final ConcurrentLinkedQueue<GenerationTicketRequest> generationTicketRequests = new ConcurrentLinkedQueue<>();
-    private final ConcurrentLinkedQueue<TimestampInvalidation> timestampInvalidations = new ConcurrentLinkedQueue<>();
-    private final ConcurrentLinkedQueue<TickSnapshot.GenerationReadyData> droppedGenerationReady = new ConcurrentLinkedQueue<>();
+
     private final Thread processingThread;
     private final ColumnTimestampCache timestampCache;
     private final Map<UUID, PlayerState> players;
+    // Nullable: disk reading is disabled when no reader is configured
+    private final AbstractChunkDiskReader diskReader;
+    private final SendActionBatcher sendActionBatcher = new SendActionBatcher();
 
-    // Disk-first routing flag (used in preparePlayers cancel-release logic)
-    private final boolean diskReadingAvailable;
     private final boolean generationAvailable;
 
     // Collaborators
@@ -65,11 +88,16 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         return t;
     });
 
+    // this-escape is benign: the Thread is created here but only started later via start()
+    // (post-construction), and the router's back-reference is only used from the processing
+    // loop after start(), so no partially-initialized subclass state is touched before
+    // construction completes.
+    @SuppressWarnings("this-escape")
     protected OffThreadProcessor(Map<UUID, PlayerState> players,
-                                  boolean diskReadingAvailable, boolean generationAvailable,
+                                  AbstractChunkDiskReader diskReader, boolean generationAvailable,
                                   Path dataDir, int perDimensionTimestampCacheSizeMB) {
         this.players = players;
-        this.diskReadingAvailable = diskReadingAvailable;
+        this.diskReader = diskReader;
         this.generationAvailable = generationAvailable;
         this.dataDir = dataDir;
         this.timestampCache = new ColumnTimestampCache(
@@ -79,35 +107,103 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         }
         this.ctx = new ProcessingContext(this.sendActions, this.generationTicketRequests,
                 new ProcessingDiagnostics(), new SequenceCounter());
-        this.requestRouter = new IncomingRequestRouter<>(this.timestampCache,
-                this.dedupTracker, diskReadingAvailable, generationAvailable, this.ctx);
+        this.requestRouter = new IncomingRequestRouter<>(this, this.players, this.timestampCache,
+                this.dedupTracker, diskReader != null, generationAvailable, this.ctx);
         this.processingThread = new Thread(this::processingLoop, "LSS Processing Thread");
         this.processingThread.setDaemon(true);
         this.processingThread.setPriority(Thread.NORM_PRIORITY - 1);
+        this.processingThread.setUncaughtExceptionHandler((th, ex) ->
+                LSSLogger.error("LSS processing thread died unexpectedly", ex));
     }
 
     public void start() {
         this.processingThread.start();
     }
 
-    /** Post a snapshot for the processing thread to consume. */
-    public void postSnapshot(TickSnapshot snapshot) {
-        synchronized (this.snapshotLock) {
-            if (this.pendingSnapshot != null) {
-                // Snapshot overwrite: queue dropped generationReady for the processing thread
-                // to release their concurrency slots (ConcurrencyLimiter is not thread-safe)
-                for (var genReady : this.pendingSnapshot.generationReady()) {
-                    this.droppedGenerationReady.add(genReady);
-                }
+    // ---- Mailbox producers (main thread) ----
+
+    /**
+     * Post this tick's snapshot (latest-wins) and generation outcomes (lossless).
+     * Ownership of the snapshot's maps and the generationReady list transfers to the processor.
+     */
+    public void postSnapshot(TickSnapshot snapshot, List<TickSnapshot.GenerationReadyData> generationReady) {
+        synchronized (this.mailboxLock) {
+            if (!generationReady.isEmpty()) {
+                this.pendingGenerationReady.addAll(generationReady);
             }
             this.pendingSnapshot = snapshot;
-            this.snapshotLock.notifyAll();
+            this.mailboxLock.notifyAll();
         }
     }
 
-    /** Drain completed send actions (called by main thread). */
-    public SendAction pollSendAction() {
-        return this.sendActions.poll();
+    /** Notify the processing thread that a player was removed (disconnect or dimension change). */
+    public void notifyPlayerRemoved(UUID uuid) {
+        synchronized (this.mailboxLock) {
+            this.pendingRemovals.add(uuid);
+        }
+    }
+
+    /** Queue timestamp invalidation for dirty positions. */
+    public void invalidateTimestamps(String dimension, long[] positions) {
+        synchronized (this.mailboxLock) {
+            this.pendingInvalidations.add(new TimestampInvalidation(dimension, positions));
+        }
+    }
+
+    /** Queue positions for clearing from a player's diskReadDone set (dirty re-send support). */
+    public void clearDiskReadDone(UUID playerUuid, long[] positions) {
+        synchronized (this.mailboxLock) {
+            this.pendingDirtyClears.computeIfAbsent(playerUuid, k -> new ArrayList<>()).add(positions);
+        }
+    }
+
+    /**
+     * Feed a generation failure for a request whose ticket could not be submitted
+     * (e.g. generation capacity rejection). Delivered like any other generation outcome.
+     */
+    public void feedGenerationFailure(UUID playerUuid, int cx, int cz, String dimension, long submissionOrder) {
+        synchronized (this.mailboxLock) {
+            this.pendingGenerationReady.add(new TickSnapshot.GenerationReadyData(
+                    playerUuid, cx, cz, dimension, null, 0L, submissionOrder));
+        }
+    }
+
+    // ---- Main-thread output drains ----
+
+    /** Platform hook that sends one batched-response frame to a player. */
+    @FunctionalInterface
+    public interface BatchSender<PlayerState> {
+        void send(PlayerState state, byte[] responseTypes, long[] packedPositions, int count) throws Exception;
+    }
+
+    /**
+     * Drain completed send actions and flush them as one batched response per player
+     * (called by the main thread each tick).
+     */
+    public void drainSendActions(BatchSender<PlayerState> sender) {
+        this.sendActionBatcher.clear();
+
+        SendAction action;
+        while ((action = this.sendActions.poll()) != null) {
+            var state = this.players.get(action.playerUuid());
+            // Identity check: a dimension change re-registers the same UUID with a fresh
+            // state — actions produced for the old session must not reach the new one.
+            if (state == null || state != action.producerState()
+                    || !state.hasCompletedHandshake()) continue;
+            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.packedPosition());
+        }
+
+        if (this.sendActionBatcher.isEmpty()) return;
+
+        this.sendActionBatcher.forEach((uuid, types, positions, count) -> {
+            var state = this.players.get(uuid);
+            if (state == null || !state.hasCompletedHandshake()) return;
+            try {
+                sender.send(state, types, positions, count);
+            } catch (Exception e) {
+                LSSLogger.error("Failed to send batch response to " + state.getPlayerName(), e);
+            }
+        });
     }
 
     /** Drain generation ticket requests (called by main thread). */
@@ -115,30 +211,25 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         return this.generationTicketRequests.poll();
     }
 
-    /** Queue timestamp invalidation for dirty positions (called by main thread). */
-    public void invalidateTimestamps(String dimension, long[] positions) {
-        this.timestampInvalidations.add(new TimestampInvalidation(dimension, positions));
-    }
+    // ---- Platform hooks ----
 
-    /** Drain disk reader results for a player. Returns ReadResult or null. */
-    protected abstract ReadResult pollDiskResult(PlayerState state);
-    protected abstract ReadResult pollGenerationResult(PlayerState state);
-
-    /** Enqueue payloads from a disk/gen result into the player's ready queue. */
-    protected abstract void enqueueResultPayloads(PlayerState state, ReadResult result);
-
-    /** Submit a disk read for unloaded chunk (called from processing thread). */
-    protected abstract void submitDiskRead(UUID playerUuid, int requestId, String dimension,
+    /**
+     * Submit a disk read for an unloaded chunk (called from processing thread). Returns
+     * {@code false} if the read could not be submitted (e.g. no reader, or the dimension's level
+     * is not registered yet) so the caller can unwind the pending entry + dedup group instead
+     * of leaking them.
+     */
+    protected abstract boolean submitDiskRead(UUID playerUuid, String dimension,
                                             int cx, int cz,
                                             long submissionOrder);
 
     /**
      * Store timestamp and enqueue pre-serialized column data as a payload.
      */
-    protected boolean compressAndEnqueueLoaded(PlayerState state, LoadedColumnData column,
-                                               int requestId, long columnTimestamp,
-                                               long submissionOrder,
-                                               String dimension) {
+    protected boolean enqueueLoadedColumn(PlayerState state, LoadedColumnData column,
+                                          long columnTimestamp,
+                                          long submissionOrder,
+                                          String dimension) {
         if (column.serializedSections() == null || column.serializedSections().length == 0) {
             return false;
         }
@@ -149,40 +240,54 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         long packed = PositionUtil.packPosition(column.cx(), column.cz());
         this.timestampCache.put(dimension, packed, columnTimestamp, this.cycleNow);
 
-        buildAndEnqueueColumnPayload(state, column.cx(), column.cz(), dimension,
-                requestId, columnTimestamp, submissionOrder,
+        return buildAndEnqueueColumnPayload(state, column.cx(), column.cz(), dimension,
+                columnTimestamp, submissionOrder,
                 column.serializedSections(), estimatedBytes);
-        return true;
     }
 
-    /** Build platform-specific payload from serialized section bytes and enqueue to the player's ready queue. */
-    protected abstract void buildAndEnqueueColumnPayload(PlayerState state, int cx, int cz,
-                                                          String dimension, int requestId,
-                                                          long columnTimestamp, long submissionOrder,
-                                                          byte[] sectionBytes, int estimatedBytes);
+    /**
+     * Build platform-specific payload from serialized section bytes and enqueue to the
+     * player's ready queue. Returns false when the column cannot go on the wire (oversized
+     * payload) — every caller then answers up-to-date so the position resolves terminally
+     * instead of dropping silently (the old silent drop left diskReadDone set with no
+     * response, and the client retried an unserveable position forever).
+     */
+    protected abstract boolean buildAndEnqueueColumnPayload(PlayerState state, int cx, int cz,
+                                                             String dimension,
+                                                             long columnTimestamp, long submissionOrder,
+                                                             byte[] sectionBytes, int estimatedBytes);
+
+    // ---- Processing loop ----
 
     private void processingLoop() {
         while (true) {
-            TickSnapshot snapshot;
-            synchronized (this.snapshotLock) {
+            MailboxTake take;
+            synchronized (this.mailboxLock) {
                 while (this.pendingSnapshot == null) {
                     try {
-                        this.snapshotLock.wait(SNAPSHOT_POLL_MS);
+                        this.mailboxLock.wait(SNAPSHOT_POLL_MS);
                     } catch (InterruptedException e) {
                         return;
                     }
                 }
-                snapshot = this.pendingSnapshot;
+                take = new MailboxTake(this.pendingSnapshot, this.pendingGenerationReady,
+                        this.pendingRemovals, this.pendingInvalidations, this.pendingDirtyClears);
                 this.pendingSnapshot = null;
+                this.pendingGenerationReady = new ArrayList<>();
+                this.pendingRemovals = new ArrayList<>();
+                this.pendingInvalidations = new ArrayList<>();
+                this.pendingDirtyClears = new HashMap<>();
             }
 
-            if (snapshot.shutdown()) return;
+            if (take.snapshot().shutdown()) return;
 
             try {
-                this.processCycle(snapshot);
+                this.processCycle(take);
                 this.consecutiveErrors = 0;
-            } catch (Exception e) {
-                LSSLogger.error("Error in processing cycle", e);
+            } catch (Throwable t) {
+                // Catch Throwable (not just Exception) so a transient Error doesn't silently
+                // kill the processing thread and stop the LOD pipeline for every player.
+                LSSLogger.error("Error in processing cycle", t);
                 if (++this.consecutiveErrors >= 10) {
                     LSSLogger.error("Processing thread hit " + this.consecutiveErrors + " consecutive errors, backing off");
                     try { Thread.sleep(1000); } catch (InterruptedException ie) { return; }
@@ -191,16 +296,14 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         }
     }
 
-    private void processCycle(TickSnapshot snapshot) {
+    private void processCycle(MailboxTake take) {
         this.cycleNow = LSSConstants.epochSeconds();
         this.ctx.diagnostics().resetTickCounters();
 
-        releaseDroppedGenerationSlots();
-        preparePlayers(snapshot);
-        drainDiskResultsForAllPlayers(snapshot);
-        drainGenerationResultsForAllPlayers(snapshot);
-        processGenerationReady(snapshot);
-        routeIncomingRequests(snapshot);
+        applyEvents(take);
+        drainDiskResultsForAllPlayers(take.snapshot());
+        processGenerationReady(take.generationReady(), take.snapshot());
+        routeIncomingRequests(take.snapshot());
 
         if (++this.evictionCounter >= EVICTION_INTERVAL_CYCLES) {
             this.evictionCounter = 0;
@@ -217,53 +320,30 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
         }
     }
 
-    /** Release generation concurrency slots from snapshots that were overwritten before processing. */
-    private void releaseDroppedGenerationSlots() {
-        TickSnapshot.GenerationReadyData genReady;
-        while ((genReady = this.droppedGenerationReady.poll()) != null) {
-            var state = this.players.get(genReady.playerUuid());
-            if (state != null) {
-                state.removePendingByPosition(genReady.columnData().cx(), genReady.columnData().cz());
-                state.getRateLimiters().generation().release();
-            }
-        }
-    }
+    // ---- Phase 1: Apply lossless events ----
 
-    // ---- Phase 1: Handle dimension changes, drain cancels ----
-
-    private void preparePlayers(TickSnapshot snapshot) {
-        // Drain timestamp invalidations queued from main thread
-        TimestampInvalidation inv;
-        while ((inv = this.timestampInvalidations.poll()) != null) {
+    private void applyEvents(MailboxTake take) {
+        for (var inv : take.invalidations()) {
             this.timestampCache.invalidate(inv.dimension(), inv.positions());
         }
 
-        // Clean up dedup groups for removed players
-        for (UUID removedUuid : snapshot.removedPlayers()) {
-            cleanupDedupGroups(this.dedupTracker.removePlayer(removedUuid));
+        // Player removals (disconnect or dimension change): release the player's dedup groups
+        // and the attached players' pending entries. The removed state itself is simply dropped
+        // — its slot counts die with it, so nothing can leak.
+        for (UUID removed : take.removals()) {
+            cleanupDedupGroups(this.dedupTracker.removePlayer(removed));
         }
 
-        for (var entry : snapshot.players().entrySet()) {
+        for (var entry : take.dirtyClears().entrySet()) {
             var state = this.players.get(entry.getKey());
             if (state == null) continue;
-            if (entry.getValue().dimensionChanged()) {
-                state.clearProcessingState();
-                cleanupDedupGroups(this.dedupTracker.removePlayer(entry.getKey()));
-            }
-            state.drainDirtyClearRequests();
-
-            // Drain cancel requests
-            Integer cancelId;
-            while ((cancelId = state.pollCancel()) != null) {
-                var pending = state.removePendingByRequestId(cancelId);
-                if (pending != null) {
-                    state.getRateLimiters().forRequest(pending.type(), this.diskReadingAvailable).release();
-                }
+            for (long[] positions : entry.getValue()) {
+                state.clearDiskReadDone(positions);
             }
         }
     }
 
-    private void cleanupDedupGroups(java.util.List<DedupTracker.RemovedGroup> removedGroups) {
+    private void cleanupDedupGroups(List<DedupTracker.RemovedGroup> removedGroups) {
         for (var rg : removedGroups) {
             int cx = PositionUtil.unpackX(rg.packed());
             int cz = PositionUtil.unpackZ(rg.packed());
@@ -271,7 +351,6 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
                 var attachedState = this.players.get(attachment.playerUuid());
                 if (attachedState != null) {
                     attachedState.removePendingByPosition(cx, cz);
-                    attachedState.getRateLimiters().syncOnLoad().release();
                 }
             }
         }
@@ -280,147 +359,125 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
     // ---- Phase 2: Drain disk reader results (with cross-player dedup dispatch) ----
 
     private void drainDiskResultsForAllPlayers(TickSnapshot snapshot) {
-        for (var entry : snapshot.players().entrySet()) {
+        for (var entry : snapshot.playerDimensions().entrySet()) {
             var state = this.players.get(entry.getKey());
             if (state == null) continue;
             UUID playerUuid = entry.getKey();
+            String dimension = entry.getValue();
 
-            ReadResult result;
-            while ((result = this.pollDiskResult(state)) != null) {
+            if (this.diskReader == null) continue;
+            var queue = this.diskReader.getPlayerQueue(state.getPlayerUUID());
+            if (queue == null) continue;
+
+            ChunkReadResult result;
+            while ((result = queue.poll()) != null) {
+                if (!dimension.equals(result.dimension())) {
+                    // Read submitted before a dimension change: the pending entry, slot, and
+                    // dedup group that backed it died with the removed state. Delivering it here
+                    // would stamp diskReadDone/timestampCache under the NEW dimension and could
+                    // tear down a live new-dimension dedup group at the same packed position.
+                    continue;
+                }
                 int cx = result.chunkX();
                 int cz = result.chunkZ();
-                var pending = state.removePendingByPosition(cx, cz);
-                int requestId = pending != null ? pending.requestId() : result.requestId();
-
-                state.getRateLimiters().syncOnLoad().release();
-
                 long packed = PositionUtil.packPosition(cx, cz);
 
-                if (result.saturated()) {
-                    this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, requestId));
-                    if (LSSLogger.isDebugEnabled()) {
-                        LSSLogger.debug("Rate-limited " + playerUuid + " (disk saturated): chunk [" + cx + ", " + cz + "]");
-                    }
-                } else if (result.notFound()) {
-                    handleDiskNotFound(playerUuid, state, requestId, cx, cz, pending);
-                } else {
-                    state.markDiskReadDone(cx, cz);
-                    if (result.sectionBytes() != null) {
-                        this.enqueueResultPayloads(state, result);
-                    } else {
-                        // All-air chunk (exists on disk but no visible sections) — notify client
-                        this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, requestId));
-                    }
-                    // Store timestamp so reconnecting clients get up-to-date responses
-                    this.timestampCache.put(entry.getValue().dimension(), packed, result.columnTimestamp(), this.cycleNow);
-                }
-                this.ctx.diagnostics().incrementDiskDrained();
+                deliverDiskResult(playerUuid, state, result, result.submissionOrder(), dimension);
 
-                // Dispatch to attached players in the dedup group
-                var group = this.dedupTracker.removeGroup(packed);
+                if (!result.saturated() && !result.notFound()) {
+                    // Store timestamp so reconnecting clients get up-to-date responses
+                    this.timestampCache.put(result.dimension(), packed, result.columnTimestamp(), this.cycleNow);
+                }
+
+                // Dispatch the same result to attached players in the dedup group
+                var group = this.dedupTracker.removeGroup(packed, dimension);
                 if (group != null) {
-                    dispatchDedupGroup(group, result, cx, cz);
+                    for (var attachment : group.attached()) {
+                        var attachedState = this.players.get(attachment.playerUuid());
+                        if (attachedState == null) continue;
+                        deliverDiskResult(attachment.playerUuid(), attachedState, result,
+                                attachment.submissionOrder(), dimension);
+                    }
                 }
             }
         }
     }
 
-    private void dispatchDedupGroup(DedupTracker.Group group, ReadResult result,
-                                     int cx, int cz) {
-        byte[] sectionBytes = result.sectionBytes();
-        for (var attachment : group.attached()) {
-            var attachedState = this.players.get(attachment.playerUuid());
-            if (attachedState == null) continue;
+    /**
+     * Deliver one disk read result to one recipient: resolve the pending entry (freeing its
+     * slot), then answer with RateLimited / not-found fallback / column data / up-to-date.
+     * Shared by the primary requester and every dedup-attached player.
+     */
+    private void deliverDiskResult(UUID playerUuid, PlayerState state, ChunkReadResult result,
+                                    long submissionOrder, String dimension) {
+        int cx = result.chunkX();
+        int cz = result.chunkZ();
+        long packed = PositionUtil.packPosition(cx, cz);
+        var pending = state.removePendingByPosition(cx, cz);
 
-            var attachedPending = attachedState.removePendingByPosition(cx, cz);
-            attachedState.getRateLimiters().syncOnLoad().release();
-            int attachedRequestId = attachedPending != null ? attachedPending.requestId() : attachment.requestId();
-
-            if (result.saturated()) {
-                this.ctx.sendActions().add(new SendAction.RateLimited(attachment.playerUuid(), attachedRequestId));
-            } else if (result.notFound()) {
-                handleDiskNotFound(attachment.playerUuid(), attachedState, attachedRequestId, cx, cz, attachedPending);
-            } else if (sectionBytes != null) {
-                attachedState.markDiskReadDone(cx, cz);
-                buildAndEnqueueColumnPayload(attachedState, cx, cz, group.dimension(),
-                        attachedRequestId, result.columnTimestamp(), attachment.submissionOrder(),
-                        sectionBytes, result.estimatedBytes());
-            } else {
-                // Empty column (all air) — mark done and notify client
-                attachedState.markDiskReadDone(cx, cz);
-                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(attachment.playerUuid(), attachedRequestId));
+        if (result.saturated()) {
+            this.ctx.sendActions().add(new SendAction.RateLimited(playerUuid, packed, state));
+            if (LSSLogger.isDebugEnabled()) {
+                LSSLogger.debug("Rate-limited " + playerUuid + " (disk saturated): chunk [" + cx + ", " + cz + "]");
             }
-            this.ctx.diagnostics().incrementDiskDrained();
+        } else if (result.notFound()) {
+            handleDiskNotFound(playerUuid, state, packed, cx, cz, pending, dimension);
+        } else {
+            state.markDiskReadDone(cx, cz);
+            boolean sent = result.sectionBytes() != null
+                    && buildAndEnqueueColumnPayload(state, cx, cz, result.dimension(),
+                            result.columnTimestamp(), submissionOrder,
+                            result.sectionBytes(), result.estimatedBytes());
+            if (!sent) {
+                // All-air chunk (no visible sections) or oversized column — notify client
+                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed, state));
+            }
         }
+        this.ctx.diagnostics().incrementDiskDrained();
     }
 
     /** Disk-first fallback: if the original request was GENERATION and generation is available,
      *  queue a generation ticket; otherwise send ColumnNotGenerated. */
-    private void handleDiskNotFound(UUID playerUuid, PlayerState state, int requestId,
-                                     int cx, int cz, PendingRequest pending) {
+    private void handleDiskNotFound(UUID playerUuid, PlayerState state, long packed,
+                                     int cx, int cz, PendingRequest pending, String dimension) {
         if (pending != null && pending.type() == RequestType.GENERATION && this.generationAvailable) {
-            if (state.getRateLimiters().generation().tryAcquire()) {
+            if (state.tryAdmit(new PendingRequest(cx, cz, RequestType.GENERATION, SlotType.GENERATION))) {
                 this.ctx.generationTicketRequests().add(new GenerationTicketRequest(
-                        playerUuid, requestId, cx, cz, this.ctx.sequence().next()));
-                state.addPendingRequest(new PendingRequest(requestId, cx, cz, RequestType.GENERATION));
+                        playerUuid, cx, cz, dimension, this.ctx.sequence().next()));
             } else {
-                this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, requestId));
+                this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed, state));
             }
         } else {
-            this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, requestId));
+            this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, packed, state));
         }
     }
 
-    // ---- Phase 3: Drain generation results ----
+    // ---- Phase 3: Process generation outcomes ----
 
-    private void drainGenerationResultsForAllPlayers(TickSnapshot snapshot) {
-        for (var entry : snapshot.players().entrySet()) {
-            var state = this.players.get(entry.getKey());
+    private void processGenerationReady(List<TickSnapshot.GenerationReadyData> generationReady,
+                                         TickSnapshot snapshot) {
+        for (var entry : generationReady) {
+            var state = this.players.get(entry.playerUuid());
             if (state == null) continue;
-            UUID playerUuid = entry.getKey();
-
-            ReadResult result;
-            while ((result = this.pollGenerationResult(state)) != null) {
-                int cx = result.chunkX();
-                int cz = result.chunkZ();
-                var pending = state.removePendingByPosition(cx, cz);
-                int requestId = pending != null ? pending.requestId() : result.requestId();
-
-                state.getRateLimiters().generation().release();
-
-                if (result.notFound()) {
-                    this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(playerUuid, requestId));
-                } else {
-                    state.markDiskReadDone(cx, cz);
-                    this.enqueueResultPayloads(state, result);
-                    long packed = PositionUtil.packPosition(cx, cz);
-                    this.timestampCache.put(entry.getValue().dimension(), packed, result.columnTimestamp(), this.cycleNow);
-                }
-                this.ctx.diagnostics().incrementGenDrained();
-            }
-        }
-    }
-
-    // ---- Phase 3b: Process generation-ready data from snapshot ----
-
-    private void processGenerationReady(TickSnapshot snapshot) {
-        for (var genReady : snapshot.generationReady()) {
-            var state = this.players.get(genReady.playerUuid());
-            if (state == null) continue;
-            int cx = genReady.columnData().cx();
-            int cz = genReady.columnData().cz();
+            // A dimension change replaces the player's state (removePlayer + registerPlayer,
+            // same UUID). Outcomes harvested for the old session carry the old dimension —
+            // skip them instead of poisoning the fresh state (their pending died with it).
+            String current = snapshot.playerDimensions().get(entry.playerUuid());
+            if (current == null || !current.equals(entry.dimension())) continue;
+            int cx = entry.cx();
+            int cz = entry.cz();
             state.removePendingByPosition(cx, cz);
-            state.markDiskReadDone(cx, cz);
-            state.getRateLimiters().generation().release();
+            long packed = PositionUtil.packPosition(cx, cz);
 
-            var playerData = snapshot.players().get(genReady.playerUuid());
-            if (playerData == null) continue;
-            String dimension = playerData.dimension();
-            boolean sent = this.compressAndEnqueueLoaded(state, genReady.columnData(), genReady.requestId(),
-                    genReady.columnTimestamp(), genReady.submissionOrder(),
-                    dimension);
-            if (!sent) {
-                this.sendActions.add(new SendAction.ColumnUpToDate(genReady.playerUuid(), genReady.requestId()));
+            if (entry.columnData() == null) {
+                this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(entry.playerUuid(), packed, state));
+            } else {
+                state.markDiskReadDone(cx, cz);
+                boolean sent = this.enqueueLoadedColumn(state, entry.columnData(),
+                        entry.columnTimestamp(), entry.submissionOrder(), entry.dimension());
+                if (!sent) {
+                    this.sendActions.add(new SendAction.ColumnUpToDate(entry.playerUuid(), packed, state));
+                }
             }
             this.ctx.diagnostics().incrementGenDrained();
         }
@@ -429,16 +486,45 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
     // ---- Phase 4: Route incoming requests per player ----
 
     private void routeIncomingRequests(TickSnapshot snapshot) {
-        this.requestRouter.routeAll(snapshot, this.players,
-                this::submitDiskRead, this::compressAndEnqueueLoaded, this.cycleNow);
+        this.requestRouter.routeAll(snapshot, this.cycleNow);
     }
 
     public ProcessingDiagnostics getDiagnostics() {
         return this.ctx.diagnostics();
     }
 
+    /**
+     * Read-only internals view for the dev-only soak/benchmark exporters (dedup group
+     * count, mailbox depth, timestamp-cache occupancy/evictions). Harness seam only —
+     * production code never calls this. The dedup tracker is processing-thread-owned, so
+     * its size is read best-effort: a racing structural change reports {@code -1} instead
+     * of throwing into the caller's tick.
+     */
+    public HarnessInternals getHarnessInternals() {
+        int dedupGroups;
+        try {
+            dedupGroups = this.dedupTracker.size();
+        } catch (java.util.ConcurrentModificationException e) {
+            dedupGroups = -1;
+        }
+        int mailboxDepth;
+        synchronized (this.mailboxLock) {
+            mailboxDepth = (this.pendingSnapshot != null ? 1 : 0)
+                    + this.pendingGenerationReady.size()
+                    + this.pendingRemovals.size()
+                    + this.pendingInvalidations.size()
+                    + this.pendingDirtyClears.size();
+        }
+        return new HarnessInternals(dedupGroups, mailboxDepth,
+                this.timestampCache.getEvictionCount(), this.timestampCache.sizesPerDimension());
+    }
+
+    /** @see #getHarnessInternals() */
+    public record HarnessInternals(int dedupGroups, int mailboxDepth, long tscacheEvictions,
+                                   Map<String, Integer> tscacheSizePerDimension) {}
+
     public void shutdown() {
-        this.postSnapshot(TickSnapshot.shutdownSentinel());
+        this.postSnapshot(TickSnapshot.shutdownSentinel(), List.of());
         try {
             this.processingThread.interrupt();
             this.processingThread.join(SHUTDOWN_JOIN_MS);
@@ -449,9 +535,21 @@ public abstract class OffThreadProcessor<PlayerState extends PlayerStateAccess, 
             Thread.currentThread().interrupt();
         }
 
-        // Save timestamp cache to disk (synchronous — server is shutting down)
-        if (this.dataDir != null) {
-            this.timestampCache.save(this.dataDir);
+        // Save timestamp cache to disk. Route the final save through SAVE_EXECUTOR (single-threaded,
+        // FIFO) so it runs after any in-flight periodic save, then wait for it — otherwise a late
+        // async save could overwrite the final state with an older snapshot.
+        // Skip if the processing thread is still alive: ColumnTimestampCache is single-owner
+        // (processing thread), so snapshotting it here would race its put/invalidate/evict.
+        if (this.processingThread.isAlive()) {
+            LSSLogger.warn("Skipping final timestamp cache save — processing thread still running");
+        } else if (this.dataDir != null) {
+            var snapshot = this.timestampCache.snapshotForSave();
+            try {
+                SAVE_EXECUTOR.submit(() -> snapshot.save(this.dataDir))
+                        .get(SHUTDOWN_JOIN_MS, TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                LSSLogger.warn("Timestamp cache final save did not complete cleanly", e);
+            }
         }
     }
 }

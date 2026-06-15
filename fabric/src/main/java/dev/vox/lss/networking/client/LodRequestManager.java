@@ -2,11 +2,10 @@ package dev.vox.lss.networking.client;
 
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
+import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.networking.payloads.BatchChunkRequestC2SPayload;
-import dev.vox.lss.networking.payloads.CancelRequestC2SPayload;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -14,6 +13,7 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.function.IntSupplier;
 
 public class LodRequestManager {
     /** Backpressure threshold: halt sending when column processing queue exceeds this fraction. */
@@ -29,65 +29,30 @@ public class LodRequestManager {
     private int lastChunkZ;
     private ResourceKey<Level> lastDimension;
 
-    // Key: packed position, Value: raw column timestamp
-    // defaultReturnValue(-1L) -> -1 means "not in map / never requested"
-    private final Long2LongOpenHashMap columnTimestamps = new Long2LongOpenHashMap();
-    {
-        columnTimestamps.defaultReturnValue(-1L);
-    }
+    // Per-column state: timestamps + dirty/retry/validated marks (single owner)
+    private final ColumnStateMap columns = new ColumnStateMap();
 
-    // In-flight request tracking (position ↔ requestId ↔ sendTime)
+    // In-flight request tracking (position → sendTime)
     private final InFlightTracker tracker = new InFlightTracker();
 
-    // Request queue — populated by scanner, consumed by drainQueue()
+    // Request queue — written by the scanner, consumed by drainQueue()
     private final RequestQueue queue = new RequestQueue();
 
     private boolean cacheLoaded = false;
     private volatile CompletableFuture<Long2LongOpenHashMap> pendingCacheLoad = null;
 
-    // Positions pushed by the server's dirty column broadcast that need re-requesting.
-    private final LongOpenHashSet dirtyColumns = new LongOpenHashSet();
-
-    // Positions that were rate-limited and need retry on next scan cycle.
-    private final LongOpenHashSet rateLimitRetryPositions = new LongOpenHashSet();
-
-    // Positions confirmed current (received data or up-to-date) in this session.
-    // Cleared on reconnect/dimension change. Unvalidated cached positions are re-requested.
-    private final LongOpenHashSet validatedThisSession = new LongOpenHashSet();
-
     // Metrics tracking (counters + rolling rates)
     private final RequestMetrics metrics = new RequestMetrics();
-
-    // Fixed per-type concurrency caps (set from session config)
-    private int maxGenConcurrency;
-    private int maxSyncConcurrency;
-    private boolean skipNextScan;
 
     // Derived per-tick send cap: 1/20th of last scan's queued count, floored at MIN_SEND_PER_TICK
     private int maxSendPerTick = MIN_SEND_PER_TICK;
 
-    // Pre-allocated send buffers for drainQueue() to avoid per-tick allocation
-    private int[] sendRequestIdBuffer = new int[MIN_SEND_PER_TICK];
-    private long[] sendPositionBuffer = new long[MIN_SEND_PER_TICK];
-    private long[] sendTimestampBuffer = new long[MIN_SEND_PER_TICK];
+    // Send buffers, sized once at the protocol's batch cap (~16 KB total)
+    private final long[] sendPositionBuffer = new long[LSSConstants.MAX_BATCH_CHUNK_REQUESTS];
+    private final long[] sendTimestampBuffer = new long[LSSConstants.MAX_BATCH_CHUNK_REQUESTS];
 
-    // Expanding ring scanner
+    // Expanding ring scanner (owns scan cadence + budget policy)
     private final SpiralScanner scanner = new SpiralScanner();
-
-    private void putTimestamp(long packed, long timestamp) {
-        long old = this.columnTimestamps.put(packed, timestamp);
-        this.metrics.adjustCounters(old, timestamp);
-    }
-
-    private void clearTimestamps() {
-        this.columnTimestamps.clear();
-        this.metrics.reset();
-    }
-
-    private void loadTimestamps(Long2LongOpenHashMap loaded) {
-        this.columnTimestamps.putAll(loaded);
-        this.metrics.bulkRecount(this.columnTimestamps);
-    }
 
     public void onSessionConfig(SessionConfigS2CPayload config, String serverAddress) {
         this.sessionConfig = config;
@@ -95,10 +60,8 @@ public class LodRequestManager {
         resetRequestState();
         this.lastDimension = null;
         this.cacheLoaded = false;
+        this.scanner.setConfig(config);
         this.scanner.reset();
-        this.maxGenConcurrency = config.generationConcurrencyLimitPerPlayer();
-        this.maxSyncConcurrency = config.syncOnLoadConcurrencyLimitPerPlayer();
-        this.skipNextScan = false;
     }
 
     private static int countMissingVanillaChunks(ClientLevel level, int playerCx, int playerCz, int radius) {
@@ -125,9 +88,33 @@ public class LodRequestManager {
 
         int playerCx = player.getBlockX() >> 4;
         int playerCz = player.getBlockZ() >> 4;
-        var currentDim = level.dimension();
+        int viewDistance = mc.options.getEffectiveRenderDistance();
+        tickWithContext(playerCx, playerCz, level.dimension(), viewDistance,
+                LSSClientNetworking.getQueuedColumnCount(),
+                () -> countMissingVanillaChunks(level, playerCx, playerCz, viewDistance));
+    }
 
-        // --- Dimension change: flush state, reload cache ---
+    /**
+     * Tick body behind the Minecraft-client guards, phases in fixed order: dimension/cache →
+     * movement prune → metrics → backpressure halt → cache gate → scan+sweep → drain+send.
+     * The backpressure halt deliberately precedes the cache poll, the timeout sweep, and the
+     * drain: while the decode queue is mostly full nothing new goes out, and recovery paths
+     * resume only once the queue drains. Package-private for direct test coverage — tick()
+     * needs a running Minecraft client.
+     */
+    void tickWithContext(int playerCx, int playerCz, ResourceKey<Level> currentDim,
+                         int viewDistance, int columnQueueSize, IntSupplier missingVanilla) {
+        tickDimensionAndCachePhase(currentDim);
+        tickMovementPhase(playerCx, playerCz);
+        this.metrics.updateRollingRates();
+        if (haltedByBackpressure(columnQueueSize)) return;
+        if (!tickCacheGatePhase()) return;
+        tickScanPhase(playerCx, playerCz, viewDistance, columnQueueSize, missingVanilla);
+        tickDrainPhase();
+    }
+
+    /** Dimension change: flush state, reload cache. First tick starts the initial load. */
+    void tickDimensionAndCachePhase(ResourceKey<Level> currentDim) {
         if (this.lastDimension != null && !currentDim.equals(this.lastDimension)) {
             this.onDimensionChange(currentDim);
         } else if (!this.cacheLoaded) {
@@ -135,245 +122,266 @@ public class LodRequestManager {
             startAsyncCacheLoad(currentDim);
         }
         this.lastDimension = currentDim;
+    }
 
-        // --- Movement: prune out-of-range data + cancel stale requests ---
+    /**
+     * Movement: prune out-of-range data + drop stale in-flight tracking, and restart the
+     * scan cadence at the new center. Two pinned consequences (LodRequestManagerTickTest):
+     * the (0,0) lastChunk init makes a player joining outside chunk (0,0) take this branch
+     * on tick 1, losing the primed immediate first scan (~1 s join delay); and crossing a
+     * chunk boundary more often than every 20 ticks restarts the cadence each time,
+     * starving both scans AND the timeout sweep that rides them until the player rests.
+     */
+    void tickMovementPhase(int playerCx, int playerCz) {
         if (playerCx != this.lastChunkX || playerCz != this.lastChunkZ) {
-            int pruneDistance = this.scanner.getPruneDistance(this.sessionConfig);
-            this.scanner.pruneOutOfRangeTimestamps(this.columnTimestamps, this.metrics, playerCx, playerCz, pruneDistance);
-            this.scanner.pruneOutOfRangePositions(this.dirtyColumns, playerCx, playerCz, pruneDistance);
-            this.scanner.pruneOutOfRangePositions(this.rateLimitRetryPositions, playerCx, playerCz, pruneDistance);
-            this.scanner.pruneOutOfRangePositions(this.validatedThisSession, playerCx, playerCz, pruneDistance);
-            this.pruneAndCancelOutOfRangePending(playerCx, playerCz, pruneDistance);
+            int pruneDistance = this.scanner.getPruneDistance();
+            this.columns.pruneOutOfRange(playerCx, playerCz, pruneDistance);
+            this.tracker.pruneOutOfRange(playerCx, playerCz, pruneDistance);
             this.lastChunkX = playerCx;
             this.lastChunkZ = playerCz;
             this.scanner.resetScanCounter();
         }
+    }
 
-        // --- Metrics ---
-        this.metrics.updateRollingRates();
+    /** Backpressure: halt when the column processing queue is mostly full. */
+    boolean haltedByBackpressure(int columnQueueSize) {
+        return columnQueueSize >= haltThreshold();
+    }
 
-        // --- Backpressure: halt when column processing queue is mostly full ---
-        int columnQueueSize = LSSClientNetworking.getQueuedColumnCount();
-        int columnQueueCapacity = ClientColumnProcessor.MAX_QUEUED_COLUMNS;
-        if (columnQueueSize >= columnQueueCapacity * BACKPRESSURE_NUMERATOR / BACKPRESSURE_DENOMINATOR) return;
+    private static int haltThreshold() {
+        return ClientColumnProcessor.MAX_QUEUED_COLUMNS * BACKPRESSURE_NUMERATOR / BACKPRESSURE_DENOMINATOR;
+    }
 
-        // --- Cache gate: don't scan until timestamp cache has loaded ---
-        // Poll inline rather than relying on thenAcceptAsync callback scheduling,
-        // which can be delayed on starved render threads (e.g., CI with llvmpipe).
+    /**
+     * Cache gate: don't scan until the timestamp cache has loaded; returns false while the
+     * load is still pending. Polls inline rather than relying on thenAcceptAsync callback
+     * scheduling, which can be delayed on starved render threads (e.g., CI with llvmpipe).
+     */
+    boolean tickCacheGatePhase() {
         if (this.pendingCacheLoad != null) {
-            if (!this.pendingCacheLoad.isDone()) return;
+            if (!this.pendingCacheLoad.isDone()) return false;
             try {
                 var loaded = this.pendingCacheLoad.getNow(null);
                 if (loaded != null && this.lastDimension != null) {
-                    this.loadTimestamps(loaded);
+                    this.columns.loadFrom(loaded);
                 }
             } catch (Exception ignored) {}
             this.pendingCacheLoad = null;
         }
+        return true;
+    }
 
-        // --- Periodic scan (every 20 ticks): discover positions needing requests ---
-        if (this.scanner.advanceScanTick()) {
-            if (this.skipNextScan) {
-                this.skipNextScan = false;
-            } else {
-                int viewDistance = mc.options.getEffectiveRenderDistance();
-
-                // Measure vanilla chunk loading pressure
-                int missingVanilla = countMissingVanillaChunks(level, playerCx, playerCz, viewDistance);
-                this.scanner.updateMissingVanillaChunks(missingVanilla);
-
-                // Compute scan budget: base × queue-pressure-scale × vanilla-load-scale
-                int budget = SpiralScanner.baseBudget(this.sessionConfig);
-                int haltThreshold = columnQueueCapacity * BACKPRESSURE_NUMERATOR / BACKPRESSURE_DENOMINATOR;
-                if (columnQueueSize > 0) {
-                    budget = Math.max(1, Math.round(budget * Math.max(0f, 1f - (float) columnQueueSize / haltThreshold)));
-                }
-                if (missingVanilla > 0) {
-                    int exclusionArea = (2 * viewDistance + 1) * (2 * viewDistance + 1);
-                    float missingFraction = (float) missingVanilla / exclusionArea;
-                    float vanillaScale = Math.max(0f, 1f - missingFraction * missingFraction);
-                    if (vanillaScale <= 0f) budget = 0;
-                    else budget = Math.max(1, Math.round(budget * vanillaScale));
-                }
-
-                // Scan expanding rings for positions that need requesting
-                if (budget > 0) {
-                    var scanResult = this.scanner.scan(playerCx, playerCz, viewDistance,
-                            this.columnTimestamps, this.dirtyColumns, this.rateLimitRetryPositions,
-                            this.validatedThisSession, this.tracker::isInFlight, this.sessionConfig, budget);
-                    if (scanResult.count() > 0) {
-                        this.queue.populate(scanResult);
-                        updateSendPerTick(scanResult.count());
-                    }
-                }
+    /**
+     * Periodic scan (every 20 ticks): discover positions needing requests.
+     * @return the {@link SpiralScanner#maybeScan} result (-1 when the cadence did not fire)
+     */
+    int tickScanPhase(int playerCx, int playerCz, int viewDistance, int columnQueueSize,
+                      IntSupplier missingVanilla) {
+        int scanned = this.scanner.maybeScan(playerCx, playerCz, viewDistance,
+                columnQueueSize, haltThreshold(), missingVanilla,
+                this.columns, this.tracker::isInFlight, this.queue);
+        if (scanned >= 0) {
+            if (scanned > 0) {
+                updateSendPerTick(scanned);
             }
-
-            // Timeout sweep: evict stale requests (always, even if scan skipped)
-            this.tracker.timeoutSweep(TIMEOUT_NANOS);
+            // Timeout sweep: evict stale requests on the scan cadence (even if scan skipped).
+            sweepTimeouts();
         }
+        return scanned;
+    }
 
-        // --- Every tick: drain queue through concurrency limits ---
+    /**
+     * Every tick: drain queue through concurrency limits and send.
+     * @return the number of positions sent
+     */
+    int tickDrainPhase() {
         if (this.queue.hasNext()) {
             int sent = drainQueue(this.maxSendPerTick);
             if (sent > 0) sendRequests(this.sendPositionBuffer, this.sendTimestampBuffer, sent);
+            return sent;
         }
+        return 0;
     }
 
     // --- Send rate adaptation ---
 
     private void updateSendPerTick(int lastScanQueued) {
-        int perTick = Math.min(LSSConstants.MAX_BATCH_CHUNK_REQUESTS,
+        this.maxSendPerTick = Math.min(LSSConstants.MAX_BATCH_CHUNK_REQUESTS,
                 Math.max(MIN_SEND_PER_TICK, (lastScanQueued + LSSConstants.TICKS_PER_SECOND - 1) / LSSConstants.TICKS_PER_SECOND));
-        if (perTick != this.maxSendPerTick) {
-            this.maxSendPerTick = perTick;
-            if (perTick > this.sendPositionBuffer.length) {
-                this.sendRequestIdBuffer = new int[perTick];
-                this.sendPositionBuffer = new long[perTick];
-                this.sendTimestampBuffer = new long[perTick];
-            }
-        }
     }
 
     // --- Queue drain ---
 
-    private int drainQueue(int maxToSend) {
+    /** Package-private for direct test coverage — tick() needs a running Minecraft client. */
+    int drainQueue(int maxToSend) {
         long now = System.nanoTime();
-        long[] positionBuffer = this.sendPositionBuffer;
-        long[] timestampBuffer = this.sendTimestampBuffer;
+        boolean generationEnabled = this.sessionConfig.generationEnabled();
+        int maxGenConcurrency = this.sessionConfig.generationConcurrencyLimitPerPlayer();
+        int maxSyncConcurrency = this.sessionConfig.syncOnLoadConcurrencyLimitPerPlayer();
         int count = 0;
 
         while (count < maxToSend && this.queue.hasNext()) {
             long pos = this.queue.peekPosition();
             long ts = this.queue.peekTimestamp();
             if (this.tracker.isInFlight(pos)) { this.queue.skip(); continue; }
-            long stored = this.columnTimestamps.get(pos);
-            if (stored > 0 && !this.dirtyColumns.contains(pos) && !this.rateLimitRetryPositions.contains(pos)
-                    && this.validatedThisSession.contains(pos)) { this.queue.skip(); continue; }
+            if (this.columns.classify(pos, generationEnabled) == ColumnStateMap.SATISFIED) { this.queue.skip(); continue; }
 
             // Per-type concurrency check — skip if this type is full, try next
             boolean isGen = ts == 0;
-            if (isGen && this.tracker.generationCount() >= this.maxGenConcurrency) { this.queue.skip(); continue; }
-            if (!isGen && (this.tracker.size() - this.tracker.generationCount()) >= this.maxSyncConcurrency) { this.queue.skip(); continue; }
+            if (isGen && this.tracker.generationCount() >= maxGenConcurrency) { this.queue.skip(); continue; }
+            if (!isGen && (this.tracker.size() - this.tracker.generationCount()) >= maxSyncConcurrency) { this.queue.skip(); continue; }
 
             this.queue.skip();
-            positionBuffer[count] = pos;
-            timestampBuffer[count] = ts;
+            this.sendPositionBuffer[count] = pos;
+            this.sendTimestampBuffer[count] = ts;
             this.tracker.markPending(pos, now, isGen);
-            this.rateLimitRetryPositions.remove(pos);
-            this.dirtyColumns.remove(pos);
+            this.columns.markSent(pos);
             count++;
         }
 
         return count;
     }
 
+    /**
+     * Evict timed-out in-flight requests and mark each eviction for retry — in-flight
+     * counts as satisfied for ring confirmation, so an unmarked eviction inside a
+     * confirmed ring would never be rescanned (permanent hole; the bandwidth-throttle
+     * soak found 161 such orphans; see InFlightTracker.timeoutSweep).
+     * Package-private for direct test coverage — tick() needs a running Minecraft client.
+     */
+    void sweepTimeouts() {
+        this.tracker.timeoutSweep(TIMEOUT_NANOS, this.columns::markRetry);
+    }
+
     // --- Request sending and callbacks ---
 
+    /** Batch send transport. Seam for tests; production default is Fabric client networking. */
+    interface BatchSender {
+        void send(BatchChunkRequestC2SPayload payload);
+    }
+
+    private BatchSender batchSender = payload -> ClientPlayNetworking.send(payload);
+
     private void sendRequests(long[] positionBuffer, long[] timestampBuffer, int count) {
-        int[] requestIds = this.sendRequestIdBuffer;
-        for (int i = 0; i < count; i++) {
-            requestIds[i] = this.tracker.send(positionBuffer[i]);
-        }
         try {
-            ClientPlayNetworking.send(new BatchChunkRequestC2SPayload(requestIds, positionBuffer, timestampBuffer, count));
+            this.batchSender.send(new BatchChunkRequestC2SPayload(positionBuffer, timestampBuffer, count));
+            long nowMs = System.currentTimeMillis();
+            for (int i = 0; i < count; i++) {
+                this.metrics.recordRequestSent(positionBuffer[i], nowMs); // RTT send stamp per position
+            }
         } catch (Exception e) {
             LSSLogger.error("Failed to send batch chunk request", e);
             for (int i = 0; i < count; i++) {
-                this.tracker.removeByRequestId(requestIds[i]);
+                this.tracker.removeByPosition(positionBuffer[i]);
+                // drainQueue consumed the dirty/retry marks at markSent, so without
+                // restoration a validated position whose batch never reached the wire
+                // classifies SATISFIED forever — the same orphan class as a timeout
+                // eviction (see sweepTimeouts), without the 10 s grace. Re-mark retry:
+                // classify re-asks with the stored timestamp, no invented stamps.
+                this.columns.markRetry(positionBuffer[i]);
             }
         }
-        this.metrics.recordSendCycle(count);
+        this.metrics.recordSendCycle(count); // counts attempts — a failed batch still counts
     }
 
-    public void onColumnReceived(int requestId, long columnTimestamp) {
-        var completion = this.tracker.removeByRequestId(requestId);
-        if (completion != null) {
-            this.dirtyColumns.remove(completion.position());
-            this.putTimestamp(completion.position(), columnTimestamp);
-            this.validatedThisSession.add(completion.position());
-        }
-        this.metrics.recordColumnReceived();
+    public void onColumnReceived(long packed, long columnTimestamp, ResourceKey<Level> dimension) {
+        // A column from another dimension is discarded by the dispatch drain
+        // (ClientColumnProcessor filters on level.dimension()), so stamping it here would
+        // mark the position SATISFIED in the current dimension's map with no data delivered.
+        if (this.lastDimension != null && !this.lastDimension.equals(dimension)) return;
+        // Apply even if the position is no longer tracked (e.g. it timed out client-side):
+        // the data is authoritative for the position, and stamping it prevents the
+        // timeout → silent-duplicate → second-timeout stall.
+        this.tracker.removeByPosition(packed);
+        this.columns.onReceived(packed, columnTimestamp);
+        this.metrics.recordColumnReceived(packed, System.currentTimeMillis()); // RTT sample + counter
     }
 
     public void onDirtyColumns(long[] dirtyPositions) {
         boolean added = false;
         for (long packed : dirtyPositions) {
-            long stored = this.columnTimestamps.get(packed);
-            if (stored > 0) {
-                this.dirtyColumns.add(packed);
-                added = true;
-            }
+            added |= this.columns.markDirtyIfKnown(packed);
         }
         if (added) {
             this.scanner.resetScanCounter();
         }
     }
 
-    public void onColumnNotGenerated(int requestId) {
-        var removal = this.tracker.removeByRequestId(requestId);
-        if (removal != null) {
-            this.putTimestamp(removal.position(), 0L);
-        }
+    /**
+     * A column stamped received was never ingested by a consumer (decode failure, consumer
+     * rejection, undispatched at disconnect). Forget the stamp so the next scan re-requests
+     * it with ts=-1 — the server's honest re-resolution then re-serves it instead of
+     * answering up-to-date. Main client thread only.
+     */
+    public void onIngestFailure(ResourceKey<Level> dimension, long packed) {
+        // The state map belongs to the current dimension; a report for another dimension's
+        // column would unstamp the wrong position here.
+        if (this.lastDimension == null || !this.lastDimension.equals(dimension)) return;
+        this.tracker.removeByPosition(packed);
+        this.columns.onIngestFailed(packed);
+        this.metrics.recordIngestFailure();
+        // No resetScanCounter here: it is a debounce (it can only DELAY the next scan,
+        // never advance it), and the retry mark already forces the confirmed-ring reset.
+        // A steady failure trickle would otherwise push the scan cadence back indefinitely.
+    }
+
+    public void onColumnNotGenerated(long packed) {
+        // BatchResponse carries no dimension, so unlike onColumnReceived this cannot be
+        // dimension-guarded. Gate on tracking instead: the tracker is cleared on dimension
+        // change / timeout / prune, so a late status can never stamp the fresh map
+        // (matches the pre-v16 requestId gate).
+        if (!this.tracker.isInFlight(packed)) { this.metrics.recordNotGenerated(); return; }
+        this.tracker.removeByPosition(packed);
+        this.columns.onNotGenerated(packed);
+        // The scanner skips in-flight positions without breaking ring confirmation, so the ring
+        // can confirm PAST this position while it was in-flight. With generation enabled the ts=0
+        // stamp is gen-retry-able (classify -> 0), but a below-ring position is never rescanned
+        // until the ring re-walks — force that re-walk so a stationary player does not keep an
+        // ungenerated hole (CL-014). Cadence-neutral and gen-disabled-safe (classify parks ts=0
+        // when generation is off, so the re-walk just skips it).
+        this.scanner.resetConfirmedRing();
         this.metrics.recordNotGenerated();
     }
 
-    public void onColumnUpToDate(int requestId) {
-        var completion = this.tracker.removeByRequestId(requestId);
-        if (completion != null) {
-            this.validatedThisSession.add(completion.position());
-            // Empty columns never get a VoxelColumn response, so columnTimestamps stays -1L.
-            // Without a positive timestamp the scanner treats the position as "never requested"
-            // and re-queues it every cycle. Stamp it now so the validatedThisSession gate works.
-            if (this.columnTimestamps.get(completion.position()) == -1L) {
-                this.putTimestamp(completion.position(), LSSConstants.epochSeconds());
-            }
-        }
+    public void onColumnUpToDate(long packed) {
+        if (!this.tracker.isInFlight(packed)) { this.metrics.recordUpToDate(); return; }
+        this.tracker.removeByPosition(packed);
+        this.columns.onUpToDate(packed);
         this.metrics.recordUpToDate();
     }
 
-    public void onRateLimited(int requestId) {
-        var removal = this.tracker.removeByRequestId(requestId);
-        if (removal != null) {
-            this.rateLimitRetryPositions.add(removal.position());
-        }
+    public void onRateLimited(long packed) {
+        this.scanner.noteRateLimited(); // backoff regardless of tracking (pre-v16 set skipNextScan outside the gate)
+        if (!this.tracker.isInFlight(packed)) { this.metrics.recordRateLimited(); return; }
+        this.tracker.removeByPosition(packed);
+        this.columns.markRetry(packed);
         this.metrics.recordRateLimited();
-        this.skipNextScan = true;
     }
 
     private void onDimensionChange(ResourceKey<Level> newDimension) {
+        // Unstamp columns still queued for decode BEFORE saveCache persists the old
+        // dimension's map: their stamps describe data no consumer ever saw (the drain's
+        // dimension filter will discard the payloads once the level switches). At this
+        // point lastDimension is still the OLD dimension, so the per-report guard keeps
+        // new-dimension stragglers (never stamped) from touching the old map.
+        LSSClientNetworking.reportUndispatchedColumns(this);
         saveCache();
-        this.cancelAllPending();
         resetRequestState();
         this.queue.clear();
         this.scanner.resetScanCounter();
+        this.scanner.clearSkipNextScan();
         this.cacheLoaded = true;
         startAsyncCacheLoad(newDimension);
     }
 
     private void resetRequestState() {
-        this.clearTimestamps();
-        this.dirtyColumns.clear();
-        this.rateLimitRetryPositions.clear();
-        this.validatedThisSession.clear();
+        this.columns.clear();
         this.tracker.clear();
-        this.skipNextScan = false;
+        this.metrics.reset();
     }
 
     private void startAsyncCacheLoad(ResourceKey<Level> dimension) {
         this.pendingCacheLoad = ColumnCacheStore.loadAsync(this.serverAddress, dimension);
-    }
-
-    private void sendCancelPacket(int reqId) {
-        try { ClientPlayNetworking.send(new CancelRequestC2SPayload(reqId)); }
-        catch (Exception ignored) {}
-    }
-
-    private void pruneAndCancelOutOfRangePending(int playerCx, int playerCz, int pruneDistance) {
-        this.tracker.pruneOutOfRange(playerCx, playerCz, pruneDistance, this::sendCancelPacket);
-    }
-
-    private void cancelAllPending() {
-        this.tracker.forEachRequestId(this::sendCancelPacket);
     }
 
     public void disconnect() {
@@ -381,8 +389,8 @@ public class LodRequestManager {
     }
 
     public void saveCache() {
-        if (this.serverAddress != null && this.lastDimension != null && !this.columnTimestamps.isEmpty()) {
-            ColumnCacheStore.saveAsync(this.serverAddress, this.lastDimension, this.columnTimestamps);
+        if (this.serverAddress != null && this.lastDimension != null && !this.columns.isEmptyMap()) {
+            ColumnCacheStore.saveAsync(this.serverAddress, this.lastDimension, this.columns.mapForSave());
         }
     }
 
@@ -390,20 +398,57 @@ public class LodRequestManager {
         if (this.serverAddress != null) {
             ColumnCacheStore.clearForServer(this.serverAddress);
         }
-        this.cancelAllPending();
+        this.pendingCacheLoad = null; // drop any in-flight load — its pre-clear result would resurrect flushed timestamps
         resetRequestState();
         this.queue.clear();
         this.scanner.reset();
     }
 
+    // --- Test seams ---
+    // tick() needs a running Minecraft client, so LodRequestManagerTest seeds the
+    // collaborators directly. Single-threaded use only (main-client-thread contract).
+
+    ColumnStateMap columnsForTest() { return this.columns; }
+    InFlightTracker trackerForTest() { return this.tracker; }
+    RequestQueue queueForTest() { return this.queue; }
+    SpiralScanner scannerForTest() { return this.scanner; }
+
+    /** tick() derives this from the client level; tests set it directly. */
+    void setLastDimensionForTest(ResourceKey<Level> dimension) { this.lastDimension = dimension; }
+
+    /** Replace the batch send transport (production default sends via Fabric networking). */
+    void setBatchSenderForTest(BatchSender sender) { this.batchSender = sender; }
+
+    /** Inject a cache-load future to drive the cache gate without real cache IO. */
+    void setPendingCacheLoadForTest(CompletableFuture<Long2LongOpenHashMap> future) {
+        this.pendingCacheLoad = future;
+    }
+
+    /** Skip the first-tick async cache load — tick-phase tests drive the gate explicitly. */
+    void markCacheLoadedForTest() { this.cacheLoaded = true; }
+
     // --- Public getters ---
 
-    public int getReceivedColumnCount() { return this.metrics.getReceivedCount(); }
-    public int getEmptyColumnCount() { return this.metrics.getEmptyCount(); }
-    public int getEffectiveLodDistanceChunks() { return this.sessionConfig != null ? this.scanner.getEffectiveLodDistance(this.sessionConfig) : 0; }
+    /** Dimension id of the level this manager is currently scanning, or "none" before the first tick. */
+    public String getCurrentDimensionId() {
+        var dim = this.lastDimension;
+        return dim != null ? dim.identifier().toString() : "none";
+    }
+
+    /**
+     * Stored timestamp for one column position (-1 absent, 0 not-generated, &gt;0 epoch
+     * seconds). Main client thread only — used by the soak harness per-position probes.
+     */
+    public long getColumnTimestamp(int cx, int cz) {
+        return this.columns.timestampFor(PositionUtil.packPosition(cx, cz));
+    }
+
+    public int getReceivedColumnCount() { return this.columns.receivedCount(); }
+    public int getEmptyColumnCount() { return this.columns.emptyCount(); }
+    public int getEffectiveLodDistanceChunks() { return this.sessionConfig != null ? this.scanner.getEffectiveLodDistance() : 0; }
     public long getTotalSendCycles() { return this.metrics.getTotalSendCycles(); }
     public long getTotalPositionsRequested() { return this.metrics.getTotalPositionsRequested(); }
-    public int getDirtyColumnCount() { return this.dirtyColumns.size(); }
+    public int getDirtyColumnCount() { return this.columns.dirtyCount(); }
     public int getConfirmedRing() { return this.scanner.getConfirmedRing(); }
     public int getScanRing() { return this.scanner.getScanRing(); }
     public int getMissingVanillaChunks() { return this.scanner.getMissingVanillaChunks(); }
@@ -413,10 +458,15 @@ public class LodRequestManager {
     public long getTotalUpToDate() { return this.metrics.getTotalUpToDate(); }
     public long getTotalNotGenerated() { return this.metrics.getTotalNotGenerated(); }
     public long getTotalRateLimited() { return this.metrics.getTotalRateLimited(); }
+    public long getTotalIngestFailures() { return this.metrics.getTotalIngestFailures(); }
 
     // Rolling rates
     public double getReceiveRate() { return this.metrics.getReceiveRate(); }
     public double getRequestRate() { return this.metrics.getRequestRate(); }
+
+    // RTT distribution (nearest-rank percentiles over the retained sample ring; -1 when empty)
+    public double getRttP50Ms() { return this.metrics.getRttP50Ms(); }
+    public double getRttP95Ms() { return this.metrics.getRttP95Ms(); }
 
     // Concurrency
     public int getPendingCount() { return this.tracker.size(); }

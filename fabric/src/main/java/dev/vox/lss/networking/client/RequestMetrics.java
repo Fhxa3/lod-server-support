@@ -2,16 +2,18 @@ package dev.vox.lss.networking.client;
 
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 
+import java.util.Arrays;
+
 /**
  * Tracks request/response counters and rolling rates for the LOD request manager.
  */
 class RequestMetrics {
     // EWMA smoothing factor for rolling rates
     private static final double EWMA_SMOOTHING_FACTOR = 0.3;
-
-    // Column timestamp counters
-    private int receivedCount = 0;
-    private int emptyCount = 0;
+    // RTT distribution: ring buffer of the most recent samples; stamp map bounded so a
+    // server that never answers cannot grow it without limit
+    private static final int RTT_SAMPLE_CAPACITY = 128;
+    private static final int MAX_PENDING_RTT_STAMPS = 4096;
 
     // Send cycle counters
     private long totalSendCycles = 0;
@@ -22,6 +24,7 @@ class RequestMetrics {
     private long totalUpToDate = 0;
     private long totalNotGenerated = 0;
     private long totalRateLimited = 0;
+    private long totalIngestFailures = 0;
 
     // Rolling rate tracking (EWMA, updated every second)
     private long lastRateUpdateMs = 0;
@@ -30,19 +33,12 @@ class RequestMetrics {
     private double receiveRate = 0;
     private double requestRate = 0;
 
-    /**
-     * Adjusts received/empty counters when a timestamp is replaced.
-     * @param oldTimestamp the previous value (-1 if absent)
-     * @param newTimestamp the new value being stored
-     */
-    void adjustCounters(long oldTimestamp, long newTimestamp) {
-        if (oldTimestamp >= 0) {
-            if (oldTimestamp > 0) this.receivedCount--;
-            else this.emptyCount--;
-        }
-        if (newTimestamp > 0) this.receivedCount++;
-        else if (newTimestamp == 0) this.emptyCount++;
-    }
+    // RTT send stamps keyed by packed position (absent = fastutil default 0; epoch ms is
+    // never 0) and a ring buffer of the most recent round-trip samples
+    private final Long2LongOpenHashMap rttSendStamps = new Long2LongOpenHashMap();
+    private final long[] rttSamplesMs = new long[RTT_SAMPLE_CAPACITY];
+    private int rttSampleCount = 0;
+    private int rttSampleIndex = 0;
 
     void recordSendCycle(int positionCount) {
         this.totalSendCycles++;
@@ -55,6 +51,32 @@ class RequestMetrics {
         this.columnsReceivedInWindow++;
     }
 
+    /**
+     * Stamp one position's request-send time for RTT measurement. A re-send of the same
+     * position overwrites the stamp, so the eventual sample measures the latest attempt.
+     */
+    void recordRequestSent(long packedPosition, long nowMs) {
+        if (this.rttSendStamps.size() >= MAX_PENDING_RTT_STAMPS
+                && !this.rttSendStamps.containsKey(packedPosition)) {
+            return;
+        }
+        this.rttSendStamps.put(packedPosition, nowMs);
+    }
+
+    /**
+     * Position-keyed receive: records the column counters AND, when a send stamp exists
+     * for the position, one RTT sample (receive minus send).
+     */
+    void recordColumnReceived(long packedPosition, long nowMs) {
+        long sentMs = this.rttSendStamps.remove(packedPosition);
+        if (sentMs != 0 && nowMs >= sentMs) {
+            this.rttSamplesMs[this.rttSampleIndex] = nowMs - sentMs;
+            this.rttSampleIndex = (this.rttSampleIndex + 1) % RTT_SAMPLE_CAPACITY;
+            if (this.rttSampleCount < RTT_SAMPLE_CAPACITY) this.rttSampleCount++;
+        }
+        recordColumnReceived();
+    }
+
     void recordUpToDate() {
         this.totalUpToDate++;
     }
@@ -65,6 +87,10 @@ class RequestMetrics {
 
     void recordRateLimited() {
         this.totalRateLimited++;
+    }
+
+    void recordIngestFailure() {
+        this.totalIngestFailures++;
     }
 
     /**
@@ -86,44 +112,36 @@ class RequestMetrics {
     }
 
     void reset() {
-        this.receivedCount = 0;
-        this.emptyCount = 0;
         this.lastRateUpdateMs = 0;
         this.columnsReceivedInWindow = 0;
         this.positionsRequestedInWindow = 0;
         this.receiveRate = 0;
         this.requestRate = 0;
+        this.rttSendStamps.clear();
+        this.rttSampleCount = 0;
+        this.rttSampleIndex = 0;
     }
 
-    /**
-     * Recount received/empty from the full timestamp map after a bulk load.
-     */
-    void bulkRecount(Long2LongOpenHashMap timestamps) {
-        this.receivedCount = 0;
-        this.emptyCount = 0;
-        for (long ts : timestamps.values()) {
-            if (ts > 0) this.receivedCount++;
-            else if (ts == 0) this.emptyCount++;
-        }
-    }
-
-    /**
-     * Called during pruning - directly decrements based on removed timestamp value.
-     */
-    void onTimestampRemoved(long timestamp) {
-        if (timestamp > 0) this.receivedCount--;
-        else if (timestamp == 0) this.emptyCount--;
+    /** Percentile (nearest-rank) over the retained RTT samples; -1 when no samples exist. */
+    private double rttPercentileMs(double percentile) {
+        int count = this.rttSampleCount;
+        if (count == 0) return -1.0;
+        long[] sorted = Arrays.copyOf(this.rttSamplesMs, count);
+        Arrays.sort(sorted);
+        int rank = (int) Math.ceil(percentile * count) - 1;
+        return sorted[Math.max(0, Math.min(count - 1, rank))];
     }
 
     // --- Getters ---
-    int getReceivedCount() { return this.receivedCount; }
-    int getEmptyCount() { return this.emptyCount; }
     long getTotalSendCycles() { return this.totalSendCycles; }
     long getTotalPositionsRequested() { return this.totalPositionsRequested; }
     long getTotalColumnsReceived() { return this.totalColumnsReceived; }
     long getTotalUpToDate() { return this.totalUpToDate; }
     long getTotalNotGenerated() { return this.totalNotGenerated; }
     long getTotalRateLimited() { return this.totalRateLimited; }
+    long getTotalIngestFailures() { return this.totalIngestFailures; }
     double getReceiveRate() { return this.receiveRate; }
     double getRequestRate() { return this.requestRate; }
+    double getRttP50Ms() { return rttPercentileMs(0.50); }
+    double getRttP95Ms() { return rttPercentileMs(0.95); }
 }

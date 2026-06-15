@@ -14,6 +14,9 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 dependencies {
-    api 'org.slf4j:slf4j-api:2.0.17'
-    compileOnly 'it.unimi.dsi:fastutil:8.5.15'
+    api 'org.slf4j:slf4j-api:2.0.18'
+    compileOnly 'it.unimi.dsi:fastutil:8.5.18'
+    // Provided at runtime by both platforms (Minecraft bundles GSON); compileOnly keeps it
+    // out of the Paper shadow jar and the Fabric jar-in-jar, same pattern as fastutil.
+    compileOnly 'com.google.code.gson:gson:2.13.2'
 }

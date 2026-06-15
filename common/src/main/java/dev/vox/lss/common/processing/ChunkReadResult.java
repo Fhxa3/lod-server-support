@@ -1,0 +1,26 @@
+package dev.vox.lss.common.processing;
+
+import java.util.UUID;
+
+/**
+ * Result of an async chunk disk read (or a generation outcome routed through the disk
+ * pipeline). Pure-Java — shared verbatim by both platforms.
+ *
+ * <p>{@code saturated} means the disk reader pool rejected the task; the position should
+ * be retried later, not treated as "not found". {@code sectionBytes == null} with
+ * {@code !notFound} is an all-air chunk (exists on disk, nothing visible to send).
+ */
+public record ChunkReadResult(UUID playerUuid, int chunkX, int chunkZ,
+                              byte[] sectionBytes, String dimension, int estimatedBytes,
+                              long columnTimestamp,
+                              boolean notFound, boolean saturated,
+                              long submissionOrder) {
+
+    public static ChunkReadResult empty(UUID playerUuid, int chunkX, int chunkZ, String dimension, long submissionOrder) {
+        return new ChunkReadResult(playerUuid, chunkX, chunkZ, null, dimension, 0, 0L, true, false, submissionOrder);
+    }
+
+    public static ChunkReadResult saturated(UUID playerUuid, int chunkX, int chunkZ, String dimension, long submissionOrder) {
+        return new ChunkReadResult(playerUuid, chunkX, chunkZ, null, dimension, 0, 0L, false, true, submissionOrder);
+    }
+}

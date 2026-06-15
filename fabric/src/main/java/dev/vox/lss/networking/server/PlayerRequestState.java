@@ -8,36 +8,28 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.Level;
 
-public class PlayerRequestState extends AbstractPlayerRequestState<PlayerRequestState.QueuedPayload> {
+import java.util.UUID;
+
+public class PlayerRequestState extends AbstractPlayerRequestState<CustomPacketPayload> {
     private volatile ServerPlayer player;
     private ResourceKey<Level> lastDimension;
 
-    public record QueuedPayload(CustomPacketPayload payload, int requestId,
-                                int estimatedBytes, long submissionOrder) implements Comparable<QueuedPayload> {
-        @Override
-        public int compareTo(QueuedPayload other) {
-            return Long.compare(this.submissionOrder, other.submissionOrder);
-        }
-    }
-
-    public PlayerRequestState(ServerPlayer player, int syncRate, int syncConcurrency,
-                              int genRate, int genConcurrency) {
-        super(player.getUUID(), syncRate, syncConcurrency, genRate, genConcurrency);
+    public PlayerRequestState(ServerPlayer player, int syncConcurrency, int genConcurrency) {
+        super(player.getUUID(), syncConcurrency, genConcurrency);
         this.player = player;
         this.lastDimension = player.level().dimension();
     }
 
-    public void addRequest(int requestId, long packedPosition, long clientTimestamp) {
-        int cx = PositionUtil.unpackX(packedPosition);
-        int cz = PositionUtil.unpackZ(packedPosition);
-        enqueueIncomingRequest(new IncomingRequest(requestId, cx, cz, clientTimestamp));
+    /** Test seam: a state with no live {@link ServerPlayer}, for payload-queue assertions in
+     *  unit tests. Player-derived accessors (name, dimension) must not be called on it. */
+    PlayerRequestState(UUID playerUuid, int syncConcurrency, int genConcurrency) {
+        super(playerUuid, syncConcurrency, genConcurrency);
     }
 
-    /**
-     * Clear concurrent queues on dimension change (called from main thread).
-     */
-    public void onDimensionChange() {
-        onDimensionChangeBase();
+    public void addRequest(long packedPosition, long clientTimestamp) {
+        int cx = PositionUtil.unpackX(packedPosition);
+        int cz = PositionUtil.unpackZ(packedPosition);
+        enqueueIncomingRequest(new IncomingRequest(cx, cz, clientTimestamp));
     }
 
     public void updatePlayer(ServerPlayer newPlayer) {
@@ -45,6 +37,9 @@ public class PlayerRequestState extends AbstractPlayerRequestState<PlayerRequest
     }
 
     public ServerPlayer getPlayer() { return this.player; }
+
+    @Override
+    public String getPlayerName() { return this.player.getName().getString(); }
     public ResourceKey<Level> getLastDimension() { return this.lastDimension; }
 
     public boolean checkDimensionChange() {

@@ -1,13 +1,12 @@
 package dev.vox.lss.paper;
 
+import dev.vox.lss.common.DiagnosticsFormatter;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.SharedBandwidthLimiter;
 import dev.vox.lss.common.processing.LoadedColumnData;
 import dev.vox.lss.common.processing.OffThreadProcessor;
-import dev.vox.lss.common.processing.SendAction;
-import dev.vox.lss.common.processing.SendActionBatcher;
 import dev.vox.lss.common.processing.TickDiagnostics;
 import dev.vox.lss.common.processing.TickSnapshot;
 import dev.vox.lss.common.tracking.DirtyColumnTracker;
@@ -35,7 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * calls.
  */
 public class PaperRequestProcessingService {
-    private final Map<UUID, PaperPlayerRequestState> players = new ConcurrentHashMap<>();
+    private final Map<UUID, PaperPlayerRequestState> players;
     private final MinecraftServer server;
     private final PaperChunkDiskReader diskReader;
     private final PaperChunkGenerationService generationService;
@@ -52,36 +51,85 @@ public class PaperRequestProcessingService {
 
     private final TickDiagnostics diag = new TickDiagnostics();
 
-    // Reused per-tick maps (single-threaded on server thread)
-    private final Map<UUID, TickSnapshot.PlayerTickData> reusablePlayerTickData = new HashMap<>();
-    private final Map<UUID, Long2ObjectMap<LoadedColumnData>> reusableLoadedChunkProbes = new HashMap<>();
-    private final SendActionBatcher sendActionBatcher = new SendActionBatcher();
+
 
     private static final int DIAG_LOG_INTERVAL_TICKS = 100;
     private static final int MAX_PROBES_PER_TICK_PER_PLAYER = 512;
 
+    /** Test seam: puts one encoded voxel-column frame on the wire. Production default is the
+     *  raw NMS payload send; tests inject recording/throwing senders. */
+    @FunctionalInterface
+    interface ColumnPayloadSender {
+        void send(PaperPlayerRequestState state, byte[] data) throws Exception;
+    }
+
+    /** Test seam: resolves a loaded chunk into pre-serialized column data, or null when the
+     *  chunk is not loaded. Production default probes the chunk source on the main thread. */
+    @FunctionalInterface
+    interface LoadedColumnProbe {
+        LoadedColumnData probe(ServerLevel level, int cx, int cz);
+    }
+
+    private ColumnPayloadSender columnPayloadSender = (state, data) ->
+            PaperPayloadHandler.sendRawNmsPayload(state.getPlayer().getBukkitEntity(),
+                    PaperPayloadHandler.ID_VOXEL_COLUMN, data);
+
+    private LoadedColumnProbe loadedColumnProbe = (level, cx, cz) -> {
+        LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
+        return chunk != null ? PaperSectionSerializer.serializeColumn(level, chunk, cx, cz) : null;
+    };
+
+    void setColumnPayloadSender(ColumnPayloadSender sender) {
+        this.columnPayloadSender = sender;
+    }
+
+    void setLoadedColumnProbe(LoadedColumnProbe probe) {
+        this.loadedColumnProbe = probe;
+    }
+
+    /** Collaborator set for the package-private constructor. Tests build it over recording
+     *  collaborators; production wiring lives in {@link #productionWiring} only. */
+    record Wiring(Map<UUID, PaperPlayerRequestState> players,
+                  PaperChunkDiskReader diskReader,
+                  PaperChunkGenerationService generationService,
+                  PaperOffThreadProcessor offThreadProcessor,
+                  DirtyColumnTracker dirtyTracker,
+                  PaperDirtyColumnBroadcaster dirtyBroadcaster) {}
+
     public PaperRequestProcessingService(MinecraftServer server, Plugin plugin, PaperConfig config) {
+        this(server, config, productionWiring(server, plugin, config));
+    }
+
+    /** Test seam: same field wiring as production, collaborators injected. */
+    PaperRequestProcessingService(MinecraftServer server, PaperConfig config, Wiring wiring) {
         this.server = server;
         this.config = config;
-
-        this.diskReader = new PaperChunkDiskReader(config.diskReaderThreads);
-        if (config.enableChunkGeneration) {
-            this.generationService = new PaperChunkGenerationService(config, plugin);
-        } else {
-            this.generationService = null;
-        }
+        this.players = wiring.players();
+        this.diskReader = wiring.diskReader();
+        this.generationService = wiring.generationService();
         this.bandwidthLimiter = new SharedBandwidthLimiter(config.bytesPerSecondLimitGlobal);
+        this.offThreadProcessor = wiring.offThreadProcessor();
+        this.dirtyTracker = wiring.dirtyTracker();
+        this.dirtyBroadcaster = wiring.dirtyBroadcaster();
+    }
+
+    private static Wiring productionWiring(MinecraftServer server, Plugin plugin, PaperConfig config) {
+        Map<UUID, PaperPlayerRequestState> players = new ConcurrentHashMap<>();
+        var diskReader = new PaperChunkDiskReader(config.diskReaderThreads);
+        PaperChunkGenerationService generationService = config.enableChunkGeneration
+                ? new PaperChunkGenerationService(config, plugin) : null;
 
         var dataDir = server.getWorldPath(LevelResource.ROOT).resolve("data");
-        this.offThreadProcessor = new PaperOffThreadProcessor(
-                this.players,
-                this.diskReader, this.generationService, dataDir,
+        var offThreadProcessor = new PaperOffThreadProcessor(
+                players, diskReader, generationService != null, dataDir,
                 config.perDimensionTimestampCacheSizeMB);
-        this.offThreadProcessor.start();
+        offThreadProcessor.start();
 
-        this.dirtyTracker = new DirtyColumnTracker();
-        this.dirtyBroadcaster = new PaperDirtyColumnBroadcaster(
-                server, this.players, this.dirtyTracker, this.offThreadProcessor);
+        var dirtyTracker = new DirtyColumnTracker();
+        var dirtyBroadcaster = new PaperDirtyColumnBroadcaster(
+                server, players, dirtyTracker, offThreadProcessor);
+        return new Wiring(players, diskReader, generationService, offThreadProcessor,
+                dirtyTracker, dirtyBroadcaster);
     }
 
     public DirtyColumnTracker getDirtyTracker() {
@@ -90,10 +138,8 @@ public class PaperRequestProcessingService {
 
     public PaperPlayerRequestState registerPlayer(ServerPlayer player, int capabilities) {
         var state = this.players.computeIfAbsent(player.getUUID(), uuid -> new PaperPlayerRequestState(
-                player, this.config.syncOnLoadRateLimitPerPlayer, this.config.syncOnLoadConcurrencyLimitPerPlayer,
-                this.config.generationRateLimitPerPlayer, this.config.generationConcurrencyLimitPerPlayer));
+                player, this.config.syncOnLoadConcurrencyLimitPerPlayer, this.config.generationConcurrencyLimitPerPlayer));
         this.diskReader.registerPlayer(player.getUUID());
-        if (this.generationService != null) this.generationService.registerPlayer(player.getUUID());
         state.setCapabilities(capabilities);
         state.markHandshakeComplete();
         return state;
@@ -101,6 +147,7 @@ public class PaperRequestProcessingService {
 
     public void removePlayer(UUID uuid) {
         this.players.remove(uuid);
+        this.offThreadProcessor.notifyPlayerRemoved(uuid);
         cleanupPlayerServices(uuid);
     }
 
@@ -123,22 +170,8 @@ public class PaperRequestProcessingService {
             int cx = PositionUtil.unpackX(packedPosition);
             int cz = PositionUtil.unpackZ(packedPosition);
             if (PositionUtil.chebyshevDistance(cx, cz, playerCx, playerCz) > maxDist) continue;
-            state.addRequest(batch.requestIds()[i], cx, cz, batch.clientTimestamps()[i]);
+            state.addRequest(cx, cz, batch.clientTimestamps()[i]);
         }
-    }
-
-    public void handleCancel(ServerPlayer player, int requestId) {
-        var state = this.players.get(player.getUUID());
-        if (state == null || !state.hasCompletedHandshake())
-            return;
-        state.addCancel(requestId);
-    }
-
-    public void handleBandwidthUpdate(ServerPlayer player, long desiredRate) {
-        var state = this.players.get(player.getUUID());
-        if (state == null || !state.hasCompletedHandshake())
-            return;
-        state.setDesiredBandwidth(desiredRate);
     }
 
     public void tick() {
@@ -170,7 +203,7 @@ public class PaperRequestProcessingService {
     }
 
     private record LifecycleResult(
-            Map<UUID, TickSnapshot.PlayerTickData> playerTickData,
+            Map<UUID, String> playerDimensions,
             Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes,
             int activeCount,
             List<UUID> toRemove) {
@@ -178,21 +211,13 @@ public class PaperRequestProcessingService {
 
     private LifecycleResult processPlayerLifecycle(
             List<TickSnapshot.GenerationReadyData> generationReady) {
-        this.reusablePlayerTickData.clear();
-        this.reusableLoadedChunkProbes.clear();
-        Map<UUID, TickSnapshot.PlayerTickData> playerTickData = this.reusablePlayerTickData;
-        Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes = this.reusableLoadedChunkProbes;
+        // Allocated fresh each tick: the snapshot owns these maps after postSnapshot, so the
+        // processing thread can iterate them without racing the next tick's lifecycle pass.
+        Map<UUID, String> playerDimensions = new HashMap<>();
+        Map<UUID, Long2ObjectMap<LoadedColumnData>> loadedChunkProbes = new HashMap<>();
 
-        // Build per-player set of generation-ready packed positions to skip in probeLoadedChunks
-        Map<UUID, LongOpenHashSet> genReadyPositions = null;
-        if (!generationReady.isEmpty()) {
-            genReadyPositions = new HashMap<>();
-            for (var genData : generationReady) {
-                genReadyPositions.computeIfAbsent(genData.playerUuid(),
-                        k -> new LongOpenHashSet())
-                        .add(PositionUtil.packPosition(genData.columnData().cx(), genData.columnData().cz()));
-            }
-        }
+        // Per-player set of generation-outcome positions to skip in probeLoadedChunks
+        Map<UUID, LongOpenHashSet> genReadyPositions = TickSnapshot.groupPositionsByPlayer(generationReady);
 
         int activeCount = 0;
         List<UUID> toRemove = null;
@@ -203,7 +228,6 @@ public class PaperRequestProcessingService {
             this.diag.updateQueuePeak(state.getSendQueueSize());
 
             boolean removed = false;
-            boolean dimensionChanged = false;
 
             if (state.getPlayer().isRemoved()) {
                 var current = this.server.getPlayerList().getPlayer(state.getPlayer().getUUID());
@@ -217,49 +241,47 @@ public class PaperRequestProcessingService {
                 }
             }
 
-            if (!removed && state.checkDimensionChange()) {
-                state.onDimensionChange();
-                cleanupPlayerServices(state.getPlayer().getUUID());
-                // Re-create result queues so disk reads and generation results
-                // are not silently dropped after dimension change
-                this.diskReader.registerPlayer(state.getPlayer().getUUID());
-                if (this.generationService != null) this.generationService.registerPlayer(state.getPlayer().getUUID());
-                dimensionChanged = true;
-            }
-
             if (removed)
                 continue;
 
+            if (state.checkDimensionChange()) {
+                // A dimension change abandons all in-flight work. Reuse the (well-tested)
+                // disconnect teardown + a fresh registration instead of a second, hand-rolled
+                // partial-reset protocol: the processing thread unwinds the old state's dedup
+                // groups via the removal event, and the fresh state starts clean next tick.
+                var changed = state.getPlayer();
+                int capabilities = state.getCapabilities();
+                removePlayer(changed.getUUID());
+                registerPlayer(changed, capabilities);
+                continue;
+            }
+
             var player = state.getPlayer();
-            var level = (ServerLevel) player.level();
+            var level = player.level();
             String dimension = this.dimensionStringCache.computeIfAbsent(level,
                     l -> l.dimension().identifier().toString());
 
             this.offThreadProcessor.updateDimensionContext(dimension, level);
 
-            playerTickData.put(player.getUUID(), new TickSnapshot.PlayerTickData(
-                    dimension, dimensionChanged));
+            playerDimensions.put(player.getUUID(), dimension);
 
-            if (!dimensionChanged) {
-                var skipPositions = genReadyPositions != null
-                        ? genReadyPositions.get(player.getUUID()) : null;
-                var probes = this.probeLoadedChunks(state, level, skipPositions);
-                if (!probes.isEmpty()) {
-                    loadedChunkProbes.put(player.getUUID(), probes);
-                }
+            var skipPositions = genReadyPositions != null
+                    ? genReadyPositions.get(player.getUUID()) : null;
+            var probes = this.probeLoadedChunks(state, level, skipPositions);
+            if (!probes.isEmpty()) {
+                loadedChunkProbes.put(player.getUUID(), probes);
             }
         }
 
-        return new LifecycleResult(playerTickData, loadedChunkProbes, activeCount, toRemove);
+        return new LifecycleResult(playerDimensions, loadedChunkProbes, activeCount, toRemove);
     }
 
     private void postSnapshot(LifecycleResult lifecycle,
             List<TickSnapshot.GenerationReadyData> generationReady) {
-        var removed = lifecycle.toRemove != null ? lifecycle.toRemove : List.<UUID>of();
         var snapshot = new TickSnapshot(
-                lifecycle.playerTickData, lifecycle.loadedChunkProbes, generationReady,
-                removed, this.config.sendQueueLimitPerPlayer, false);
-        this.offThreadProcessor.postSnapshot(snapshot);
+                lifecycle.playerDimensions, lifecycle.loadedChunkProbes,
+                this.config.sendQueueLimitPerPlayer, false);
+        this.offThreadProcessor.postSnapshot(snapshot, generationReady);
     }
 
     private void flushSendQueues(int activeCount) {
@@ -269,29 +291,22 @@ public class PaperRequestProcessingService {
         for (var state : this.players.values()) {
             if (!state.hasCompletedHandshake())
                 continue;
-            long effective = Math.min(perPlayerCap, Math.max(1, state.getDesiredBandwidth()));
-            this.flushSendQueue(state, effective);
+            long[] dropped = state.flushSendQueue(perPlayerCap, this.bandwidthLimiter, this.diag,
+                    data -> this.columnPayloadSender.send(state, data));
+            if (dropped.length > 0) {
+                // A send failure discarded resolved-but-undelivered columns: clear their
+                // done-bits so the client's re-requests re-resolve instead of being
+                // answered up-to-date for data that never arrived.
+                this.offThreadProcessor.clearDiskReadDone(state.getPlayerUUID(), dropped);
+            }
         }
     }
 
     private void tickDiagnosticsLog() {
         if (++this.diagLogCounter >= DIAG_LOG_INTERVAL_TICKS) {
             this.diagLogCounter = 0;
-            if (LSSLogger.isDebugEnabled()) {
-                long uptimeSec = this.getUptimeSeconds();
-                long bwRate = uptimeSec > 0 ? this.bandwidthLimiter.getTotalBytesSent() / uptimeSec : 0;
-                LSSLogger.debug(this.diag.formatSummary(bwRate, this.config.bytesPerSecondLimitGlobal));
-                for (var state : this.players.values()) {
-                    if (!state.hasCompletedHandshake()) continue;
-                    var rl = state.getRateLimiters();
-                    LSSLogger.debug(String.format("  %s: sq=%d, psync=%d, pgen=%d, syncCC=%d/%d, genCC=%d/%d, wq=%d",
-                            state.getPlayer().getName().getString(), state.getSendQueueSize(),
-                            state.getPendingSyncCount(), state.getPendingGenerationCount(),
-                            rl.syncOnLoad().getCurrentConcurrency(), rl.syncOnLoad().getMaxConcurrency(),
-                            rl.generation().getCurrentConcurrency(), rl.generation().getMaxConcurrency(),
-                            state.getWaitingQueueSize()));
-                }
-            }
+            DiagnosticsFormatter.logDebugSummary(this.diag, this.getUptimeSeconds(),
+                    this.config.bytesPerSecondLimitGlobal, this.bandwidthLimiter, this.players.values());
         }
     }
 
@@ -310,9 +325,9 @@ public class PaperRequestProcessingService {
             if (skipPositions != null && skipPositions.contains(packed))
                 continue;
 
-            LevelChunk chunk = level.getChunkSource().getChunkNow(req.cx(), req.cz());
-            if (chunk != null) {
-                probes.put(packed, PaperSectionSerializer.serializeColumn(level, chunk, req.cx(), req.cz()));
+            var column = this.loadedColumnProbe.probe(level, req.cx(), req.cz());
+            if (column != null) {
+                probes.put(packed, column);
             }
             probed++;
         }
@@ -321,27 +336,9 @@ public class PaperRequestProcessingService {
     }
 
     private void drainSendActions() {
-        this.sendActionBatcher.clear();
-
-        SendAction action;
-        while ((action = this.offThreadProcessor.pollSendAction()) != null) {
-            var state = this.players.get(action.playerUuid());
-            if (state == null || !state.hasCompletedHandshake()) continue;
-            this.sendActionBatcher.add(action.playerUuid(), action.responseType(), action.requestId());
-        }
-
-        if (this.sendActionBatcher.isEmpty()) return;
-
-        this.sendActionBatcher.forEach((uuid, types, ids, count) -> {
-            var state = this.players.get(uuid);
-            if (state == null || !state.hasCompletedHandshake()) return;
-            try {
-                var bukkitPlayer = state.getPlayer().getBukkitEntity();
-                PaperPayloadHandler.sendBatchResponse(bukkitPlayer, types, ids, count);
-            } catch (Exception e) {
-                LSSLogger.error("Failed to send batch response to " + state.getPlayer().getName().getString(), e);
-            }
-        });
+        this.offThreadProcessor.drainSendActions((state, types, positions, count) ->
+                PaperPayloadHandler.sendBatchResponse(state.getPlayer().getBukkitEntity(),
+                        types, positions, count));
     }
 
     private void drainGenerationTicketRequests() {
@@ -355,41 +352,21 @@ public class PaperRequestProcessingService {
                 continue;
 
             var player = state.getPlayer();
-            if (player.isRemoved())
-                continue;
-            var level = (ServerLevel) player.level();
-            boolean accepted = this.generationService.submitGeneration(
-                    req.playerUuid(), req.requestId(), level, req.cx(), req.cz(),
+            var level = player.level();
+            String dimension = this.dimensionStringCache.computeIfAbsent(level,
+                    l -> l.dimension().identifier().toString());
+            // Ticket queued before a dimension change targets the old dimension's coordinates.
+            // The admitting state was discarded by removePlayer+registerPlayer, so dropping
+            // the stale ticket leaks nothing.
+            if (!dimension.equals(req.dimension())) continue;
+            boolean accepted = !player.isRemoved() && this.generationService.submitGeneration(
+                    req.playerUuid(), level, req.cx(), req.cz(),
                     req.submissionOrder());
             if (!accepted) {
-                this.generationService.addResult(req.playerUuid(), PaperChunkDiskReader.emptyResult(
-                        req.playerUuid(), req.requestId(), req.cx(), req.cz(), req.submissionOrder()));
-            }
-        }
-    }
-
-    private void flushSendQueue(PaperPlayerRequestState state, long allocationBytes) {
-        state.drainReadyPayloads();
-        var queue = state.getSendQueue();
-
-        while (!queue.isEmpty()) {
-            if (!state.canSend(allocationBytes))
-                return;
-
-            var queued = queue.peek();
-            try {
-                var bukkitPlayer = state.getPlayer().getBukkitEntity();
-                PaperPayloadHandler.sendRawNmsPayload(bukkitPlayer,
-                        PaperPayloadHandler.ID_VOXEL_COLUMN, queued.data());
-                queue.poll();
-                state.recordSend(queued.estimatedBytes());
-                this.bandwidthLimiter.recordSend(queued.estimatedBytes());
-                this.diag.recordSectionSent(queued.estimatedBytes());
-            } catch (Exception e) {
-                LSSLogger.error("Failed to send queued payload to " + state.getPlayer().getName().getString()
-                        + ", dropping remaining queue (" + queue.size() + " entries)", e);
-                queue.clear();
-                return;
+                // Capacity rejection or removed player: feed a failure outcome so the
+                // processing thread frees the pending slot and tells the client ColumnNotGenerated.
+                this.offThreadProcessor.feedGenerationFailure(
+                        req.playerUuid(), req.cx(), req.cz(), dimension, req.submissionOrder());
             }
         }
     }
@@ -414,6 +391,10 @@ public class PaperRequestProcessingService {
         return this.diag.format(this.config.sendQueueLimitPerPlayer);
     }
 
+    public TickDiagnostics getTickDiag() {
+        return this.diag;
+    }
+
     public long getWindowBandwidthRate() {
         return this.diag.getWindowBytesPerSecond();
     }
@@ -422,7 +403,7 @@ public class PaperRequestProcessingService {
         return (System.nanoTime() - this.startTimeNanos) / LSSConstants.NANOS_PER_SECOND;
     }
 
-    public OffThreadProcessor<?, ?> getOffThreadProcessor() {
+    public OffThreadProcessor<?> getOffThreadProcessor() {
         return this.offThreadProcessor;
     }
 

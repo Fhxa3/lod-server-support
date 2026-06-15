@@ -19,8 +19,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Manages chunk generation requests for the Paper plugin.
@@ -29,52 +27,82 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  */
 public class PaperChunkGenerationService {
 
-    record GenerationCallback(UUID playerUuid, int requestId, long submissionOrder) {}
+    record GenerationCallback(UUID playerUuid, long submissionOrder) {}
 
-    private record PendingGenerationKey(ResourceKey<Level> dimension, int cx, int cz) {}
+    // Package-visible (with launchAsyncLoad/onChunkReady) so T1 tests can drive the async
+    // boundary directly instead of going through Bukkit's scheduler.
+    record PendingGenerationKey(ResourceKey<Level> dimension, int cx, int cz) {}
 
     /**
      * Tracks an active async chunk load. The async future fires {@link #onChunkReady}
      * when Paper finishes loading/generating the chunk to FULL status.
      */
     static class ActiveGeneration {
+        // Monotonic id of this launch. A stale async completion (from an entry that already
+        // timed out and was resubmitted under the same key) carries the OLD token, so
+        // onChunkReady can reject it and leave the current entry for its own completion —
+        // otherwise the stale (possibly failed) result consumes the fresh entry by key match.
+        final long token;
         final List<GenerationCallback> callbacks = new ArrayList<>();
         int ticksWaiting = 0;
+
+        ActiveGeneration(long token) { this.token = token; }
     }
+
+    // Main-thread-owned: assigns a unique token to each ActiveGeneration launch.
+    private long nextGenerationToken = 0;
 
     private final LinkedHashMap<PendingGenerationKey, ActiveGeneration> active = new LinkedHashMap<>();
     private final Map<UUID, Integer> perPlayerActiveCount = new HashMap<>();
-    private final ConcurrentHashMap<UUID, ConcurrentLinkedQueue<PaperChunkDiskReader.SimpleReadResult>> playerResults = new ConcurrentHashMap<>();
-    private final ConcurrentLinkedQueue<TickSnapshot.GenerationReadyData> generationReadyQueue = new ConcurrentLinkedQueue<>();
+    // Main-thread-owned (onChunkReady is scheduled to the main thread via runTask; tick() swaps it out)
+    private List<TickSnapshot.GenerationReadyData> mainReady = new ArrayList<>();
 
     private final Plugin plugin;
     private final int maxConcurrent;
     private final int maxPerPlayerActive;
     private final int timeoutTicks;
 
+    /** Test seam: hands the async-load completion back to the main thread. Production
+     *  default is Bukkit's scheduler, which throws once the plugin is disabled —
+     *  tests inject throwing schedulers to pin that rejection containment. */
+    @FunctionalInterface
+    interface MainThreadScheduler {
+        void schedule(Runnable task) throws Exception;
+    }
+
+    // Wired in the constructor (default references the blank-final plugin field, which is
+    // not definitely assigned until the constructor body runs).
+    private MainThreadScheduler mainThreadScheduler;
+
+    void setMainThreadScheduler(MainThreadScheduler scheduler) {
+        this.mainThreadScheduler = scheduler;
+    }
+
     // Volatile is sufficient — only written from the main tick thread, read by /stats commands.
     private volatile long totalSubmitted = 0;
     private volatile long totalCompleted = 0;
     private volatile long totalTimeouts = 0;
+    private volatile long totalRemovedInFlight = 0;
 
     public PaperChunkGenerationService(PaperConfig config, Plugin plugin) {
         this.plugin = plugin;
         this.maxConcurrent = config.generationConcurrencyLimitGlobal;
         this.maxPerPlayerActive = config.generationConcurrencyLimitPerPlayer;
         this.timeoutTicks = config.generationTimeoutSeconds * LSSConstants.TICKS_PER_SECOND;
+        this.mainThreadScheduler = task -> Bukkit.getScheduler().runTask(this.plugin, task);
     }
 
     /**
      * Submit a generation request. Returns true if accepted (piggyback or new active slot),
      * false if at capacity (caller should feed back a rejection result).
      */
-    public boolean submitGeneration(UUID playerUuid, int requestId, ServerLevel level, int cx, int cz, long submissionOrder) {
+    public boolean submitGeneration(UUID playerUuid, ServerLevel level, int cx, int cz, long submissionOrder) {
         var key = new PendingGenerationKey(level.dimension(), cx, cz);
 
         // Already active — piggyback on existing async load
         var existingActive = this.active.get(key);
         if (existingActive != null) {
-            existingActive.callbacks.add(new GenerationCallback(playerUuid, requestId, submissionOrder));
+            existingActive.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
             incrementCount(this.perPlayerActiveCount, playerUuid);
             return true;
         }
@@ -82,13 +110,13 @@ public class PaperChunkGenerationService {
         // Try to add directly to active and launch async load
         int playerActive = this.perPlayerActiveCount.getOrDefault(playerUuid, 0);
         if (this.active.size() < this.maxConcurrent && playerActive < this.maxPerPlayerActive) {
-            var gen = new ActiveGeneration();
-            gen.callbacks.add(new GenerationCallback(playerUuid, requestId, submissionOrder));
+            var gen = new ActiveGeneration(++this.nextGenerationToken);
+            gen.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
             this.active.put(key, gen);
             incrementCount(this.perPlayerActiveCount, playerUuid);
             this.totalSubmitted++;
 
-            launchAsyncLoad(key, level, cx, cz);
+            launchAsyncLoad(key, level, cx, cz, gen.token);
             return true;
         }
 
@@ -99,8 +127,9 @@ public class PaperChunkGenerationService {
     /**
      * Launches Paper's async chunk load. The callback fires on the main thread
      * when the chunk reaches FULL status. Paper manages tickets automatically.
+     * Package-visible seam: tests override this to capture the launch.
      */
-    private void launchAsyncLoad(PendingGenerationKey key, ServerLevel level, int cx, int cz) {
+    void launchAsyncLoad(PendingGenerationKey key, ServerLevel level, int cx, int cz, long token) {
         level.getWorld().getChunkAtAsync(cx, cz, true, false).whenComplete((chunk, ex) -> {
             if (ex != null) {
                 LSSLogger.error("Async chunk load failed at " + cx + "," + cz, ex);
@@ -108,8 +137,8 @@ public class PaperChunkGenerationService {
             var readyChunk = ex == null ? chunk : null;
             // Ensure callback runs on the main thread — whenComplete does not guarantee thread
             try {
-                Bukkit.getScheduler().runTask(this.plugin, () ->
-                        onChunkReady(key, level, readyChunk, cx, cz));
+                this.mainThreadScheduler.schedule(() ->
+                        onChunkReady(key, level, readyChunk, cx, cz, token));
             } catch (Exception scheduleEx) {
                 // Plugin disabled during shutdown — do not call onChunkReady inline
                 // because we're on an async thread and active map is not thread-safe.
@@ -121,11 +150,17 @@ public class PaperChunkGenerationService {
 
     /**
      * Called on the main thread when Paper finishes loading/generating a chunk to FULL.
+     * Package-visible so tests can fire the completion that launchAsyncLoad would schedule.
      */
-    private void onChunkReady(PendingGenerationKey key, ServerLevel level,
-                               Chunk chunk, int cx, int cz) {
-        var gen = this.active.remove(key);
-        if (gen == null) return; // cleaned up by removePlayer or timeout
+    void onChunkReady(PendingGenerationKey key, ServerLevel level,
+                       Chunk chunk, int cx, int cz, long token) {
+        var gen = this.active.get(key);
+        // Reject a stale completion: the entry that launched this load already timed out and a
+        // new entry was resubmitted under the same key (different token). Leaving the current
+        // entry untouched lets ITS own completion serve it — a stale (often failed) result must
+        // not consume the fresh entry. null = the entry was cleaned up by removePlayer/timeout.
+        if (gen == null || gen.token != token) return;
+        this.active.remove(key);
 
         if (chunk != null) {
             try {
@@ -134,33 +169,48 @@ public class PaperChunkGenerationService {
                     long columnTimestamp = LSSConstants.epochSeconds();
                     LoadedColumnData columnData = PaperSectionSerializer.serializeColumn(
                             level, nmsChunk, cx, cz);
+                    String dimension = key.dimension().identifier().toString();
 
                     for (var cb : gen.callbacks) {
-                        this.generationReadyQueue.add(new TickSnapshot.GenerationReadyData(
-                                cb.playerUuid, cb.requestId, columnData, columnTimestamp,
-                                cb.submissionOrder));
+                        this.mainReady.add(new TickSnapshot.GenerationReadyData(
+                                cb.playerUuid, cx, cz, dimension,
+                                columnData, columnTimestamp, cb.submissionOrder));
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
                     this.totalCompleted++;
                 } else {
                     LSSLogger.warn("Chunk at " + cx + "," + cz + " was null after async load completed");
-                    emptyResultForCallbacks(gen.callbacks, cx, cz, this.perPlayerActiveCount);
+                    addFailures(gen.callbacks, key, cx, cz);
+                    this.totalRemovedInFlight++;
                 }
-            } catch (Exception e) {
-                LSSLogger.error("Failed to extract primitives for generated chunk at " + cx + ", " + cz, e);
-                emptyResultForCallbacks(gen.callbacks, cx, cz, this.perPlayerActiveCount);
+            } catch (Throwable t) {
+                // Throwable, not Exception (mirrors the Fabric twin): an Error here would
+                // otherwise skip addFailures and leak every callback's generation slot and
+                // per-player count until disconnect.
+                LSSLogger.error("Failed to extract primitives for generated chunk at " + cx + ", " + cz, t);
+                addFailures(gen.callbacks, key, cx, cz);
+                this.totalRemovedInFlight++;
+                if (t instanceof Error err) throw err;
             }
         } else {
-            emptyResultForCallbacks(gen.callbacks, cx, cz, this.perPlayerActiveCount);
+            addFailures(gen.callbacks, key, cx, cz);
+            this.totalRemovedInFlight++;
         }
     }
 
-    private void emptyResultForCallbacks(List<GenerationCallback> callbacks, int cx, int cz,
-                                          Map<UUID, Integer> countMap) {
+    /**
+     * Add a failure outcome (columnData == null) for every callback. Main thread only.
+     * Callers that removed the active entry must also count it exactly once — totalTimeouts
+     * on the timeout path, totalRemovedInFlight on the failure paths (mirrors the Fabric
+     * twin) — so the generation books (submitted == completed + timeouts + removed) balance
+     * (soak law A4).
+     */
+    private void addFailures(List<GenerationCallback> callbacks, PendingGenerationKey key, int cx, int cz) {
+        String dimension = key.dimension().identifier().toString();
         for (var cb : callbacks) {
-            this.addResult(cb.playerUuid, PaperChunkDiskReader.emptyResult(
-                    cb.playerUuid, cb.requestId, cx, cz, cb.submissionOrder));
-            decrementCount(countMap, cb.playerUuid);
+            this.mainReady.add(new TickSnapshot.GenerationReadyData(
+                    cb.playerUuid, cx, cz, dimension, null, 0L, cb.submissionOrder));
+            decrementCount(this.perPlayerActiveCount, cb.playerUuid);
         }
     }
 
@@ -170,14 +220,10 @@ public class PaperChunkGenerationService {
     public List<TickSnapshot.GenerationReadyData> tick() {
         this.tickActiveTimeouts();
 
-        // Drain generation-ready data from async callbacks
-        List<TickSnapshot.GenerationReadyData> ready = null;
-        TickSnapshot.GenerationReadyData grd;
-        while ((grd = this.generationReadyQueue.poll()) != null) {
-            if (ready == null) ready = new ArrayList<>();
-            ready.add(grd);
-        }
-        return ready != null ? ready : List.of();
+        if (this.mainReady.isEmpty()) return List.of();
+        var ready = this.mainReady;
+        this.mainReady = new ArrayList<>();
+        return ready;
     }
 
     /**
@@ -193,36 +239,14 @@ public class PaperChunkGenerationService {
             gen.ticksWaiting++;
 
             if (gen.ticksWaiting > this.timeoutTicks) {
-                emptyResultForCallbacks(gen.callbacks, entry.getKey().cx, entry.getKey().cz,
-                        this.perPlayerActiveCount);
+                addFailures(gen.callbacks, entry.getKey(), entry.getKey().cx, entry.getKey().cz);
                 iter.remove();
                 this.totalTimeouts++;
             }
         }
     }
 
-    void registerPlayer(UUID playerUuid) {
-        this.playerResults.computeIfAbsent(playerUuid, k -> new ConcurrentLinkedQueue<>());
-    }
-
-    void addResult(UUID playerUuid, PaperChunkDiskReader.SimpleReadResult result) {
-        var queue = this.playerResults.get(playerUuid);
-        if (queue != null) {
-            queue.add(result);
-        }
-    }
-
-    public ConcurrentLinkedQueue<PaperChunkDiskReader.SimpleReadResult> getPlayerQueue(UUID playerUuid) {
-        return this.playerResults.get(playerUuid);
-    }
-
-    public void removePlayerResults(UUID playerUuid) {
-        this.playerResults.remove(playerUuid);
-    }
-
     public void removePlayer(UUID playerUuid) {
-        this.removePlayerResults(playerUuid);
-
         // Clean active callbacks first — if onChunkReady fires between these steps,
         // decrementCount needs perPlayerActiveCount to still exist
         var activeIter = this.active.entrySet().iterator();
@@ -231,6 +255,9 @@ public class PaperChunkGenerationService {
             gen.callbacks.removeIf(cb -> cb.playerUuid.equals(playerUuid));
             if (gen.callbacks.isEmpty()) {
                 activeIter.remove();
+                // Submitted but neither completed nor timed out — without this counter the
+                // submitted/completed books can never re-balance after a kick or dimension change
+                this.totalRemovedInFlight++;
             }
         }
 
@@ -242,13 +269,24 @@ public class PaperChunkGenerationService {
         // Active async futures will complete but onChunkReady will find empty active map.
         this.active.clear();
         this.perPlayerActiveCount.clear();
-        this.playerResults.clear();
+        this.mainReady.clear();
     }
 
     public String getDiagnostics() {
-        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d",
-                totalSubmitted, totalCompleted, active.size(), totalTimeouts);
+        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d, removed=%d",
+                totalSubmitted, totalCompleted, active.size(), totalTimeouts, totalRemovedInFlight);
     }
+
+    public long getTotalSubmitted() { return this.totalSubmitted; }
+
+    public long getTotalCompleted() { return this.totalCompleted; }
+
+    public long getTotalTimeouts() { return this.totalTimeouts; }
+
+    public long getTotalRemovedInFlight() { return this.totalRemovedInFlight; }
+
+    /** Main thread only (like every other read of {@code active}). */
+    public int getActiveCount() { return this.active.size(); }
 
     private static void incrementCount(Map<UUID, Integer> map, UUID uuid) {
         map.merge(uuid, 1, Integer::sum);

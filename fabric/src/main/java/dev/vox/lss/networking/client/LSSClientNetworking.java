@@ -2,6 +2,7 @@ package dev.vox.lss.networking.client;
 
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
+import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.api.LSSApi;
 import dev.vox.lss.config.LSSClientConfig;
 import dev.vox.lss.networking.payloads.BatchResponseS2CPayload;
@@ -13,34 +14,40 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Minecraft;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.storage.LevelResource;
 
-import java.util.concurrent.atomic.AtomicLong;
-
 public class LSSClientNetworking {
-    private static volatile boolean serverEnabled = false;
-    private static volatile int serverLodDistance = 0;
-    private static final AtomicLong columnsReceived = new AtomicLong();
-    private static final AtomicLong bytesReceived = new AtomicLong();
-    private static volatile long connectionStartMs = 0;
-    private static volatile LodRequestManager requestManager;
-
     private static final ClientColumnProcessor columnProcessor = new ClientColumnProcessor();
 
+    // Session state and the JOIN / SessionConfig / DISCONNECT ladders live in the gate
+    // (unit-testable); this class wires the production seams — the real handshake send
+    // and manager construction with live server-address resolution.
+    private static final ClientSessionGate sessionGate = new ClientSessionGate(
+            columnProcessor,
+            () -> ClientPlayNetworking.send(new HandshakeC2SPayload(
+                    LSSConstants.PROTOCOL_VERSION, LSSConstants.CAPABILITY_VOXEL_COLUMNS)),
+            LSSClientNetworking::createRequestManager);
+
     public static boolean isServerEnabled() {
-        return serverEnabled;
+        return sessionGate.isServerEnabled();
+    }
+
+    public static boolean hasReceivedSessionConfig() {
+        return sessionGate.hasReceivedSessionConfig();
     }
 
     public static int getServerLodDistance() {
-        return serverLodDistance;
+        return sessionGate.getServerLodDistance();
     }
 
     public static long getColumnsReceived() {
-        return columnsReceived.get();
+        return sessionGate.getColumnsReceived();
     }
 
     public static long getBytesReceived() {
-        return bytesReceived.get();
+        return sessionGate.getBytesReceived();
     }
 
     public static long getColumnsDropped() {
@@ -48,25 +55,50 @@ public class LSSClientNetworking {
     }
 
     public static long getConnectionStartMs() {
-        return connectionStartMs;
+        return sessionGate.getConnectionStartMs();
     }
 
     public static LodRequestManager getRequestManager() {
-        return requestManager;
+        return sessionGate.getRequestManager();
     }
 
     public static int getQueuedColumnCount() {
         return columnProcessor.getQueuedCount();
     }
 
+    /**
+     * Report a delivered-but-not-ingested column (decode failure or consumer rejection
+     * via {@link LSSApi#reportIngestFailure}). Hops to the main thread, where the manager
+     * forgets the received-stamp and schedules a re-request. Safe from any thread.
+     */
+    public static void reportIngestFailure(ResourceKey<Level> dimension, int chunkX, int chunkZ) {
+        var mc = Minecraft.getInstance();
+        if (mc == null) return; // unit tests / very early startup — no session to repair anyway
+        mc.execute(() -> {
+            var manager = sessionGate.getRequestManager();
+            if (manager != null) {
+                manager.onIngestFailure(dimension, PositionUtil.packPosition(chunkX, chunkZ));
+            }
+        });
+    }
+
+    /**
+     * Drain the decode queue and unstamp every undispatched column via the manager —
+     * called before any cache persistence (disconnect, dimension change) so stamps for
+     * never-ingested data cannot outlive the session state that recorded them.
+     */
+    static void reportUndispatchedColumns(LodRequestManager manager) {
+        columnProcessor.reportUndispatched(manager);
+    }
+
     public static void triggerHostHandshake() {
         Minecraft.getInstance().execute(() -> {
             if (!LSSClientConfig.CONFIG.receiveServerLods) return;
-            if (requestManager != null) return;
+            if (sessionGate.getRequestManager() != null) return;
+            if (!LSSApi.hasVoxelConsumers()) return; // no LOD consumer -> stay silent
             try {
-                int clientCaps = LSSApi.hasVoxelConsumers()
-                        ? LSSConstants.CAPABILITY_VOXEL_COLUMNS : 0;
-                ClientPlayNetworking.send(new HandshakeC2SPayload(LSSConstants.PROTOCOL_VERSION, clientCaps));
+                ClientPlayNetworking.send(new HandshakeC2SPayload(
+                        LSSConstants.PROTOCOL_VERSION, LSSConstants.CAPABILITY_VOXEL_COLUMNS));
             } catch (Exception e) {
                 LSSLogger.debug("LAN host handshake send failed: " + e.getMessage());
             }
@@ -79,62 +111,43 @@ public class LSSClientNetworking {
         registerTickHandler();
     }
 
+    /**
+     * Production {@link ClientSessionGate.ManagerFactory}: builds the per-session manager
+     * and resolves the cache-keying server address from the live client (multiplayer ip →
+     * LAN/local world dir → unknown).
+     */
+    private static LodRequestManager createRequestManager(SessionConfigS2CPayload payload) {
+        var manager = new LodRequestManager();
+        var mc = Minecraft.getInstance();
+        String serverAddr;
+        var serverData = mc.getCurrentServer();
+        var spServer = mc.getSingleplayerServer();
+        if (serverData != null && serverData.ip != null) {
+            serverAddr = serverData.ip;
+        } else if (spServer != null) {
+            var worldDir = spServer.getWorldPath(LevelResource.ROOT).getFileName();
+            serverAddr = "local:" + (worldDir != null ? worldDir : "world");
+        } else {
+            serverAddr = "unknown";
+        }
+        manager.onSessionConfig(payload, serverAddr);
+        return manager;
+    }
+
     private static void registerPacketHandlers() {
         ClientPlayNetworking.registerGlobalReceiver(
                 SessionConfigS2CPayload.TYPE,
-                (payload, context) -> context.client().execute(() -> {
-                    LSSLogger.info("Server session config received (protocol v" + payload.protocolVersion()
-                            + ", LOD distance: " + payload.lodDistanceChunks() + " chunks"
-                            + ", enabled: " + payload.enabled()
-                            + ", syncRate: " + payload.syncOnLoadRateLimitPerPlayer() + ")");
-
-                    if (payload.protocolVersion() != LSSConstants.PROTOCOL_VERSION) {
-                        LSSLogger.warn("Server has incompatible LSS protocol version " + payload.protocolVersion()
-                                + " (client: " + LSSConstants.PROTOCOL_VERSION + "), LOD distribution disabled");
-                        serverEnabled = false;
-                        return;
-                    }
-
-                    serverEnabled = payload.enabled();
-                    serverLodDistance = payload.lodDistanceChunks();
-
-                    if (payload.enabled()) {
-                        connectionStartMs = System.currentTimeMillis();
-                        var manager = new LodRequestManager();
-                        var mc = Minecraft.getInstance();
-                        String serverAddr;
-                        var serverData = mc.getCurrentServer();
-                        var spServer = mc.getSingleplayerServer();
-                        if (serverData != null && serverData.ip != null) {
-                            serverAddr = serverData.ip;
-                        } else if (spServer != null) {
-                            var worldDir = spServer.getWorldPath(LevelResource.ROOT).getFileName();
-                            serverAddr = "local:" + (worldDir != null ? worldDir : "world");
-                        } else {
-                            serverAddr = "unknown";
-                        }
-                        manager.onSessionConfig(payload, serverAddr);
-                        requestManager = manager;
-                    }
-                })
+                (payload, context) -> context.client().execute(
+                        () -> sessionGate.onSessionConfig(payload, LSSApi.hasVoxelConsumers()))
         );
 
         ClientPlayNetworking.registerGlobalReceiver(
                 BatchResponseS2CPayload.TYPE,
                 (payload, context) -> {
                     context.client().execute(() -> {
-                        var manager = requestManager;
+                        var manager = sessionGate.getRequestManager();
                         if (manager == null) return;
-                        for (int i = 0; i < payload.count(); i++) {
-                            int requestId = payload.requestIds()[i];
-                            byte type = payload.responseTypes()[i];
-                            switch (type) {
-                                case LSSConstants.RESPONSE_RATE_LIMITED -> manager.onRateLimited(requestId);
-                                case LSSConstants.RESPONSE_UP_TO_DATE -> manager.onColumnUpToDate(requestId);
-                                case LSSConstants.RESPONSE_NOT_GENERATED -> manager.onColumnNotGenerated(requestId);
-                                default -> LSSLogger.warn("Unknown batch response type: " + type);
-                            }
-                        }
+                        dispatchBatchResponses(manager, payload);
                     });
                 }
         );
@@ -143,7 +156,7 @@ public class LSSClientNetworking {
                 DirtyColumnsS2CPayload.TYPE,
                 (payload, context) -> {
                     context.client().execute(() -> {
-                        var manager = requestManager;
+                        var manager = sessionGate.getRequestManager();
                         if (manager != null) {
                             manager.onDirtyColumns(payload.dirtyPositions());
                         }
@@ -154,14 +167,15 @@ public class LSSClientNetworking {
         ClientPlayNetworking.registerGlobalReceiver(
                 VoxelColumnS2CPayload.TYPE,
                 (payload, context) -> {
-                    columnsReceived.incrementAndGet();
-                    bytesReceived.addAndGet(payload.estimatedBytes());
+                    sessionGate.recordColumnFrame(payload.estimatedBytes());
 
                     context.client().execute(() -> {
-                        var manager = requestManager;
+                        var manager = sessionGate.getRequestManager();
                         if (manager != null) {
-                            manager.onColumnReceived(payload.requestId(),
-                                    payload.columnTimestamp());
+                            manager.onColumnReceived(
+                                    PositionUtil.packPosition(payload.chunkX(), payload.chunkZ()),
+                                    payload.columnTimestamp(),
+                                    payload.dimension());
                         }
                         columnProcessor.offer(payload);
                     });
@@ -169,53 +183,43 @@ public class LSSClientNetworking {
         );
     }
 
+    /**
+     * Routes each batch entry to its per-type manager callback. An unknown responseType
+     * skips that entry only, never the rest of the batch (forward compat with newer
+     * servers). Package-private so tests can exercise it without a network receiver.
+     */
+    static void dispatchBatchResponses(LodRequestManager manager, BatchResponseS2CPayload payload) {
+        for (int i = 0; i < payload.count(); i++) {
+            long packed = payload.packedPositions()[i];
+            byte type = payload.responseTypes()[i];
+            switch (type) {
+                case LSSConstants.RESPONSE_RATE_LIMITED -> manager.onRateLimited(packed);
+                case LSSConstants.RESPONSE_UP_TO_DATE -> manager.onColumnUpToDate(packed);
+                case LSSConstants.RESPONSE_NOT_GENERATED -> manager.onColumnNotGenerated(packed);
+                default -> LSSLogger.warn("Unknown batch response type: " + type);
+            }
+        }
+    }
+
     private static void registerConnectionLifecycle() {
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
-            serverEnabled = false;
-            serverLodDistance = 0;
-            requestManager = null;
-
-            if (!LSSClientConfig.CONFIG.receiveServerLods) return;
-
             // Don't activate on singleplayer/integrated servers (unless testing)
-            if (Minecraft.getInstance().hasSingleplayerServer()
-                    && !Boolean.getBoolean("lss.test.integratedServer")) {
-                return;
-            }
-
-            try {
-                int clientCaps = LSSApi.hasVoxelConsumers()
-                        ? LSSConstants.CAPABILITY_VOXEL_COLUMNS : 0;
-                ClientPlayNetworking.send(new HandshakeC2SPayload(LSSConstants.PROTOCOL_VERSION, clientCaps));
-            } catch (Exception e) {
-                LSSLogger.debug("Handshake send failed (server likely doesn't have LSS): " + e.getMessage());
-            }
+            boolean localIntegratedServer = Minecraft.getInstance().hasSingleplayerServer()
+                    && !Boolean.getBoolean("lss.test.integratedServer");
+            sessionGate.onJoin(LSSClientConfig.CONFIG.receiveServerLods, localIntegratedServer,
+                    LSSApi.hasVoxelConsumers());
         });
 
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-            var manager = requestManager;
-            if (manager != null) {
-                manager.disconnect();
-                manager.saveCache();
-            }
-            columnProcessor.shutdown();
-            columnProcessor.resetStats();
-            serverEnabled = false;
-            serverLodDistance = 0;
-            columnsReceived.set(0);
-            bytesReceived.set(0);
-            connectionStartMs = 0;
-            requestManager = null;
-        });
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> sessionGate.onDisconnect());
     }
 
     private static void registerTickHandler() {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            var manager = requestManager;
-            if (manager != null && serverEnabled) {
+            var manager = sessionGate.getRequestManager();
+            if (manager != null && sessionGate.isServerEnabled()) {
                 manager.tick();
             }
-            columnProcessor.scheduleProcessing(serverEnabled);
+            columnProcessor.scheduleProcessing(sessionGate.isServerEnabled());
         });
     }
 }

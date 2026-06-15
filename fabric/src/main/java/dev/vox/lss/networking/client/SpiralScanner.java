@@ -5,23 +5,28 @@ import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.compat.ModCompat;
 import dev.vox.lss.config.LSSClientConfig;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
-import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
+import java.util.function.IntSupplier;
 import java.util.function.LongPredicate;
 
 /**
  * Expanding Chebyshev ring scanner that discovers chunk positions to request.
- * Populates a queue that {@link LodRequestManager} drip-feeds to the server every tick.
+ * Owns the whole scan policy — 20-tick cadence, skip-one-scan rate-limit backoff,
+ * and the budget computation with its queue-pressure and vanilla-load scales —
+ * and writes accepted positions directly into the {@link RequestQueue} that
+ * {@link LodRequestManager} drip-feeds to the server every tick.
  */
 class SpiralScanner {
     /** Scan budget multiplier relative to server concurrency limit. */
     private static final int BUDGET_MULTIPLIER = 4;
 
+    private SessionConfigS2CPayload sessionConfig;
+
     private int confirmedRing = 0;
     private int scanRing = 0;
     private int scanTickCounter = LSSConstants.TICKS_PER_SECOND - 1; // starts at max so first scan fires immediately on join
     private int missingVanillaChunks = Integer.MAX_VALUE;
+    private boolean skipNextScan;
 
     // Last scan budget tracking
     private int lastBudget;
@@ -32,31 +37,60 @@ class SpiralScanner {
     private int cachedVoxyDistance = -1; // -1 = not present
     private int voxyDistanceStaleness = 0;
 
-    // Reusable scan buffers (grown as needed)
-    private long[] posBuf = new long[0];
-    private long[] tsBuf = new long[0];
+    /** Set once per session, alongside {@link #reset()}. */
+    void setConfig(SessionConfigS2CPayload sessionConfig) {
+        this.sessionConfig = sessionConfig;
+    }
 
-    /**
-     * Result of a scan tick: parallel arrays of positions and timestamps, plus count.
-     */
-    record ScanResult(long[] positions, long[] timestamps, int count) {}
-
-    /**
-     * Increments the scan tick counter. Returns true when 20 ticks have elapsed
-     * and a scan should fire.
-     */
-    boolean advanceScanTick() {
-        if (++this.scanTickCounter < LSSConstants.TICKS_PER_SECOND) return false;
-        this.scanTickCounter = 0;
-        return true;
+    /** A rate-limited response arrived — back off by skipping the next scan. */
+    void noteRateLimited() {
+        this.skipNextScan = true;
     }
 
     /**
-     * Returns the base scan budget for the given server concurrency limit.
+     * Advance the scan cadence and, when it fires, run a budgeted ring scan that writes
+     * accepted positions into the queue (committing only when something was accepted, so
+     * an undrained remainder keeps draining after an empty scan).
+     *
+     * @param missingVanilla evaluated only when the cadence fires and the skip flag is clear
+     * @return -1 when the cadence did not fire this tick; otherwise the number of queued
+     *         positions (0 for a skipped or empty scan)
      */
-    static int baseBudget(SessionConfigS2CPayload config) {
-        int concurrencyBased = config.syncOnLoadConcurrencyLimitPerPlayer() * BUDGET_MULTIPLIER;
-        return Math.min(concurrencyBased, config.syncOnLoadRateLimitPerPlayer());
+    int maybeScan(int playerCx, int playerCz, int viewDistance,
+                  int columnQueueSize, int columnQueueHaltThreshold,
+                  IntSupplier missingVanilla,
+                  ColumnStateMap columns, LongPredicate isInFlight,
+                  RequestQueue queue) {
+        if (++this.scanTickCounter < LSSConstants.TICKS_PER_SECOND) return -1;
+        this.scanTickCounter = 0;
+
+        if (this.skipNextScan) {
+            this.skipNextScan = false;
+            return 0;
+        }
+
+        this.missingVanillaChunks = missingVanilla.getAsInt();
+
+        // Compute scan budget: base × queue-pressure-scale × vanilla-load-scale
+        int budget = this.sessionConfig.syncOnLoadConcurrencyLimitPerPlayer() * BUDGET_MULTIPLIER;
+        if (columnQueueSize > 0) {
+            budget = Math.max(1, Math.round(budget * Math.max(0f, 1f - (float) columnQueueSize / columnQueueHaltThreshold)));
+        }
+        if (this.missingVanillaChunks > 0) {
+            int exclusionArea = (2 * viewDistance + 1) * (2 * viewDistance + 1);
+            float missingFraction = (float) this.missingVanillaChunks / exclusionArea;
+            float vanillaScale = Math.max(0f, 1f - missingFraction * missingFraction);
+            if (vanillaScale <= 0f) budget = 0;
+            else budget = Math.max(1, Math.round(budget * vanillaScale));
+        }
+
+        if (budget <= 0) return 0;
+
+        int count = scan(playerCx, playerCz, viewDistance, columns, isInFlight, queue, budget);
+        if (count > 0) {
+            queue.commit(count);
+        }
+        return count;
     }
 
     /**
@@ -64,35 +98,24 @@ class SpiralScanner {
      * Skips fully-confirmed rings (all positions satisfied) without spending budget,
      * and continues across multiple rings until budget is exhausted.
      */
-    ScanResult scan(int playerCx, int playerCz, int viewDistance,
-                    Long2LongOpenHashMap columnTimestamps,
-                    LongOpenHashSet dirtyColumns,
-                    LongOpenHashSet rateLimitRetryPositions,
-                    LongOpenHashSet validatedThisSession,
-                    LongPredicate isInFlight,
-                    SessionConfigS2CPayload sessionConfig,
-                    int budget) {
+    private int scan(int playerCx, int playerCz, int viewDistance,
+                     ColumnStateMap columns, LongPredicate isInFlight,
+                     RequestQueue queue, int budget) {
         int exclusionRadius = viewDistance;
-        int lodDistance = getEffectiveLodDistance(sessionConfig);
+        int lodDistance = getEffectiveLodDistance();
+        boolean generationEnabled = this.sessionConfig.generationEnabled();
 
-        // Reuse buffers, grow if needed
-        if (this.posBuf.length < budget) {
-            this.posBuf = new long[budget];
-            this.tsBuf = new long[budget];
-        }
-        long[] posBuf = this.posBuf;
-        long[] tsBuf = this.tsBuf;
+        queue.ensureCapacity(budget);
         int count = 0;
 
-        int genCap = sessionConfig.generationConcurrencyLimitPerPlayer() * BUDGET_MULTIPLIER;
+        int genCap = this.sessionConfig.generationConcurrencyLimitPerPlayer() * BUDGET_MULTIPLIER;
 
-        int exclusionDistSq = exclusionRadius * exclusionRadius;
         int[] chunkCoords = new int[2];
         int localScanRing = -1;
         int syncQueued = 0;
         int genQueued = 0;
 
-        if (!rateLimitRetryPositions.isEmpty()) {
+        if (columns.hasRetries()) {
             this.confirmedRing = 0;
         }
 
@@ -100,8 +123,11 @@ class SpiralScanner {
 
         outer:
         for (int r = localConfirmedRing; r <= lodDistance; r++) {
-            if (2 * r * r <= exclusionDistSq) { localConfirmedRing = r + 1; continue; }
-            if (r == 0) { localConfirmedRing = 1; continue; }
+            // Chebyshev exclusion to match vanilla's loaded-chunk square. A Euclidean circle
+            // leaves the square's corner chunks eligible for LOD requests while they are
+            // loaded and continuously re-saving (inhabitedTime), which turns the dirty
+            // broadcast into a permanent re-request/re-serve loop on those corners.
+            if (r <= exclusionRadius) { localConfirmedRing = r + 1; continue; }
 
             boolean ringFullySatisfied = true;
             int ringSize = 8 * r;
@@ -112,44 +138,26 @@ class SpiralScanner {
                 int cx = chunkCoords[0];
                 int cz = chunkCoords[1];
 
-                int pdx = cx - playerCx;
-                int pdz = cz - playerCz;
-                if (pdx * pdx + pdz * pdz <= exclusionDistSq) continue;
-
                 long packed = PositionUtil.packPosition(cx, cz);
 
                 // In-flight positions are satisfied — skip without breaking ring confirmation
                 if (isInFlight.test(packed)) continue;
 
-                long stored = columnTimestamps.get(packed);
-
-                // Determine timestamp to send, or skip this position entirely.
-                // Priority: unknown > generation > dirty > rate-limit retry > revalidation
-                long ts;
-                if (stored == -1L) {
-                    ts = -1L; // Unknown — sync-on-load first; server generates only on explicit retry
-                } else if (stored == 0L && sessionConfig.generationEnabled()) {
-                    if (genQueued >= genCap) { ringFullySatisfied = false; continue; }
-                    ts = 0L; // Not generated — generation retry
-                } else if (dirtyColumns.contains(packed)) {
-                    ts = stored; // Server-pushed dirty
-                } else if (rateLimitRetryPositions.contains(packed)) {
-                    ts = stored; // Rate-limit retry
-                } else if (stored > 0 && !validatedThisSession.contains(packed)) {
-                    ts = stored; // Cached but not validated this session
-                } else {
-                    continue; // Position is satisfied
-                }
+                long ts = columns.classify(packed, generationEnabled);
+                if (ts == ColumnStateMap.SATISFIED) continue;
+                if (ts == 0L && genQueued >= genCap) { ringFullySatisfied = false; continue; }
 
                 ringFullySatisfied = false;
-                posBuf[count] = packed;
-                tsBuf[count] = ts;
+                queue.put(count, packed, ts);
                 count++;
                 if (ts == 0) genQueued++; else syncQueued++;
                 if (localScanRing < r) localScanRing = r;
             }
 
-            if (ringFullySatisfied) {
+            // Contiguous prefix only: confirming a satisfied OUTER ring while an inner ring
+            // still has unsatisfied positions (e.g. gen-cap skips) would start every later
+            // scan past the inner ring — a permanent LOD hole for a stationary player.
+            if (ringFullySatisfied && localConfirmedRing == r) {
                 localConfirmedRing = r + 1;
             }
         }
@@ -160,7 +168,7 @@ class SpiralScanner {
         this.lastSyncQueued = syncQueued;
         this.lastGenQueued = genQueued;
 
-        return new ScanResult(posBuf, tsBuf, count);
+        return count;
     }
 
     /**
@@ -179,10 +187,6 @@ class SpiralScanner {
         }
     }
 
-    void updateMissingVanillaChunks(int count) {
-        this.missingVanillaChunks = count;
-    }
-
     void reset() {
         this.confirmedRing = 0;
         this.scanRing = 0;
@@ -190,6 +194,7 @@ class SpiralScanner {
         this.missingVanillaChunks = Integer.MAX_VALUE;
         this.cachedVoxyDistance = -1;
         this.voxyDistanceStaleness = 0;
+        this.skipNextScan = false;
     }
 
     void resetScanCounter() {
@@ -197,8 +202,30 @@ class SpiralScanner {
         this.scanTickCounter = 0;
     }
 
-    int getEffectiveLodDistance(SessionConfigS2CPayload sessionConfig) {
-        int serverDistance = sessionConfig.lodDistanceChunks();
+    /**
+     * Force the next scan to re-walk from the innermost ring (cheaply skipping already-satisfied
+     * positions) WITHOUT resetting the scan-tick cadence. Used when a position BELOW the confirmed
+     * ring became requestable again — a late not-generated stamp on a position the ring confirmed
+     * past while it was in-flight: only a re-walk re-reaches it. Unlike {@link #resetScanCounter}
+     * this leaves the cadence alone (a steady not-generated trickle would otherwise debounce scans
+     * back indefinitely), and unlike a retry mark it leaves {@link ColumnStateMap#classify} free to
+     * correctly PARK the position when generation is disabled instead of looping re-requests.
+     */
+    void resetConfirmedRing() {
+        this.confirmedRing = 0;
+    }
+
+    /**
+     * A dimension change discards any pending rate-limit backoff — it belonged to the old
+     * dimension's load. Deliberately NOT part of resetScanCounter(): the movement and
+     * dirty-broadcast paths call that too and must preserve the backoff.
+     */
+    void clearSkipNextScan() {
+        this.skipNextScan = false;
+    }
+
+    int getEffectiveLodDistance() {
+        int serverDistance = this.sessionConfig.lodDistanceChunks();
         int clientDistance = LSSClientConfig.CONFIG.lodDistanceChunks;
         int effective;
         if (clientDistance > 0) {
@@ -222,32 +249,8 @@ class SpiralScanner {
         return this.cachedVoxyDistance;
     }
 
-    int getPruneDistance(SessionConfigS2CPayload sessionConfig) {
-        return getEffectiveLodDistance(sessionConfig) + LSSConstants.LOD_DISTANCE_BUFFER;
-    }
-
-    // --- Pruning ---
-
-    void pruneOutOfRangeTimestamps(Long2LongOpenHashMap columnTimestamps, RequestMetrics metrics,
-                                    int playerCx, int playerCz, int pruneDistance) {
-        var iter = columnTimestamps.long2LongEntrySet().iterator();
-        while (iter.hasNext()) {
-            var entry = iter.next();
-            if (PositionUtil.isOutOfRange(entry.getLongKey(), playerCx, playerCz, pruneDistance)) {
-                metrics.onTimestampRemoved(entry.getLongValue());
-                iter.remove();
-            }
-        }
-    }
-
-    void pruneOutOfRangePositions(LongOpenHashSet set, int playerCx, int playerCz, int pruneDistance) {
-        var iter = set.iterator();
-        while (iter.hasNext()) {
-            long packed = iter.nextLong();
-            if (PositionUtil.isOutOfRange(packed, playerCx, playerCz, pruneDistance)) {
-                iter.remove();
-            }
-        }
+    int getPruneDistance() {
+        return getEffectiveLodDistance() + LSSConstants.LOD_DISTANCE_BUFFER;
     }
 
     // --- Getters ---

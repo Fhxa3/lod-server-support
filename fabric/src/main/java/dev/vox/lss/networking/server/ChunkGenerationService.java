@@ -18,14 +18,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class ChunkGenerationService {
     // flags=2 (LOADING) makes the chunk load/generate; timeout=0 means we manage lifetime ourselves
     private static final TicketType LSS_GEN_TICKET = new TicketType(0, 2);
 
-    record GenerationCallback(UUID playerUuid, int requestId, long submissionOrder) {}
+    record GenerationCallback(UUID playerUuid, long submissionOrder) {}
 
     private record PendingGenerationKey(ResourceKey<Level> dimension, int cx, int cz) {}
 
@@ -41,36 +39,59 @@ public class ChunkGenerationService {
         }
     }
 
+    /** Serializes a completed chunk into wire-format column data. Test seam (D9): injectable
+     *  so a Throwable mid-serialization can be exercised against the release-in-finally
+     *  contract without corrupting a real chunk; production always wires
+     *  {@link SectionSerializer#serializeColumn}. */
+    @FunctionalInterface
+    public interface ColumnSerializer {
+        LoadedColumnData serialize(ServerLevel level, LevelChunk chunk, int cx, int cz);
+    }
+
     private final LinkedHashMap<PendingGenerationKey, PendingGeneration> active = new LinkedHashMap<>();
     private final Map<UUID, Integer> perPlayerActiveCount = new HashMap<>();
-    private final ConcurrentHashMap<UUID, ConcurrentLinkedQueue<ChunkDiskReader.ReadResult>> playerResults = new ConcurrentHashMap<>();
 
     private final int maxConcurrent;
     private final int maxPerPlayerActive;
     private final int timeoutTicks;
+    private final ColumnSerializer columnSerializer;
+    private DirtyContentFilter dirtyContentFilter;
 
     // Volatile is sufficient — only written from the main tick thread, read by /stats commands.
     private volatile long totalSubmitted = 0;
     private volatile long totalCompleted = 0;
     private volatile long totalTimeouts = 0;
+    private volatile long totalRemovedInFlight = 0;
 
     public ChunkGenerationService(LSSServerConfig config) {
+        this(config, SectionSerializer::serializeColumn);
+    }
+
+    /** Test seam constructor (see {@link ColumnSerializer}); zero behavior change when
+     *  default-wired through the production constructor above. */
+    public ChunkGenerationService(LSSServerConfig config, ColumnSerializer columnSerializer) {
         this.maxConcurrent = config.generationConcurrencyLimitGlobal;
         this.maxPerPlayerActive = config.generationConcurrencyLimitPerPlayer;
         this.timeoutTicks = config.generationTimeoutSeconds * LSSConstants.TICKS_PER_SECOND;
+        this.columnSerializer = columnSerializer;
+    }
+
+    /** Wired by RequestProcessingService after construction (it owns the filter). */
+    public void setDirtyContentFilter(DirtyContentFilter filter) {
+        this.dirtyContentFilter = filter;
     }
 
     /**
      * Submit a generation request. Returns true if accepted (piggyback or new active slot),
      * false if at capacity (caller should feed back a rejection result).
      */
-    public boolean submitGeneration(UUID playerUuid, int requestId, ServerLevel level, int cx, int cz, long submissionOrder) {
+    public boolean submitGeneration(UUID playerUuid, ServerLevel level, int cx, int cz, long submissionOrder) {
         var key = new PendingGenerationKey(level.dimension(), cx, cz);
 
         // Already active — piggyback on existing entry
         var existing = this.active.get(key);
         if (existing != null) {
-            existing.callbacks.add(new GenerationCallback(playerUuid, requestId, submissionOrder));
+            existing.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
             incrementCount(this.perPlayerActiveCount, playerUuid);
             return true;
         }
@@ -82,7 +103,7 @@ public class ChunkGenerationService {
             level.getChunkSource().addTicketWithRadius(LSS_GEN_TICKET, pos, 0);
 
             var gen = new PendingGeneration(pos, level);
-            gen.callbacks.add(new GenerationCallback(playerUuid, requestId, submissionOrder));
+            gen.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
             this.active.put(key, gen);
             incrementCount(this.perPlayerActiveCount, playerUuid);
             this.totalSubmitted++;
@@ -95,8 +116,8 @@ public class ChunkGenerationService {
 
     /**
      * Tick the generation service. Extracts primitives for completed chunks (main thread safe),
-     * returns GenerationReadyData for the processing thread to voxelize off-thread.
-     * Timeouts produce empty results directly in the player result queue.
+     * returns one GenerationReadyData per callback for the processing thread — successes carry
+     * column data; timeouts and extraction errors carry {@code columnData == null}.
      */
     public List<TickSnapshot.GenerationReadyData> tick() {
         if (this.active.isEmpty()) return List.of();
@@ -110,11 +131,8 @@ public class ChunkGenerationService {
             if (gen.ticksWaiting > this.timeoutTicks) {
                 LSSLogger.debug("Generation timeout for chunk " + gen.pos.x() + "," + gen.pos.z()
                         + " after " + gen.ticksWaiting + " ticks (" + gen.callbacks.size() + " callbacks)");
-                for (var cb : gen.callbacks) {
-                    this.addResult(cb.playerUuid, ChunkDiskReader.emptyResult(
-                            cb.playerUuid, cb.requestId, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
-                    decrementCount(this.perPlayerActiveCount, cb.playerUuid);
-                }
+                if (ready == null) ready = new ArrayList<>();
+                addFailures(ready, gen);
                 gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
                 iter.remove();
                 this.totalTimeouts++;
@@ -123,56 +141,60 @@ public class ChunkGenerationService {
 
             LevelChunk chunk = gen.level.getChunkSource().getChunkNow(gen.pos.x(), gen.pos.z());
             if (chunk != null) {
+                if (ready == null) ready = new ArrayList<>();
                 try {
                     long columnTimestamp = LSSConstants.epochSeconds();
-                    LoadedColumnData columnData = SectionSerializer.serializeColumn(
+                    LoadedColumnData columnData = this.columnSerializer.serialize(
                             gen.level, chunk, gen.pos.x(), gen.pos.z());
+                    String dimension = gen.level.dimension().identifier().toString();
+
+                    // Seed the dirty filter with the served bytes: the chunk's imminent
+                    // unload-save would otherwise count as "first observed save" and
+                    // trigger a pointless second send of the identical column.
+                    if (this.dirtyContentFilter != null) {
+                        this.dirtyContentFilter.seed(dimension, gen.pos.x(), gen.pos.z(),
+                                columnData.serializedSections());
+                    }
 
                     // One GenerationReadyData per callback — processing thread will voxelize
                     for (var cb : gen.callbacks) {
-                        if (ready == null) ready = new ArrayList<>();
                         ready.add(new TickSnapshot.GenerationReadyData(
-                                cb.playerUuid, cb.requestId, columnData, columnTimestamp,
-                                cb.submissionOrder));
+                                cb.playerUuid, gen.pos.x(), gen.pos.z(), dimension,
+                                columnData, columnTimestamp, cb.submissionOrder));
                         decrementCount(this.perPlayerActiveCount, cb.playerUuid);
                     }
                     this.totalCompleted++;
-                } catch (Exception e) {
-                    LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), e);
-                    for (var cb : gen.callbacks) {
-                        this.addResult(cb.playerUuid, ChunkDiskReader.emptyResult(
-                                cb.playerUuid, cb.requestId, gen.pos.x(), gen.pos.z(), cb.submissionOrder));
-                        decrementCount(this.perPlayerActiveCount, cb.playerUuid);
-                    }
+                } catch (Throwable t) {
+                    LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), t);
+                    addFailures(ready, gen);
+                    // Failed extraction is a terminal removal that is neither completed nor a
+                    // timeout — count it as removed-in-flight so the generation books
+                    // (submitted == completed + timeouts + removed) still balance (soak law A4).
+                    this.totalRemovedInFlight++;
+                } finally {
+                    // Always release the force-load ticket and drop the active entry — even on an
+                    // Error during serialization — or the chunk stays force-loaded forever and the
+                    // entry is retried (and re-throws) every server tick.
+                    gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
+                    iter.remove();
                 }
-                gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
-                iter.remove();
             }
         }
         return ready != null ? ready : List.of();
     }
 
-    void registerPlayer(UUID playerUuid) {
-        this.playerResults.computeIfAbsent(playerUuid, k -> new ConcurrentLinkedQueue<>());
-    }
-
-    void addResult(UUID playerUuid, ChunkDiskReader.ReadResult result) {
-        var queue = this.playerResults.get(playerUuid);
-        if (queue != null) {
-            queue.add(result);
+    /** Add a failure outcome (columnData == null) for every callback of the entry. */
+    private void addFailures(List<TickSnapshot.GenerationReadyData> ready, PendingGeneration gen) {
+        String dimension = gen.level.dimension().identifier().toString();
+        for (var cb : gen.callbacks) {
+            ready.add(new TickSnapshot.GenerationReadyData(
+                    cb.playerUuid, gen.pos.x(), gen.pos.z(), dimension,
+                    null, 0L, cb.submissionOrder));
+            decrementCount(this.perPlayerActiveCount, cb.playerUuid);
         }
     }
 
-    public ConcurrentLinkedQueue<ChunkDiskReader.ReadResult> getPlayerQueue(UUID playerUuid) {
-        return this.playerResults.get(playerUuid);
-    }
-
-    public void removePlayerResults(UUID playerUuid) {
-        this.playerResults.remove(playerUuid);
-    }
-
     public void removePlayer(UUID playerUuid) {
-        this.removePlayerResults(playerUuid);
         this.perPlayerActiveCount.remove(playerUuid);
 
         // Clean up active entries
@@ -183,6 +205,9 @@ public class ChunkGenerationService {
             if (gen.callbacks.isEmpty()) {
                 gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
                 iter.remove();
+                // Submitted but neither completed nor timed out — without this counter the
+                // submitted/completed books can never re-balance after a kick or dimension change
+                this.totalRemovedInFlight++;
             }
         }
     }
@@ -193,17 +218,18 @@ public class ChunkGenerationService {
         }
         this.active.clear();
         this.perPlayerActiveCount.clear();
-        this.playerResults.clear();
     }
 
     public String getDiagnostics() {
-        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d",
-                totalSubmitted, totalCompleted, active.size(), totalTimeouts);
+        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d, removed=%d",
+                totalSubmitted, totalCompleted, active.size(), totalTimeouts, totalRemovedInFlight);
     }
 
     public long getTotalSubmitted() { return totalSubmitted; }
     public long getTotalCompleted() { return totalCompleted; }
     public long getTotalTimeouts() { return totalTimeouts; }
+    public long getTotalRemovedInFlight() { return totalRemovedInFlight; }
+    public int getActiveCount() { return active.size(); }
 
     private static void incrementCount(Map<UUID, Integer> map, UUID uuid) {
         map.merge(uuid, 1, Integer::sum);

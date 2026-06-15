@@ -13,10 +13,14 @@ import java.util.Map;
  */
 public class DirtyColumnTracker {
     private final Map<String, LongOpenHashSet> dirtyColumns = new HashMap<>();
+    private long totalDrained;
+    private long totalMarked;
 
     public synchronized void markDirty(String dimension, int cx, int cz) {
         long packed = PositionUtil.packPosition(cx, cz);
-        dirtyColumns.computeIfAbsent(dimension, k -> new LongOpenHashSet()).add(packed);
+        if (dirtyColumns.computeIfAbsent(dimension, k -> new LongOpenHashSet()).add(packed)) {
+            totalMarked++;
+        }
     }
 
     public synchronized long[] drainDirty(String dimension) {
@@ -24,6 +28,24 @@ public class DirtyColumnTracker {
         if (set == null || set.isEmpty()) return null;
         long[] result = set.toLongArray();
         set.clear();
+        totalDrained += result.length;
         return result;
     }
+
+    /** Dirty positions accumulated and not yet drained, across all dimensions. */
+    public synchronized int pendingCount() {
+        int total = 0;
+        for (var set : dirtyColumns.values()) total += set.size();
+        return total;
+    }
+
+    /** Cumulative count of positions handed to broadcasters across the tracker's lifetime. */
+    public synchronized long getTotalDrained() { return totalDrained; }
+
+    /**
+     * Cumulative count of net-new dirty marks (re-marking a still-pending position does not
+     * count). Closes mark/drain conservation: at any observation point,
+     * {@code getTotalMarked() == getTotalDrained() + pendingCount()}.
+     */
+    public synchronized long getTotalMarked() { return totalMarked; }
 }

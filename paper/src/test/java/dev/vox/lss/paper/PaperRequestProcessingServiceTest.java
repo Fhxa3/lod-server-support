@@ -1,0 +1,620 @@
+package dev.vox.lss.paper;
+
+import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.common.processing.LoadedColumnData;
+import dev.vox.lss.common.processing.OffThreadProcessor;
+import dev.vox.lss.common.processing.QueuedPayload;
+import dev.vox.lss.common.processing.TickSnapshot;
+import dev.vox.lss.common.tracking.DirtyColumnTracker;
+import net.minecraft.SharedConstants;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.players.PlayerList;
+import net.minecraft.world.level.Level;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * First direct tests of {@link PaperRequestProcessingService} — the hand-copied twin of
+ * Fabric's RequestProcessingService, previously exercised only by live soak runs. Built
+ * on the collaborator-injected {@code Wiring} constructor: recording subclasses of the
+ * processor / generation service / broadcaster observe exactly the calls the service
+ * glue makes, and the column-sender / probe seams replace the only NMS sends. Pins the
+ * batch-request gate, handshake lifecycle (reuse, dimension change, respawn swap vs
+ * removal), the a9bee8d flush-drop {@code clearDiskReadDone} wiring, the generation
+ * ticket drain triage, the enabled=false freeze, probe budget accounting, and shutdown
+ * failure isolation.
+ */
+class PaperRequestProcessingServiceTest {
+
+    @BeforeAll
+    static void setup() {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+    }
+
+    // ---- recording collaborators ----
+
+    static class RecordingProcessor extends PaperOffThreadProcessor {
+        final List<TickSnapshot> snapshots = new ArrayList<>();
+        final List<List<TickSnapshot.GenerationReadyData>> postedGenerationReady = new ArrayList<>();
+        final List<UUID> removals = new ArrayList<>();
+        record DirtyClear(UUID playerUuid, long[] positions) {}
+        final List<DirtyClear> dirtyClears = new ArrayList<>();
+        record GenFailure(UUID playerUuid, int cx, int cz, String dimension, long submissionOrder) {}
+        final List<GenFailure> genFailures = new ArrayList<>();
+        final ArrayDeque<OffThreadProcessor.GenerationTicketRequest> ticketQueue = new ArrayDeque<>();
+        final AtomicInteger sendActionDrains = new AtomicInteger();
+        boolean throwOnShutdown = false;
+        boolean shutdownCalled = false;
+
+        RecordingProcessor(Map<UUID, PaperPlayerRequestState> players, PaperChunkDiskReader diskReader) {
+            // Never start()ed: the recording overrides observe the main-thread glue only.
+            super(players, diskReader, true, null, 32);
+        }
+
+        @Override
+        public void postSnapshot(TickSnapshot snapshot, List<TickSnapshot.GenerationReadyData> generationReady) {
+            snapshots.add(snapshot);
+            postedGenerationReady.add(generationReady);
+        }
+
+        @Override
+        public void notifyPlayerRemoved(UUID uuid) {
+            removals.add(uuid);
+        }
+
+        @Override
+        public void clearDiskReadDone(UUID playerUuid, long[] positions) {
+            dirtyClears.add(new DirtyClear(playerUuid, positions));
+        }
+
+        @Override
+        public void feedGenerationFailure(UUID playerUuid, int cx, int cz, String dimension, long submissionOrder) {
+            genFailures.add(new GenFailure(playerUuid, cx, cz, dimension, submissionOrder));
+        }
+
+        @Override
+        public OffThreadProcessor.GenerationTicketRequest pollGenerationTicketRequest() {
+            return ticketQueue.poll();
+        }
+
+        @Override
+        public void drainSendActions(OffThreadProcessor.BatchSender<PaperPlayerRequestState> sender) {
+            sendActionDrains.incrementAndGet();
+        }
+
+        @Override
+        public void shutdown() {
+            shutdownCalled = true;
+            if (throwOnShutdown) throw new IllegalStateException("processor shutdown boom");
+        }
+    }
+
+    static class RecordingGenService extends PaperChunkGenerationService {
+        record Submitted(UUID playerUuid, int cx, int cz, long submissionOrder) {}
+        final List<Submitted> submitted = new ArrayList<>();
+        final List<UUID> removedPlayers = new ArrayList<>();
+        List<TickSnapshot.GenerationReadyData> nextTick = List.of();
+        boolean accept = true;
+        boolean shutdownCalled = false;
+
+        RecordingGenService(PaperConfig config) {
+            super(config, null); // plugin only used by the (never-invoked) real launchAsyncLoad
+        }
+
+        @Override
+        public boolean submitGeneration(UUID playerUuid, ServerLevel level, int cx, int cz, long submissionOrder) {
+            submitted.add(new Submitted(playerUuid, cx, cz, submissionOrder));
+            return accept;
+        }
+
+        @Override
+        public List<TickSnapshot.GenerationReadyData> tick() {
+            var out = nextTick;
+            nextTick = List.of();
+            return out;
+        }
+
+        @Override
+        public void removePlayer(UUID playerUuid) {
+            removedPlayers.add(playerUuid);
+            super.removePlayer(playerUuid);
+        }
+
+        @Override
+        public void shutdown() {
+            shutdownCalled = true;
+            super.shutdown();
+        }
+    }
+
+    static class RecordingBroadcaster extends PaperDirtyColumnBroadcaster {
+        int ticks = 0;
+
+        RecordingBroadcaster(MinecraftServer server, Map<UUID, PaperPlayerRequestState> players,
+                             DirtyColumnTracker tracker, PaperOffThreadProcessor processor) {
+            super(server, players, tracker, processor);
+        }
+
+        @Override
+        void tick(PaperConfig config) {
+            ticks++;
+        }
+    }
+
+    // ---- rig ----
+
+    private Map<UUID, PaperPlayerRequestState> players;
+    private PaperChunkDiskReader diskReader;
+    private RecordingProcessor processor;
+    private RecordingGenService genService;
+    private RecordingBroadcaster broadcaster;
+    private MinecraftServer server;
+    private PlayerList playerList;
+    private PaperConfig config;
+    private PaperRequestProcessingService service;
+
+    @BeforeEach
+    void buildRig() {
+        config = new PaperConfig();
+        config.validate();
+        players = new ConcurrentHashMap<>();
+        diskReader = new PaperChunkDiskReader(1);
+        processor = new RecordingProcessor(players, diskReader);
+        genService = new RecordingGenService(config);
+        server = mock(MinecraftServer.class);
+        playerList = mock(PlayerList.class);
+        when(server.getPlayerList()).thenReturn(playerList);
+        var tracker = new DirtyColumnTracker();
+        broadcaster = new RecordingBroadcaster(server, players, tracker, processor);
+        service = new PaperRequestProcessingService(server, config,
+                new PaperRequestProcessingService.Wiring(
+                        players, diskReader, genService, processor, tracker, broadcaster));
+        // Default probe: "nothing is loaded". The production default would dereference the
+        // mocked level's chunk source; probe-specific tests inject their own recorder.
+        service.setLoadedColumnProbe((level, cx, cz) -> null);
+    }
+
+    @AfterEach
+    void teardownReader() {
+        diskReader.shutdown();
+    }
+
+    private static ServerLevel level(ResourceKey<Level> key) {
+        var l = mock(ServerLevel.class);
+        when(l.dimension()).thenReturn(key);
+        return l;
+    }
+
+    /** Mocked player at chunk (0,0) (getBlockX/Z default 0), not removed. */
+    private static ServerPlayer playerIn(UUID uuid, ServerLevel level) {
+        var p = mock(ServerPlayer.class);
+        when(p.getUUID()).thenReturn(uuid);
+        when(p.level()).thenReturn(level);
+        // getPlayerName() is dereferenced by the flush-failure log path
+        when(p.getName()).thenReturn(Component.literal("p-" + uuid.toString().substring(0, 8)));
+        return p;
+    }
+
+    private static PaperPayloadHandler.DecodedBatchChunkRequest batchOf(long[] positions, long[] timestamps) {
+        return new PaperPayloadHandler.DecodedBatchChunkRequest(positions, timestamps, positions.length);
+    }
+
+    /** PlayerBandwidthTracker refills only after >=1ms elapsed; give the fresh bucket a window. */
+    private static void awaitBandwidthWindow() throws InterruptedException {
+        Thread.sleep(10);
+    }
+
+    // ---- PP-001: batch-request distance guard ----
+
+    @Test
+    void batchRequestGateDropsBeyondLodPlusBufferAndKeepsClientTimestamps() {
+        config.lodDistanceChunks = 16; // gate at 16 + 32 = 48 Chebyshev
+        var player = playerIn(UUID.randomUUID(), level(Level.OVERWORLD));
+        var state = service.registerPlayer(player, 1);
+
+        service.handleBatchRequest(player, batchOf(
+                new long[]{
+                        PositionUtil.packPosition(48, -48),  // exactly at the gate: accepted
+                        PositionUtil.packPosition(49, 0),    // one past: dropped
+                        PositionUtil.packPosition(0, -49)},  // negative side: dropped
+                new long[]{77L, 1L, 2L}));
+
+        assertEquals(1, state.getTotalRequestsReceived(), "out-of-range positions are never enqueued");
+        var accepted = state.pollIncomingRequest();
+        assertEquals(48, accepted.cx());
+        assertEquals(-48, accepted.cz());
+        assertEquals(77L, accepted.clientTimestamp(), "the accepted request carries ITS OWN clientTimestamp");
+        assertNull(state.pollIncomingRequest());
+    }
+
+    // ---- PP-002: unregistered / pre-handshake batch requests are silent no-ops ----
+
+    @Test
+    void batchRequestWithoutRegistrationOrHandshakeIsSilentlyDropped() {
+        var level = level(Level.OVERWORLD);
+        var batch = batchOf(new long[]{PositionUtil.packPosition(1, 1)}, new long[]{-1L});
+
+        // state == null: the post-/reload shape (client still sends, plugin map is fresh)
+        var stranger = playerIn(UUID.randomUUID(), level);
+        assertDoesNotThrow(() -> service.handleBatchRequest(stranger, batch));
+        assertTrue(players.isEmpty());
+
+        // state present but handshake never completed: also dropped, no queue growth
+        var uuid = UUID.randomUUID();
+        var p = playerIn(uuid, level);
+        var bare = new PaperPlayerRequestState(p, 4, 4);
+        players.put(uuid, bare);
+        service.handleBatchRequest(p, batch);
+        assertEquals(0, bare.getTotalRequestsReceived());
+        assertNull(bare.pollIncomingRequest());
+    }
+
+    // ---- PP-003: re-handshake reuses the state ----
+
+    @Test
+    void reHandshakeReusesStateUpdatesCapabilitiesAndKeepsPendingWork() {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+
+        var first = service.registerPlayer(player, 1);
+        first.addRequest(3, 4, -1L);
+        var queueBefore = diskReader.getPlayerQueue(uuid);
+        assertNotNull(queueBefore, "registration creates the disk-reader result queue");
+
+        var second = service.registerPlayer(player, 0);
+        assertSame(first, second, "computeIfAbsent reuses the existing state");
+        assertEquals(0, second.getCapabilities(), "capabilities are updated by the re-handshake");
+        assertTrue(second.hasCompletedHandshake());
+        assertEquals(1, second.getTotalRequestsReceived(), "counters survive the re-handshake");
+        var pending = second.pollIncomingRequest();
+        assertNotNull(pending, "queued work survives the re-handshake");
+        assertEquals(3, pending.cx());
+        assertSame(queueBefore, diskReader.getPlayerQueue(uuid),
+                "disk-reader registration is idempotent (results are not torn down)");
+    }
+
+    // ---- PP-004: dimension change re-registers ----
+
+    @Test
+    void checkDimensionChangeIsTrueExactlyOncePerFlip() {
+        var overworld = level(Level.OVERWORLD);
+        var player = playerIn(UUID.randomUUID(), overworld);
+        var state = new PaperPlayerRequestState(player, 4, 4);
+
+        var end = level(Level.END);  // build the mock BEFORE opening the when() stub (no nested stubbing)
+        assertFalse(state.checkDimensionChange(), "construction captures the join dimension");
+        when(player.level()).thenReturn(end);
+        assertTrue(state.checkDimensionChange(), "first check after the flip reports it");
+        assertFalse(state.checkDimensionChange(), "the flip is consumed — no repeat re-registration");
+        when(player.level()).thenReturn(overworld);
+        assertTrue(state.checkDimensionChange(), "the round trip back is a fresh flip");
+        assertFalse(state.checkDimensionChange());
+    }
+
+    @Test
+    void dimensionChangeTickReRegistersAFreshStateWithPreservedCapabilities() {
+        var uuid = UUID.randomUUID();
+        var overworld = level(Level.OVERWORLD);
+        var player = playerIn(uuid, overworld);
+        var old = service.registerPlayer(player, 1);
+        old.addRequest(1, 1, -1L);
+        long packed = PositionUtil.packPosition(1, 1);
+        old.addReadyPayload(new QueuedPayload<>(new byte[]{1}, 1, 1L, packed));
+
+        var end = level(Level.END);  // build the mock BEFORE opening the when() stub (no nested stubbing)
+        when(player.level()).thenReturn(end);
+        service.tick();
+
+        var fresh = service.getPlayers().get(uuid);
+        assertNotNull(fresh, "the player is re-registered, not dropped");
+        assertNotSame(old, fresh, "a dimension change discards the old state entirely");
+        assertEquals(1, fresh.getCapabilities(), "capabilities survive the re-registration");
+        assertTrue(fresh.hasCompletedHandshake());
+        assertEquals(List.of(uuid), processor.removals,
+                "the processing thread is told exactly once (dedup-group teardown)");
+        assertNull(fresh.pollIncomingRequest(), "fresh pending queue");
+        assertFalse(fresh.hasEnqueuedColumn(packed), "fresh send pipeline");
+        assertEquals(0, fresh.getSendQueueSize());
+
+        // No second flip: the next tick must NOT re-register again
+        service.tick();
+        assertSame(fresh, service.getPlayers().get(uuid));
+        assertEquals(1, processor.removals.size());
+    }
+
+    // ---- PP-005: removed-vs-respawn branches ----
+
+    @Test
+    void removedPlayerStillOnThePlayerListSwapsTheHandleAndKeepsState() {
+        var uuid = UUID.randomUUID();
+        var overworld = level(Level.OVERWORLD);
+        var player = playerIn(uuid, overworld);
+        var state = service.registerPlayer(player, 1);
+        state.addRequest(2, 2, -1L);
+
+        when(player.isRemoved()).thenReturn(true);
+        var respawned = playerIn(uuid, overworld); // genuinely different instance, same UUID
+        when(playerList.getPlayer(uuid)).thenReturn(respawned);
+        service.tick();
+
+        assertSame(state, service.getPlayers().get(uuid), "respawn keeps the state");
+        assertSame(respawned, state.getPlayer(), "the player handle is swapped to the new instance");
+        assertNotNull(state.pollIncomingRequest(), "pending work survives the respawn swap");
+        assertTrue(processor.removals.isEmpty(), "no teardown for a respawn");
+    }
+
+    @Test
+    void removedPlayerAbsentFromThePlayerListIsFullyTornDown() {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        service.registerPlayer(player, 1);
+        assertNotNull(diskReader.getPlayerQueue(uuid));
+
+        when(player.isRemoved()).thenReturn(true);
+        when(playerList.getPlayer(uuid)).thenReturn(null);
+        service.tick();
+
+        assertTrue(service.getPlayers().isEmpty(), "state removed");
+        assertEquals(List.of(uuid), processor.removals, "processing thread notified");
+        assertNull(diskReader.getPlayerQueue(uuid), "disk-reader results torn down");
+        assertEquals(List.of(uuid), genService.removedPlayers, "generation service pruned");
+    }
+
+    // ---- PP-006: flush-drop wiring clears done-bits (the Paper half of a9bee8d) ----
+
+    @Test
+    void senderFailureRoutesExactlyTheDroppedPositionsToClearDiskReadDone() throws Exception {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        var state = service.registerPlayer(player, 1);
+        long p1 = PositionUtil.packPosition(10, 11);
+        long p2 = PositionUtil.packPosition(12, 13);
+        state.addReadyPayload(new QueuedPayload<>(new byte[]{1}, 8, 1L, p1));
+        state.addReadyPayload(new QueuedPayload<>(new byte[]{2}, 8, 2L, p2));
+        service.setColumnPayloadSender((s, data) -> { throw new IllegalStateException("wire down"); });
+
+        awaitBandwidthWindow();
+        service.tick();
+
+        assertEquals(1, processor.dirtyClears.size(), "one clear batch for the dropped flush");
+        var clear = processor.dirtyClears.get(0);
+        assertEquals(uuid, clear.playerUuid());
+        long[] got = clear.positions().clone();
+        Arrays.sort(got);
+        assertArrayEquals(new long[]{p1, p2}, got,
+                "exactly the dropped positions reach clearDiskReadDone — deleting the wiring "
+                        + "turns every lost delivery into a permanent up-to-date hole");
+        assertFalse(state.hasEnqueuedColumn(p1));
+        assertFalse(state.hasEnqueuedColumn(p2));
+    }
+
+    @Test
+    void successfulFlushSendsPayloadBytesAndClearsNothing() throws Exception {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        var state = service.registerPlayer(player, 1);
+        state.addReadyPayload(new QueuedPayload<>(new byte[]{7, 7}, 8, 1L, PositionUtil.packPosition(1, 0)));
+        var sent = new ArrayList<byte[]>();
+        service.setColumnPayloadSender((s, data) -> sent.add(data));
+
+        awaitBandwidthWindow();
+        service.tick();
+
+        assertEquals(1, sent.size());
+        assertArrayEquals(new byte[]{7, 7}, sent.get(0));
+        assertTrue(processor.dirtyClears.isEmpty(), "a clean flush must not clear done-bits");
+    }
+
+    // ---- PP-007: generation ticket drain triage ----
+
+    @Test
+    void staleDimensionTicketIsDroppedWithoutSubmittingOrFeedingFailure() {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        service.registerPlayer(player, 1);
+        processor.ticketQueue.add(new OffThreadProcessor.GenerationTicketRequest(
+                uuid, 5, 5, "minecraft:the_end", 9L));
+
+        service.tick();
+
+        assertTrue(genService.submitted.isEmpty(), "stale-dimension ticket never reaches generation");
+        assertTrue(processor.genFailures.isEmpty(),
+                "and feeds no failure — the admitting state died with the dimension change");
+    }
+
+    @Test
+    void capacityRejectedTicketFeedsAFailureSoTheSlotUnwinds() {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        service.registerPlayer(player, 1);
+        genService.accept = false;
+        processor.ticketQueue.add(new OffThreadProcessor.GenerationTicketRequest(
+                uuid, 5, 5, "minecraft:overworld", 9L));
+
+        service.tick();
+
+        assertEquals(List.of(new RecordingGenService.Submitted(uuid, 5, 5, 9L)), genService.submitted);
+        assertEquals(List.of(new RecordingProcessor.GenFailure(uuid, 5, 5, "minecraft:overworld", 9L)),
+                processor.genFailures,
+                "a bounced submit must feed a failure or the pending slot leaks forever");
+    }
+
+    @Test
+    void removedPlayerTicketFeedsFailureWithoutSubmitting() {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        service.registerPlayer(player, 1);
+        when(player.isRemoved()).thenReturn(true);
+        when(playerList.getPlayer(uuid)).thenReturn(player); // respawn-swap keeps the same (removed) handle
+        processor.ticketQueue.add(new OffThreadProcessor.GenerationTicketRequest(
+                uuid, 6, 6, "minecraft:overworld", 11L));
+
+        service.tick();
+
+        assertTrue(genService.submitted.isEmpty(), "isRemoved short-circuits before submitGeneration");
+        assertEquals(List.of(new RecordingProcessor.GenFailure(uuid, 6, 6, "minecraft:overworld", 11L)),
+                processor.genFailures);
+    }
+
+    // ---- PP-008: enabled=false tick is a full freeze ----
+
+    @Test
+    void tickWithEnabledFalseDoesNothingAndResumesWhenFlipped() {
+        config.enabled = false;
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        var state = service.registerPlayer(player, 1);
+        state.addRequest(1, 1, -1L); // there WOULD be work
+        processor.ticketQueue.add(new OffThreadProcessor.GenerationTicketRequest(
+                uuid, 5, 5, "minecraft:overworld", 9L));
+
+        service.tick();
+
+        assertTrue(processor.snapshots.isEmpty(), "no snapshot posted");
+        assertEquals(0, processor.sendActionDrains.get(), "no send-action drain");
+        assertEquals(0, broadcaster.ticks, "broadcaster never ticks");
+        assertEquals(1, processor.ticketQueue.size(), "ticket queue untouched");
+
+        // The same rig does work once enabled — proves the recorders are live, not vacuous
+        config.enabled = true;
+        service.tick();
+        assertEquals(1, processor.snapshots.size());
+        assertEquals(1, processor.sendActionDrains.get());
+        assertEquals(1, broadcaster.ticks);
+        assertTrue(processor.ticketQueue.isEmpty());
+    }
+
+    // ---- PP-009: shutdown failure isolation ----
+
+    @Test
+    void throwingProcessorShutdownStillShutsDownDiskReaderAndGenerationAndClearsPlayers() {
+        var uuid = UUID.randomUUID();
+        service.registerPlayer(playerIn(uuid, level(Level.OVERWORLD)), 1);
+        processor.throwOnShutdown = true;
+
+        assertDoesNotThrow(service::shutdown);
+
+        assertTrue(processor.shutdownCalled);
+        assertTrue(service.getPlayers().isEmpty(), "players cleared despite the processor throw");
+        assertNull(diskReader.getPlayerQueue(uuid), "disk reader shut down (result queues cleared)");
+        assertTrue(genService.shutdownCalled, "generation shutdown not skipped");
+    }
+
+    // ---- PP-010: probe budget, dedupe, generation-ready skip ----
+
+    @Test
+    void probeBudgetCountsNullChunkAttemptsButNotDuplicateSkips() {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        var state = service.registerPlayer(player, 1);
+
+        // Order matters (FIFO queue): success A, duplicate of A, 511 unloaded, one overflow.
+        long packedA = PositionUtil.packPosition(1000, 0);
+        state.addRequest(1000, 0, -1L);
+        state.addRequest(1000, 0, 50L); // duplicate: containsKey skip, must NOT charge the budget
+        for (int i = 0; i < 511; i++) state.addRequest(i, 1, -1L); // unloaded: null probes DO charge it
+        state.addRequest(2000, 0, -1L); // past the 512 budget: never probed
+
+        var probedPositions = new ArrayList<Long>();
+        service.setLoadedColumnProbe((lvl, cx, cz) -> {
+            probedPositions.add(PositionUtil.packPosition(cx, cz));
+            return cx == 1000 ? new LoadedColumnData(cx, cz, new byte[]{1}, 10) : null;
+        });
+
+        service.tick();
+
+        assertEquals(512, probedPositions.size(),
+                "budget is 512 ATTEMPTS: the success + all 511 null-chunk probes (a duplicate charging "
+                        + "the budget would cut this to 511; a null probe not charging it would reach 513)");
+        assertEquals(1, probedPositions.stream().filter(p -> p == packedA).count(),
+                "the duplicate position is probed exactly once");
+        assertTrue(probedPositions.contains(PositionUtil.packPosition(510, 1)),
+                "the last in-budget unloaded position was attempted");
+        assertFalse(probedPositions.contains(PositionUtil.packPosition(2000, 0)),
+                "the position past the budget was not attempted this tick");
+
+        var probes = processor.snapshots.get(0).loadedChunkProbes().get(uuid);
+        assertNotNull(probes);
+        assertEquals(1, probes.size(), "only the loaded column is snapshotted");
+        assertNotNull(probes.get(packedA));
+    }
+
+    @Test
+    void probeSkipsSameTickGenerationCompletions() {
+        var uuid = UUID.randomUUID();
+        var player = playerIn(uuid, level(Level.OVERWORLD));
+        var state = service.registerPlayer(player, 1);
+        state.addRequest(7, 7, 0L);
+        state.addRequest(8, 8, -1L);
+        genService.nextTick = List.of(new TickSnapshot.GenerationReadyData(
+                uuid, 7, 7, "minecraft:overworld", null, 0L, 1L));
+
+        var probedPositions = new ArrayList<Long>();
+        service.setLoadedColumnProbe((lvl, cx, cz) -> {
+            probedPositions.add(PositionUtil.packPosition(cx, cz));
+            return null;
+        });
+
+        service.tick();
+
+        assertEquals(List.of(PositionUtil.packPosition(8, 8)), probedPositions,
+                "a same-tick generation completion is never probed — probing it would double-serve");
+        assertEquals(1, processor.postedGenerationReady.get(0).size(),
+                "the generation outcome still reaches the snapshot post");
+    }
+
+    // ---- PP-038 (service leg): shutdown with queued work; late disk submits are inert ----
+
+    @Test
+    void shutdownWithQueuedWorkIsCleanAndLateDiskSubmitsAreInert() {
+        var uuid = UUID.randomUUID();
+        var level = level(Level.OVERWORLD);
+        var player = playerIn(uuid, level);
+        var state = service.registerPlayer(player, 1);
+        state.addRequest(1, 1, -1L);
+        processor.ticketQueue.add(new OffThreadProcessor.GenerationTicketRequest(
+                uuid, 5, 5, "minecraft:overworld", 9L));
+
+        assertDoesNotThrow(service::shutdown);
+        assertTrue(service.getPlayers().isEmpty());
+
+        // A disk read racing the shutdown (async callback shape) must be a no-op:
+        // no result queue exists and the submit must not throw into the caller.
+        diskReader.setReadOverride((cx, cz) -> CompletableFuture.completedFuture(Optional.empty()));
+        assertDoesNotThrow(() -> diskReader.submitReadDirect(uuid, "minecraft:overworld", level, 1, 1, 1L));
+        assertNull(diskReader.getPlayerQueue(uuid));
+        assertEquals(0, diskReader.getDiag().getSubmittedCount(),
+                "post-shutdown submits are rejected before they are counted");
+    }
+}

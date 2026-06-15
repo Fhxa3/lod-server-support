@@ -36,7 +36,6 @@ public class PaperWorldHandler {
     /**
      * Register listeners for all configured event classes.
      */
-    @SuppressWarnings("unchecked")
     public void registerUpdateListeners(List<String> eventClassNames) {
         for (String className : eventClassNames) {
             try {
@@ -61,7 +60,7 @@ public class PaperWorldHandler {
         if (noMethodClasses.contains(className)) return;
         Method method = eventMethods.get(className);
         if (method == null) {
-            method = discoverMethod(event);
+            method = discoverMethod(event.getClass());
             if (method == null) { noMethodClasses.add(className); return; }
             eventMethods.put(className, method);
         }
@@ -96,10 +95,11 @@ public class PaperWorldHandler {
 
     /**
      * DH-style method discovery. Try methods in order:
-     * blockList(), getBlocks(), getBlock(), getLocation(), getChunk()
+     * blockList(), getBlocks(), getBlock(), getLocation(), getChunk().
+     * Keyed on the event's runtime class. Package-visible so tests can assert every
+     * default updateEvents class yields an extractor (not just that it resolves).
      */
-    private static Method discoverMethod(Event event) {
-        Class<?> clazz = event.getClass();
+    static Method discoverMethod(Class<?> clazz) {
         for (String name : new String[]{"blockList", "getBlocks", "getBlock", "getLocation", "getChunk"}) {
             try {
                 Method m = clazz.getMethod(name);

@@ -3,7 +3,9 @@ package dev.vox.lss.common.processing;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -15,41 +17,69 @@ import java.util.UUID;
  */
 class DedupTracker {
 
-    record Attachment(UUID playerUuid, int requestId, long submissionOrder) {}
+    record Attachment(UUID playerUuid, long submissionOrder) {}
     record Group(UUID primaryPlayer, String dimension, ArrayList<Attachment> attached) {}
     record RemovedGroup(long packed, Group group) {}
 
-    private final Long2ObjectOpenHashMap<Group> pending = new Long2ObjectOpenHashMap<>();
+    // Keyed by dimension first, then packed XZ: the same (cx, cz) in two different
+    // dimensions must NOT share a dedup group — they resolve to different chunk data.
+    private final Map<String, Long2ObjectOpenHashMap<Group>> pending = new HashMap<>();
 
     /**
-     * Try to attach to an existing dedup group for the given packed position.
+     * Try to attach to an existing dedup group for the given packed position in the given dimension.
      * If no group exists, creates one (empty — the caller submits the actual disk read).
      *
      * @return {@code true} if an existing group was found (caller should NOT submit a disk read),
      *         {@code false} if a new group was created (caller SHOULD submit a disk read)
      */
-    boolean tryAttachOrCreate(long packed, String dimension, UUID primaryPlayer, int requestId, long submissionOrder) {
-        var existing = this.pending.get(packed);
+    boolean tryAttachOrCreate(long packed, String dimension, UUID primaryPlayer, long submissionOrder) {
+        var dimMap = this.pending.computeIfAbsent(dimension, k -> new Long2ObjectOpenHashMap<>());
+        var existing = dimMap.get(packed);
         if (existing != null) {
-            existing.attached().add(new Attachment(primaryPlayer, requestId, submissionOrder));
+            existing.attached().add(new Attachment(primaryPlayer, submissionOrder));
             return true;
         }
-        this.pending.put(packed, new Group(primaryPlayer, dimension, new ArrayList<>(2)));
+        dimMap.put(packed, new Group(primaryPlayer, dimension, new ArrayList<>(2)));
         return false;
     }
 
     /**
-     * Remove and return the dedup group for the given packed position.
+     * Remove and return the dedup group for the given packed position in the given dimension.
      * Called when the primary disk read completes.
      *
      * @return the group, or {@code null} if no group existed
      */
-    Group removeGroup(long packed) {
-        return this.pending.remove(packed);
+    Group removeGroup(long packed, String dimension) {
+        var dimMap = this.pending.get(dimension);
+        if (dimMap == null) return null;
+        var group = dimMap.remove(packed);
+        if (group != null && dimMap.isEmpty()) {
+            this.pending.remove(dimension);
+        }
+        return group;
+    }
+
+    /** Number of pending dedup groups across all dimensions (live diagnostics export). */
+    int size() {
+        int total = 0;
+        for (var dimMap : this.pending.values()) {
+            total += dimMap.size();
+        }
+        return total;
     }
 
     /**
-     * Remove all references to the given player from all groups.
+     * Number of dimensions currently holding a group map. {@link #removeGroup} and
+     * {@link #removePlayer} prune a dimension's map when its last group leaves, so a
+     * nonzero value here with {@link #size()} == 0 is a leak (long-running servers with
+     * datapack dimensions would accumulate empty maps otherwise).
+     */
+    int trackedDimensionCount() {
+        return this.pending.size();
+    }
+
+    /**
+     * Remove all references to the given player from all groups in all dimensions.
      * If the player is the primary of a group, the entire group is removed and returned
      * so the caller can clean up attached players' concurrency slots.
      * If the player is an attachment, they are removed from the group's attached list.
@@ -60,17 +90,22 @@ class DedupTracker {
      */
     List<RemovedGroup> removePlayer(UUID playerUuid) {
         List<RemovedGroup> removed = null;
-        var iter = this.pending.long2ObjectEntrySet().iterator();
-        while (iter.hasNext()) {
-            var entry = iter.next();
-            var group = entry.getValue();
-            if (group.primaryPlayer().equals(playerUuid)) {
-                if (removed == null) removed = new ArrayList<>();
-                removed.add(new RemovedGroup(entry.getLongKey(), group));
-                iter.remove();
-            } else {
-                group.attached().removeIf(a -> a.playerUuid().equals(playerUuid));
+        var dimIter = this.pending.values().iterator();
+        while (dimIter.hasNext()) {
+            var dimMap = dimIter.next();
+            var iter = dimMap.long2ObjectEntrySet().iterator();
+            while (iter.hasNext()) {
+                var entry = iter.next();
+                var group = entry.getValue();
+                if (group.primaryPlayer().equals(playerUuid)) {
+                    if (removed == null) removed = new ArrayList<>();
+                    removed.add(new RemovedGroup(entry.getLongKey(), group));
+                    iter.remove();
+                } else {
+                    group.attached().removeIf(a -> a.playerUuid().equals(playerUuid));
+                }
             }
+            if (dimMap.isEmpty()) dimIter.remove();
         }
         return removed != null ? removed : List.of();
     }

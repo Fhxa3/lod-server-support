@@ -26,6 +26,15 @@ jobs:
       - name: Build Paper plugin
         run: ./gradlew :paper:shadowJar
 
+      - name: Soak checker + report selftests
+        run: |
+          python3 scripts/check_soak.py --selftest
+          python3 scripts/soak_report.py --selftest
+          python3 scripts/release_check.py --selftest
+
+      - name: Release-jar safety gate
+        run: python3 scripts/release_check.py
+
       - uses: actions/upload-artifact@v5
         with:
           name: lod-server-support-fabric

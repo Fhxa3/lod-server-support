@@ -1,16 +1,19 @@
 package dev.vox.lss.common.processing;
 
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 import dev.vox.lss.common.LSSConstants;
+import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.common.SharedBandwidthLimiter;
 
-import java.util.ArrayDeque;
 import java.util.PriorityQueue;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -18,45 +21,57 @@ import java.util.concurrent.atomic.AtomicLong;
  * Contains all shared fields and logic; platform subclasses provide the
  * {@code QueuedPayload} type and any MC-dependent behavior.
  *
- * @param <Q> the queued payload type (must be {@link Comparable} for priority queue ordering)
+ * <p>Admission is derived: a request occupies its {@link SlotType} slot exactly while its
+ * {@link PendingRequest} entry exists in the pending map, so the slot counters cannot drift
+ * from the map (the structural fix for the permit-leak bugs of earlier review rounds).
+ *
+ * @param <T> the platform payload type (Fabric: CustomPacketPayload, Paper: byte[])
  */
-public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implements PlayerStateAccess {
-
-    /** A request waiting in the per-player queue for a concurrency slot to open. */
-    public record QueuedRequest(IncomingRequest request, RequestType type, String dimension) {}
+public abstract class AbstractPlayerRequestState<T> {
 
     private final UUID playerUuid;
     private volatile boolean hasHandshake = false;
     private volatile int capabilities = 0;
 
+    // Bound on the per-player incoming queue: a flooding client must not grow it without
+    // limit (heap OOM / main-thread DoS). Dropped entries are harmless — the client re-requests
+    // un-acked positions on its next scan. Counts are approximate (best-effort under races).
+    private static final int MAX_INCOMING_QUEUE = 16384;
+
     // Network handler → processing thread (thread-safe intermediaries)
     private final ConcurrentLinkedQueue<IncomingRequest> incomingRequests = new ConcurrentLinkedQueue<>();
-    private final ConcurrentLinkedQueue<Integer> incomingCancels = new ConcurrentLinkedQueue<>();
-    // Main thread → processing thread (dirty column clear requests)
-    private final ConcurrentLinkedQueue<long[]> pendingDirtyClear = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger incomingRequestCount = new AtomicInteger();
     // Processing thread → main thread (thread-safe output)
-    private final ConcurrentLinkedQueue<Q> readyPayloads = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<QueuedPayload<T>> readyPayloads = new ConcurrentLinkedQueue<>();
 
     // Owned by processing thread (single-threaded access)
     private final Long2ObjectOpenHashMap<PendingRequest> pendingByPosition = new Long2ObjectOpenHashMap<>();
-    private final Int2ObjectOpenHashMap<PendingRequest> pendingByRequestId = new Int2ObjectOpenHashMap<>();
-    private final PriorityQueue<Q> sendQueue = new PriorityQueue<>();
+    // Owned by main thread (drained from readyPayloads, flushed to the wire)
+    private final PriorityQueue<QueuedPayload<T>> sendQueue = new PriorityQueue<>();
     private final LongOpenHashSet diskReadDone = new LongOpenHashSet();
+    // Column positions with a payload somewhere in the send pipeline (readyPayloads or
+    // sendQueue). Incremented at enqueue (processing thread), decremented on wire send or
+    // send-failure drop (main thread), read by the router (processing thread) to answer
+    // "is this position's data still on its way?" — counted, not a set, because a dirty
+    // re-serve can put a second payload for the same position in flight.
+    private final ConcurrentHashMap<Long, Integer> enqueuedColumns = new ConcurrentHashMap<>();
     private final PlayerBandwidthTracker bandwidth = new PlayerBandwidthTracker();
-    private final RateLimiterSet rateLimiters;
-    private final ArrayDeque<QueuedRequest> waitingQueue = new ArrayDeque<>();
     private final AtomicLong totalRequestsReceived = new AtomicLong();
-    private volatile long desiredBandwidth = Long.MAX_VALUE;
+    private final AtomicLong totalIncomingDropped = new AtomicLong();
     // Single-writer (main thread) — volatile for cross-thread visibility to processing thread
     private volatile int sendQueueSizeSnapshot = 0;
-    // Single-writer (processing thread only) — volatile sufficient for cross-thread visibility
-    private volatile int pendingSyncCount = 0;
-    private volatile int pendingGenerationCount = 0;
 
-    protected AbstractPlayerRequestState(UUID playerUuid, int syncRate, int syncConcurrency,
-                                          int genRate, int genConcurrency) {
+    // Admission slots: caps are immutable; held counts are derived from the pending map
+    // (single-writer: processing thread; volatile for /lsslod command reads).
+    private final int syncSlotCap;
+    private final int genSlotCap;
+    private volatile int heldSyncSlots = 0;
+    private volatile int heldGenSlots = 0;
+
+    protected AbstractPlayerRequestState(UUID playerUuid, int syncConcurrency, int genConcurrency) {
         this.playerUuid = playerUuid;
-        this.rateLimiters = new RateLimiterSet(syncRate, syncConcurrency, genRate, genConcurrency);
+        this.syncSlotCap = syncConcurrency;
+        this.genSlotCap = genConcurrency;
     }
 
     // ---- Handshake / Capability ----
@@ -84,139 +99,117 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
     // ---- Incoming request helpers (subclasses call these from addRequest) ----
 
     protected void enqueueIncomingRequest(IncomingRequest request) {
+        if (this.incomingRequestCount.get() >= MAX_INCOMING_QUEUE) {
+            this.totalIncomingDropped.incrementAndGet();
+            return;
+        }
         this.incomingRequests.add(request);
+        this.incomingRequestCount.incrementAndGet();
         this.totalRequestsReceived.incrementAndGet();
-    }
-
-    public void addCancel(int requestId) {
-        this.incomingCancels.add(requestId);
     }
 
     // ---- Queue management ----
 
+    /** Platform hook used by the flush error path and shared diagnostics. */
+    public abstract String getPlayerName();
+
+    /** Platform hook that puts one payload on the wire (may throw on a broken connection). */
+    @FunctionalInterface
+    public interface PayloadSender<T> {
+        void send(T payload) throws Exception;
+    }
+
+    private static final long[] NO_DROPPED_POSITIONS = new long[0];
+
     /**
-     * Drain ready payloads from the processing thread into the send queue.
-     * Called by the main thread before flushing.
+     * Drain ready payloads from the processing thread into the send queue, then flush as
+     * many as the bandwidth allocation allows through the platform sender. A send failure
+     * drops the remaining queue and returns the dropped packed positions — the caller MUST
+     * route them to {@code OffThreadProcessor.clearDiskReadDone} so the client's
+     * re-requests re-resolve instead of being answered up-to-date for data that was never
+     * delivered. Called by the main thread each tick.
+     *
+     * @return packed positions of column payloads dropped by a send failure (empty when
+     *         everything sent or remains queued)
      */
-    public void drainReadyPayloads() {
-        Q qp;
-        while ((qp = this.readyPayloads.poll()) != null) {
-            this.sendQueue.add(qp);
+    public long[] flushSendQueue(long allocationBytes, SharedBandwidthLimiter globalLimiter,
+                                  TickDiagnostics diag, PayloadSender<T> sender) {
+        QueuedPayload<T> ready;
+        while ((ready = this.readyPayloads.poll()) != null) {
+            this.sendQueue.add(ready);
         }
         this.sendQueueSizeSnapshot = this.sendQueue.size();
-    }
 
-    public boolean canSend(long allocationBytes) {
-        return this.bandwidth.canSend(allocationBytes);
-    }
+        long[] dropped = NO_DROPPED_POSITIONS;
+        while (!this.sendQueue.isEmpty()) {
+            if (!this.bandwidth.canSend(allocationBytes)) break;
 
-    public void recordSend(int bytes) {
-        this.bandwidth.recordSend(bytes);
-    }
-
-    /**
-     * Drain dirty column clear requests from main thread.
-     * Called by the processing thread at the start of each cycle.
-     */
-    @Override
-    public void drainDirtyClearRequests() {
-        long[] dirtyPositions;
-        while ((dirtyPositions = this.pendingDirtyClear.poll()) != null) {
-            for (long pos : dirtyPositions) {
-                getDiskReadDonePositions().remove(pos);
+            var queued = this.sendQueue.peek();
+            try {
+                sender.send(queued.payload());
+                this.sendQueue.poll();
+                decrementEnqueued(queued.packedPos());
+                this.bandwidth.recordSend(queued.estimatedBytes());
+                globalLimiter.recordSend(queued.estimatedBytes());
+                diag.recordSectionSent(queued.estimatedBytes());
+            } catch (Exception e) {
+                LSSLogger.error("Failed to send queued payload to " + getPlayerName()
+                        + ", dropping remaining queue (" + this.sendQueue.size() + " entries)", e);
+                var droppedList = new LongArrayList(this.sendQueue.size());
+                for (var entry : this.sendQueue) {
+                    droppedList.add(entry.packedPos());
+                    decrementEnqueued(entry.packedPos());
+                }
+                this.sendQueue.clear();
+                dropped = droppedList.toLongArray();
+                break;
             }
         }
+        this.sendQueueSizeSnapshot = this.sendQueue.size();
+        return dropped;
     }
 
-    /** Queue positions for clearing from diskReadDone (called from main thread). */
-    public void clearDiskReadDoneForPositions(long[] positions) {
-        this.pendingDirtyClear.add(positions);
-    }
+    // ---- Processing-thread-facing per-request API ----
 
-    /**
-     * Clear shared concurrent queues on dimension change.
-     * Subclasses should call this from their own onDimensionChange() and may add
-     * additional platform-specific clearing.
-     */
-    protected void onDimensionChangeBase() {
-        this.incomingRequests.clear();
-        this.incomingCancels.clear();
-        this.readyPayloads.clear();
-        this.sendQueue.clear();
-        this.pendingDirtyClear.clear();
-    }
-
-    /**
-     * Clear processing-thread-owned state on dimension change.
-     */
-    public void clearProcessingState() {
-        this.pendingByPosition.clear();
-        this.pendingByRequestId.clear();
-        this.diskReadDone.clear();
-        this.waitingQueue.clear();
-        this.pendingSyncCount = 0;
-        this.pendingGenerationCount = 0;
-    }
-
-    // ---- PlayerStateAccess per-request methods ----
-
-    @Override
     public IncomingRequest pollIncomingRequest() {
-        return this.incomingRequests.poll();
+        var r = this.incomingRequests.poll();
+        if (r != null) this.incomingRequestCount.decrementAndGet();
+        return r;
     }
 
-    @Override
-    public void addPendingRequest(PendingRequest pending) {
+    public boolean tryAdmit(PendingRequest pending) {
+        int cap = pending.heldSlot() == SlotType.SYNC_ON_LOAD ? this.syncSlotCap : this.genSlotCap;
+        int held = pending.heldSlot() == SlotType.SYNC_ON_LOAD ? this.heldSyncSlots : this.heldGenSlots;
+        if (held >= cap) return false;
+        addPendingRequest(pending);
+        return true;
+    }
+
+    private void addPendingRequest(PendingRequest pending) {
         long packed = PositionUtil.packPosition(pending.cx(), pending.cz());
         var replaced = this.pendingByPosition.put(packed, pending);
         if (replaced != null) {
-            this.pendingByRequestId.remove(replaced.requestId());
-            decrementPendingCounter(replaced.type());
+            adjustSlot(replaced.heldSlot(), -1);
         }
-        this.pendingByRequestId.put(pending.requestId(), pending);
-        incrementPendingCounter(pending.type());
+        adjustSlot(pending.heldSlot(), +1);
     }
 
-    @Override
     public PendingRequest removePendingByPosition(int cx, int cz) {
         long packed = PositionUtil.packPosition(cx, cz);
         var pending = this.pendingByPosition.remove(packed);
         if (pending != null) {
-            this.pendingByRequestId.remove(pending.requestId());
-            decrementPendingCounter(pending.type());
+            adjustSlot(pending.heldSlot(), -1);
         }
         return pending;
     }
 
-    @Override
-    public PendingRequest removePendingByRequestId(int requestId) {
-        var pending = this.pendingByRequestId.remove(requestId);
-        if (pending != null) {
-            long packed = PositionUtil.packPosition(pending.cx(), pending.cz());
-            this.pendingByPosition.remove(packed);
-            decrementPendingCounter(pending.type());
-        }
-        return pending;
-    }
-
-    @Override
     public boolean hasPendingRequest(int cx, int cz) {
         return this.pendingByPosition.containsKey(PositionUtil.packPosition(cx, cz));
     }
 
-    private void incrementPendingCounter(RequestType type) {
-        if (type == RequestType.SYNC) this.pendingSyncCount++;
-        else this.pendingGenerationCount++;
-    }
-
-    private void decrementPendingCounter(RequestType type) {
-        if (type == RequestType.SYNC) this.pendingSyncCount--;
-        else this.pendingGenerationCount--;
-    }
-
-    @Override
-    public Integer pollCancel() {
-        return this.incomingCancels.poll();
+    private void adjustSlot(SlotType slot, int delta) {
+        if (slot == SlotType.SYNC_ON_LOAD) this.heldSyncSlots += delta;
+        else this.heldGenSlots += delta;
     }
 
     public boolean hasDiskReadDone(int cx, int cz) {
@@ -227,38 +220,49 @@ public abstract class AbstractPlayerRequestState<Q extends Comparable<Q>> implem
         this.diskReadDone.add(PositionUtil.packPosition(cx, cz));
     }
 
+    /** Clear dirty positions from diskReadDone (processing thread, from dirty-clear events). */
+    public void clearDiskReadDone(long[] positions) {
+        for (long pos : positions) {
+            this.diskReadDone.remove(pos);
+        }
+    }
+
+    /** Clear one position from diskReadDone (processing thread, honest re-resolution of a ts&le;0 re-request). */
+    public void clearDiskReadDone(long packed) {
+        this.diskReadDone.remove(packed);
+    }
+
+    /** True while a column payload for this position sits in the send pipeline (any thread). */
+    public boolean hasEnqueuedColumn(long packed) {
+        return this.enqueuedColumns.containsKey(packed);
+    }
+
+    private void decrementEnqueued(long packed) {
+        this.enqueuedColumns.computeIfPresent(packed, (k, v) -> v <= 1 ? null : v - 1);
+    }
+
     // ---- Accessors for concurrent queues (used by sibling classes) ----
 
     public Iterable<IncomingRequest> getIncomingRequests() {
         return this.incomingRequests;
     }
 
-    public void addReadyPayload(Q payload) {
+    public void addReadyPayload(QueuedPayload<T> payload) {
+        this.enqueuedColumns.merge(payload.packedPos(), 1, Integer::sum);
         this.readyPayloads.add(payload);
-    }
-
-    protected LongOpenHashSet getDiskReadDonePositions() {
-        return this.diskReadDone;
     }
 
     // ---- Getters ----
 
-    @Override
-    public RateLimiterSet getRateLimiters() { return this.rateLimiters; }
-    @Override
-    public ArrayDeque<QueuedRequest> getWaitingQueue() { return this.waitingQueue; }
-    @Override
-    public int getWaitingQueueSize() { return this.waitingQueue.size(); }
-    @Override
     public UUID getPlayerUUID() { return this.playerUuid; }
-    public PriorityQueue<Q> getSendQueue() { return this.sendQueue; }
     /** Returns a volatile snapshot of the send queue size, safe for cross-thread reads. */
     public int getSendQueueSize() { return this.sendQueueSizeSnapshot; }
-    public int getPendingSyncCount() { return this.pendingSyncCount; }
-    public int getPendingGenerationCount() { return this.pendingGenerationCount; }
+    public int getHeldSyncSlots() { return this.heldSyncSlots; }
+    public int getHeldGenSlots() { return this.heldGenSlots; }
+    public int getSyncSlotCap() { return this.syncSlotCap; }
+    public int getGenSlotCap() { return this.genSlotCap; }
     public long getTotalSectionsSent() { return this.bandwidth.getTotalSectionsSent(); }
     public long getTotalBytesSent() { return this.bandwidth.getTotalBytesSent(); }
     public long getTotalRequestsReceived() { return this.totalRequestsReceived.get(); }
-    public void setDesiredBandwidth(long desiredRate) { this.desiredBandwidth = desiredRate; }
-    public long getDesiredBandwidth() { return this.desiredBandwidth; }
+    public long getTotalIncomingDropped() { return this.totalIncomingDropped.get(); }
 }

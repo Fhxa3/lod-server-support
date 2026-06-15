@@ -12,6 +12,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Per-dimension timestamp cache for served columns.
@@ -35,6 +37,12 @@ public class ColumnTimestampCache {
     private final Map<String, DimensionCache> caches = new HashMap<>();
     private final int maxEntriesPerDimension;
 
+    // Cross-thread observability for the soak/benchmark exporters (the cache itself is
+    // processing-thread-only): liveSizes mirrors each dimension's current entry count
+    // after every mutation, evictionCount accumulates evictIfOversized removals.
+    private final Map<String, Integer> liveSizes = new ConcurrentHashMap<>();
+    private final AtomicLong evictionCount = new AtomicLong();
+
     public ColumnTimestampCache(int maxEntriesPerDimension) {
         this.maxEntriesPerDimension = maxEntriesPerDimension;
     }
@@ -48,6 +56,7 @@ public class ColumnTimestampCache {
         var cache = caches.computeIfAbsent(dimension, k -> new DimensionCache());
         cache.timestamps.put(packed, timestamp);
         cache.insertionTimes.put(packed, now);
+        liveSizes.put(dimension, cache.timestamps.size());
     }
 
     /**
@@ -66,19 +75,24 @@ public class ColumnTimestampCache {
             cache.timestamps.remove(pos);
             cache.insertionTimes.remove(pos);
         }
+        liveSizes.put(dimension, cache.timestamps.size());
     }
 
     /**
-     * Evicts oldest-inserted entries when a dimension exceeds {@link #MAX_ENTRIES_PER_DIMENSION}.
+     * Evicts oldest-inserted entries when a dimension exceeds the configured per-dimension cap.
      * Returns the total number of entries evicted across all dimensions.
      */
     public int evictIfOversized() {
         int evicted = 0;
-        for (var cache : caches.values()) {
+        for (var entry : caches.entrySet()) {
+            var cache = entry.getValue();
             int excess = cache.timestamps.size() - this.maxEntriesPerDimension;
             if (excess <= 0) continue;
-            evicted += evictOldest(cache, excess);
+            int removed = evictOldest(cache, excess);
+            evicted += removed;
+            liveSizes.put(entry.getKey(), cache.timestamps.size());
         }
+        if (evicted > 0) evictionCount.addAndGet(evicted);
         return evicted;
     }
 
@@ -121,6 +135,22 @@ public class ColumnTimestampCache {
             total += cache.timestamps.size();
         }
         return total;
+    }
+
+    /**
+     * Cumulative entries removed by {@link #evictIfOversized()} over this instance's
+     * lifetime. Safe to read from any thread (exporter observability).
+     */
+    public long getEvictionCount() {
+        return evictionCount.get();
+    }
+
+    /**
+     * Current entry count per dimension, as of the last mutation. Safe to read from any
+     * thread (exporter observability) — the returned map is an immutable copy.
+     */
+    public Map<String, Integer> sizesPerDimension() {
+        return Map.copyOf(liveSizes);
     }
 
     // ---- Persistence ----
@@ -181,10 +211,12 @@ public class ColumnTimestampCache {
                 String dimension = in.readUTF();
                 int entryCount = in.readInt();
                 if (entryCount < 0 || entryCount > this.maxEntriesPerDimension) {
-                    LSSLogger.warn("Timestamp cache dimension " + dimension + " has invalid count " + entryCount + ", skipping");
-                    // Skip remaining bytes for this dimension
-                    in.skipBytes(entryCount * 16);
-                    continue;
+                    // A bad count means the file is corrupt; the byte stream can no longer be
+                    // reliably positioned (skip math could overflow / short-skip and desync),
+                    // so stop loading. The cache is only an optimization and rebuilds itself.
+                    LSSLogger.warn("Timestamp cache " + file + " has invalid entry count " + entryCount
+                            + " for dimension " + dimension + ", discarding rest");
+                    return;
                 }
                 var cache = caches.computeIfAbsent(dimension, k -> new DimensionCache());
                 cache.timestamps.ensureCapacity(entryCount);
@@ -195,6 +227,7 @@ public class ColumnTimestampCache {
                     cache.timestamps.put(packed, timestamp);
                     cache.insertionTimes.put(packed, now);
                 }
+                liveSizes.put(dimension, cache.timestamps.size());
                 totalLoaded += entryCount;
             }
             LSSLogger.info("Loaded " + totalLoaded + " timestamp cache entries from " + file);

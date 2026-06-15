@@ -10,13 +10,9 @@ public record SessionConfigS2CPayload(
         int protocolVersion,
         boolean enabled,
         int lodDistanceChunks,
-        int serverCapabilities,
-        int syncOnLoadRateLimitPerPlayer,
         int syncOnLoadConcurrencyLimitPerPlayer,
-        int generationRateLimitPerPlayer,
         int generationConcurrencyLimitPerPlayer,
-        boolean generationEnabled,
-        long playerBandwidthLimit
+        boolean generationEnabled
 ) implements CustomPacketPayload {
     public static final CustomPacketPayload.Type<SessionConfigS2CPayload> TYPE =
             new CustomPacketPayload.Type<>(Identifier.parse(LSSConstants.CHANNEL_SESSION_CONFIG));
@@ -27,28 +23,27 @@ public record SessionConfigS2CPayload(
                         buf.writeVarInt(payload.protocolVersion);
                         buf.writeBoolean(payload.enabled);
                         buf.writeVarInt(payload.lodDistanceChunks);
-                        buf.writeVarInt(payload.serverCapabilities);
-                        buf.writeVarInt(payload.syncOnLoadRateLimitPerPlayer);
                         buf.writeVarInt(payload.syncOnLoadConcurrencyLimitPerPlayer);
-                        buf.writeVarInt(payload.generationRateLimitPerPlayer);
                         buf.writeVarInt(payload.generationConcurrencyLimitPerPlayer);
                         buf.writeBoolean(payload.generationEnabled);
-                        buf.writeVarLong(payload.playerBandwidthLimit);
                     },
                     buf -> {
                         int version = buf.readVarInt();
+                        if (version != LSSConstants.PROTOCOL_VERSION) {
+                            // Foreign layout (e.g. a v15 server's 10-field config). The version
+                            // VarInt is the first field in every layout, so drain the rest to
+                            // avoid a trailing-bytes decoder kick and let the handler's version
+                            // gate log the mismatch and disable LSS.
+                            buf.skipBytes(buf.readableBytes());
+                            return new SessionConfigS2CPayload(version, false, 0, 0, 0, false);
+                        }
                         boolean enabled = buf.readBoolean();
                         int lodDist = buf.readVarInt();
-                        int serverCaps = buf.readVarInt();
-                        int syncRate = buf.readVarInt();
                         int syncConc = buf.readVarInt();
-                        int genRate = buf.readVarInt();
                         int genConc = buf.readVarInt();
                         boolean genEnabled = buf.readBoolean();
-                        long bwLimit = buf.readVarLong();
                         return new SessionConfigS2CPayload(version, enabled, lodDist,
-                                serverCaps, syncRate, syncConc, genRate, genConc,
-                                genEnabled, bwLimit);
+                                syncConc, genConc, genEnabled);
                     }
             );
 

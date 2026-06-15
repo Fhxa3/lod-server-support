@@ -1,0 +1,553 @@
+package dev.vox.lss.networking.client;
+
+import dev.vox.lss.common.PositionUtil;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import net.minecraft.SharedConstants;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.Bootstrap;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import static dev.vox.lss.networking.client.ColumnStateMap.SATISFIED;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Characterization tests for the per-column request-need ladder (the priority order
+ * mirrors the original scanner ladder bit-for-bit: unknown &gt; generation &gt; dirty &gt;
+ * rate-limit retry &gt; revalidation &gt; satisfied) and the state transitions.
+ */
+class ColumnStateMapTest {
+
+    private static final long POS = PositionUtil.packPosition(10, -3);
+
+    private ColumnStateMap map;
+
+    @BeforeAll
+    static void setup() {
+        // Only the ColumnCacheStore composite (CL-032) touches MC types; bootstrap is
+        // idempotent and matches the ColumnCacheStoreTest sibling.
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+    }
+
+    @BeforeEach
+    void setUp() {
+        map = new ColumnStateMap();
+    }
+
+    /** Drives a position to the parked state: MAX_INGEST_FAILURES + 1 failed deliveries. */
+    private void parkViaIngestFailures(long packed) {
+        for (int i = 0; i <= ColumnStateMap.MAX_INGEST_FAILURES; i++) {
+            map.onReceived(packed, 5000L + i);
+            map.onIngestFailed(packed);
+        }
+        assertEquals(SATISFIED, map.classify(packed, true), "precondition: parked");
+    }
+
+    // ---- classify ladder ----
+
+    @Test
+    void unknownPositionRequestsSyncOnLoad() {
+        assertEquals(-1L, map.classify(POS, true));
+        assertEquals(-1L, map.classify(POS, false), "unknown outranks generation availability");
+    }
+
+    @Test
+    void notGeneratedRequestsGenerationOnlyWhenEnabled() {
+        map.onNotGenerated(POS);
+        assertEquals(0L, map.classify(POS, true));
+        assertEquals(SATISFIED, map.classify(POS, false), "no gen retry when generation disabled");
+    }
+
+    @Test
+    void receivedAndValidatedIsSatisfied() {
+        map.onReceived(POS, 5000L);
+        assertEquals(SATISFIED, map.classify(POS, true));
+    }
+
+    @Test
+    void dirtyOutranksValidation() {
+        map.onReceived(POS, 5000L);
+        assertTrue(map.markDirtyIfKnown(POS));
+        assertEquals(5000L, map.classify(POS, true), "dirty re-requests with the stored timestamp");
+    }
+
+    @Test
+    void retryOutranksValidation() {
+        map.onReceived(POS, 5000L);
+        map.markRetry(POS);
+        assertEquals(5000L, map.classify(POS, true));
+    }
+
+    @Test
+    void cachedButNotValidatedRequestsResync() {
+        var loaded = new Long2LongOpenHashMap();
+        loaded.put(POS, 7000L);
+        map.loadFrom(loaded);
+        assertEquals(7000L, map.classify(POS, true), "cache-loaded position revalidates once per session");
+    }
+
+    @Test
+    void dirtyOnUnknownPositionIsNotMarked() {
+        assertFalse(map.markDirtyIfKnown(POS), "dirty needs a recorded disposition; unknown (-1) is not one");
+    }
+
+    @Test
+    void dirtyRescuesParkedNotGeneratedStamp() {
+        // generation-disabled soak finding: a not-generated stamp parks the position, but a
+        // dirty broadcast proves the server SAVED content there — the stamp is stale and the
+        // position must become requestable again (ts=0 routes disk-first server-side).
+        map.onNotGenerated(POS);
+        assertEquals(SATISFIED, map.classify(POS, false), "parked while gen disabled");
+        assertTrue(map.markDirtyIfKnown(POS), "dirty broadcast rescues the parked stamp");
+        assertEquals(0L, map.classify(POS, false), "re-requestable with ts=0 (disk-first)");
+        map.markSent(POS);
+        map.onReceived(POS, 9000L);
+        assertEquals(SATISFIED, map.classify(POS, false), "healed after the disk serve");
+    }
+
+    // ---- transitions ----
+
+    @Test
+    void markSentConsumesDirtyAndRetry() {
+        map.onReceived(POS, 5000L);
+        map.markDirtyIfKnown(POS);
+        map.markRetry(POS);
+        map.markSent(POS);
+        assertEquals(SATISFIED, map.classify(POS, true), "sent request consumed the pending marks");
+    }
+
+    @Test
+    void onReceivedConsumesDirty() {
+        map.onReceived(POS, 5000L);
+        map.markDirtyIfKnown(POS);
+        map.onReceived(POS, 6000L);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "data arriving while a dirty re-request is in flight consumes the dirty mark");
+        assertEquals(0, map.dirtyCount());
+    }
+
+    // Contract change: retry marks used to survive onReceived deliberately, because their
+    // only writer was a rate-limit bounce — a guarantee that no response was coming, so a
+    // late receipt could only belong to an OLDER request and the retry still had to fire.
+    // The timeout sweep (LodRequestManager.sweepTimeouts) broke that premise: it marks
+    // retry for positions whose response can still arrive late, and an answer supersedes
+    // the pending retry — keeping the mark re-requested every late-delivered column once
+    // and reset ring confirmation for nothing.
+    @Test
+    void onReceivedClearsRetry() {
+        map.onReceived(POS, 5000L);
+        map.markRetry(POS);
+        map.onReceived(POS, 6000L);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "a data answer supersedes the pending retry — no redundant re-request");
+        assertFalse(map.hasRetries(), "lingering retry would pin confirmedRing to 0 for an extra scan");
+    }
+
+    @Test
+    void onUpToDateClearsRetry() {
+        map.onReceived(POS, 5000L);
+        map.markRetry(POS);
+        map.onUpToDate(POS);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "an up-to-date answer supersedes the pending retry exactly like data");
+        assertFalse(map.hasRetries());
+    }
+
+    @Test
+    void onUpToDateStampsAbsentPositions() {
+        map.onUpToDate(POS);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "empty column (never sent data) must not be re-requested every scan");
+        assertEquals(1, map.receivedCount(), "stamped with a positive timestamp");
+    }
+
+    @Test
+    void onUpToDateKeepsExistingTimestamp() {
+        map.onReceived(POS, 5000L);
+        map.onUpToDate(POS);
+        assertEquals(1, map.receivedCount());
+    }
+
+    @Test
+    void onUpToDateResolvesNotGeneratedStamp() {
+        map.onNotGenerated(POS);
+        assertEquals(0L, map.classify(POS, true), "not-generated stamp retries as generation");
+        map.onUpToDate(POS);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "server affirming up-to-date must end the generation retry loop (End void storm)");
+    }
+
+    // ---- derived counts ----
+
+    @Test
+    void countsTrackTransitions() {
+        map.onReceived(POS, 5000L);
+        assertEquals(1, map.receivedCount());
+        assertEquals(0, map.emptyCount());
+
+        map.onNotGenerated(POS); // received -> empty
+        assertEquals(0, map.receivedCount());
+        assertEquals(1, map.emptyCount());
+
+        map.onReceived(POS, 6000L); // empty -> received
+        assertEquals(1, map.receivedCount());
+        assertEquals(0, map.emptyCount());
+    }
+
+    @Test
+    void loadFromRecounts() {
+        var loaded = new Long2LongOpenHashMap();
+        loaded.put(PositionUtil.packPosition(1, 1), 100L);
+        loaded.put(PositionUtil.packPosition(2, 2), 0L);
+        loaded.put(PositionUtil.packPosition(3, 3), 200L);
+        map.loadFrom(loaded);
+        assertEquals(2, map.receivedCount());
+        assertEquals(1, map.emptyCount());
+    }
+
+    @Test
+    void pruneOutOfRangeDropsAllStateAndCounts() {
+        long near = PositionUtil.packPosition(1, 1);
+        long far = PositionUtil.packPosition(500, 500);
+        map.onReceived(near, 100L);
+        map.onReceived(far, 200L);
+        map.markDirtyIfKnown(far);
+        map.markRetry(far);
+
+        map.pruneOutOfRange(0, 0, 64);
+
+        assertEquals(1, map.receivedCount());
+        assertEquals(SATISFIED, map.classify(near, true));
+        assertEquals(-1L, map.classify(far, true), "pruned position is unknown again");
+        assertEquals(0, map.dirtyCount());
+        assertFalse(map.hasRetries());
+    }
+
+    // ---- onIngestFailed ----
+
+    @Test
+    void ingestFailedForgetsReceivedStampAndMarksRetry() {
+        map.onReceived(POS, 5000L);
+        assertEquals(1, map.receivedCount());
+
+        map.onIngestFailed(POS);
+
+        assertEquals(-1L, map.timestampFor(POS), "stamp must be forgotten so the re-ask carries ts=-1");
+        assertEquals(0, map.receivedCount(), "received count must not leak");
+        assertTrue(map.hasRetries(), "retry mark forces the confirmed-ring reset");
+        assertEquals(-1L, map.classify(POS, true), "position must re-request as unknown");
+    }
+
+    @Test
+    void ingestFailedOnNotGeneratedStampKeepsEmptyCountConsistent() {
+        map.onNotGenerated(POS);
+        assertEquals(1, map.emptyCount());
+
+        map.onIngestFailed(POS);
+
+        assertEquals(0, map.emptyCount());
+        assertEquals(-1L, map.timestampFor(POS));
+    }
+
+    @Test
+    void ingestFailedOnAbsentPositionIsIgnored() {
+        map.onIngestFailed(POS);
+
+        assertEquals(0, map.receivedCount(), "no counter underflow for an unknown position");
+        assertEquals(0, map.emptyCount());
+        assertEquals(-1L, map.classify(POS, true));
+        assertFalse(map.hasRetries(),
+                "an unknown position must not gain a retry mark nothing can consume");
+    }
+
+    @Test
+    void ingestFailureCapParksThePosition() {
+        for (int i = 0; i < ColumnStateMap.MAX_INGEST_FAILURES; i++) {
+            map.onReceived(POS, 5000L + i);
+            map.onIngestFailed(POS);
+            assertEquals(-1L, map.classify(POS, true), "failure " + (i + 1) + " must re-request");
+        }
+        map.onReceived(POS, 9000L);
+        map.onIngestFailed(POS); // cap exceeded: park
+
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "a permanently failing consumer must not drive an endless re-serve loop");
+        assertFalse(map.hasRetries(), "parking must not leave an unconsumable retry mark");
+        assertTrue(map.timestampFor(POS) > 0, "parked positions carry a satisfied epoch stamp");
+        assertEquals(1, map.receivedCount(), "park bookkeeping must keep counts consistent");
+    }
+
+    @Test
+    void ingestFailureCapResetsWithSessionState() {
+        for (int i = 0; i <= ColumnStateMap.MAX_INGEST_FAILURES; i++) {
+            map.onReceived(POS, 5000L);
+            map.onIngestFailed(POS);
+        }
+        assertEquals(SATISFIED, map.classify(POS, true), "parked");
+
+        map.clear(); // clearcache / dimension change / reconnect
+        map.onReceived(POS, 6000L);
+        map.onIngestFailed(POS);
+
+        assertEquals(-1L, map.classify(POS, true), "the cap must reset with the session state");
+    }
+
+    @Test
+    void ingestFailedClearsDirtyAndValidatedAndLifecycleResumes() {
+        map.onReceived(POS, 5000L);
+        map.markDirtyIfKnown(POS);
+
+        map.onIngestFailed(POS);
+        assertEquals(0, map.dirtyCount());
+
+        // normal lifecycle resumes: re-request then receive again
+        map.markSent(POS);
+        map.onReceived(POS, 6000L);
+        assertEquals(SATISFIED, map.classify(POS, true));
+        assertEquals(1, map.receivedCount());
+        assertFalse(map.hasRetries(),
+                "a stuck retry mark would pin confirmedRing at 0 for the whole session");
+    }
+
+    @Test
+    void clearResetsEverything() {
+        map.onReceived(POS, 100L);
+        map.markRetry(POS);
+        map.clear();
+        assertEquals(0, map.receivedCount());
+        assertEquals(0, map.emptyCount());
+        assertFalse(map.hasRetries());
+        assertEquals(-1L, map.classify(POS, true));
+        assertTrue(map.isEmptyMap());
+    }
+
+    // ---- cache-loaded stamps (CL-027, CL-028) ----
+
+    @Test
+    void cacheLoadedZeroStampRetriesGenerationOnlyWhenEnabled() {
+        var loaded = new Long2LongOpenHashMap();
+        loaded.put(POS, 0L);
+        map.loadFrom(loaded);
+
+        assertEquals(1, map.emptyCount(), "a cache-loaded 0 counts as a not-generated stamp");
+        assertEquals(0L, map.classify(POS, true),
+                "next session re-asks generation for a cached not-generated stamp");
+        assertEquals(SATISFIED, map.classify(POS, false), "generation disabled parks the cached stamp");
+    }
+
+    /**
+     * CL-028 fix: loadFrom clamps a corrupt cache value below -1 (e.g. negative garbage
+     * surviving the v2 migration, see ColumnCacheStoreTest#v2MigrationSignExtendsNegativeValues)
+     * to the -1 "unknown" sentinel. Without the clamp such a value matched no classify rung
+     * and parked the position SATISFIED for the rest of the session; clamped, it re-requests
+     * on the next scan and the next save rewrites it clean.
+     */
+    @Test
+    void subMinusOneCacheValueClampsToUnknownAndReRequests() {
+        var loaded = new Long2LongOpenHashMap();
+        loaded.put(POS, -4L);
+        map.loadFrom(loaded);
+
+        assertEquals(0, map.receivedCount(), "a sub--1 value must not count as received");
+        assertEquals(0, map.emptyCount(), "...nor as a not-generated stamp");
+        assertEquals(-1L, map.classify(POS, true),
+                "a corrupt negative stamp clamps to unknown and re-requests (no silent SATISFIED park)");
+
+        // It is now -1 (unknown); the scan ladder requests -1 positions anyway, so the dirty
+        // rescue (which only fires for a KNOWN disposition) correctly does not apply.
+        assertFalse(map.markDirtyIfKnown(POS), "a clamped-to-unknown stamp is not a known disposition");
+        map.markSent(POS);
+        map.onReceived(POS, 8000L);
+        assertEquals(SATISFIED, map.classify(POS, true));
+        assertEquals(1, map.receivedCount(), "the heal restores consistent counts");
+    }
+
+    // ---- ingest-failure cap accounting (CL-029, CL-031, CL-032, CL-033) ----
+
+    /**
+     * CL-029 decision pin — failures are counted PER DELIVERY, not per consumer report:
+     * the first report of a delivery unstamps the position (timestamps.remove), so every
+     * sibling report from other consumers rejecting the SAME delivery hits the
+     * absent-position guard in onIngestFailed and is absorbed. N failing consumers
+     * therefore cost one cap increment per serve, and the park trips on the
+     * (MAX_INGEST_FAILURES + 1)-th failed delivery regardless of consumer count.
+     */
+    @Test
+    void ingestFailureCapCountsDeliveriesNotConsumerReports() {
+        for (int delivery = 1; delivery <= 2; delivery++) {
+            map.onReceived(POS, 5000L + delivery);
+            map.onIngestFailed(POS);
+            map.onIngestFailed(POS); // sibling consumer rejecting the same delivery — absorbed
+            assertEquals(-1L, map.classify(POS, true), "delivery " + delivery
+                    + " still re-requests — per-report counting would already park here");
+        }
+        map.onReceived(POS, 5003L);
+        map.onIngestFailed(POS);
+        assertEquals(-1L, map.classify(POS, true), "third failed delivery still re-requests");
+        map.onReceived(POS, 5004L);
+        map.onIngestFailed(POS);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "park trips at the 4th failed delivery (MAX_INGEST_FAILURES + 1), independent of consumer count");
+    }
+
+    @Test
+    void dirtyHealsIngestParkedPositionForExactlyOneAttempt() {
+        parkViaIngestFailures(POS);
+        long parkStamp = map.timestampFor(POS);
+        assertTrue(parkStamp > 0);
+
+        assertTrue(map.markDirtyIfKnown(POS), "a dirty broadcast reaches the parked stamp");
+        assertEquals(parkStamp, map.classify(POS, true), "exactly one re-request, with the park stamp");
+        map.markSent(POS);
+        assertEquals(SATISFIED, map.classify(POS, true), "the single heal attempt is consumed at send");
+
+        map.onReceived(POS, 9000L);
+        map.onIngestFailed(POS); // the consumer still rejects the re-served content
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "the failure count survived the park: one more report re-parks immediately, no second loop");
+        assertFalse(map.hasRetries(), "the immediate re-park must not leave an unconsumable retry mark");
+    }
+
+    @Test
+    void ingestParkStampPersistsToCacheAndRevalidatesNextSession() {
+        var dim = ResourceKey.create(Registries.DIMENSION, Identifier.parse("lss_test:park_persist"));
+        final String server = "test-park-persist";
+        try {
+            parkViaIngestFailures(POS);
+            long parkStamp = map.timestampFor(POS);
+
+            ColumnCacheStore.save(server, dim, map.mapForSave()); // the disconnect saveCache path
+
+            var next = new ColumnStateMap(); // fresh session
+            next.loadFrom(ColumnCacheStore.load(server, dim));
+            assertEquals(parkStamp, next.timestampFor(POS), "the park stamp (>0) must survive the cache roundtrip");
+            assertEquals(parkStamp, next.classify(POS, true),
+                    "next session revalidates the parked position once (resync with the park stamp)");
+
+            // Content unchanged since the park: the server answers up-to-date and it stays settled.
+            next.markSent(POS);
+            next.onUpToDate(POS);
+            assertEquals(SATISFIED, next.classify(POS, true));
+
+            // Content changed instead: the re-serve gives the consumer a fresh chance, because
+            // the failure count is session state and did NOT persist with the stamp.
+            next.onReceived(POS, parkStamp + 100);
+            next.onIngestFailed(POS);
+            assertEquals(-1L, next.classify(POS, true),
+                    "the reloaded map gets a fresh failure cap — a persisted count would insta-park here");
+        } finally {
+            ColumnCacheStore.clearForServer(server);
+        }
+    }
+
+    @Test
+    void pruneResetsIngestFailureCounts() {
+        for (int i = 0; i < ColumnStateMap.MAX_INGEST_FAILURES; i++) {
+            map.onReceived(POS, 5000L + i);
+            map.onIngestFailed(POS);
+        }
+        // One more failure would park; the player walks away and back instead.
+        map.pruneOutOfRange(1000, 1000, 4); // POS=(10,-3) is far out of range
+        map.onReceived(POS, 9000L);         // returned: served again
+        map.onIngestFailed(POS);
+
+        assertEquals(-1L, map.classify(POS, true),
+                "a pruned-and-returned position gets a fresh failure cap — a stale count would park here");
+    }
+
+    // ---- classify ladder: gen-enabled dirty arm (CL-034) ----
+
+    @Test
+    void zeroStampWithDirtyEmitsGenerationRequestWhenGenerationEnabled() {
+        map.onNotGenerated(POS);
+        assertTrue(map.markDirtyIfKnown(POS), "a dirty broadcast lands on the not-generated stamp");
+        assertEquals(0L, map.classify(POS, true),
+                "gen-enabled arm: the re-request must go out as ts=0 (disk-first), never a >0 claim");
+    }
+
+    // ---- response × prior-state matrix, unpinned cells (CL-035) ----
+
+    @Test
+    void rateLimitRetryMarkAcrossDirtyZeroAndParkedPriorStates() {
+        // retry × dirty: both marks coexist; one stored-ts request consumes both at send.
+        long dirtyPos = PositionUtil.packPosition(1, 1);
+        map.onReceived(dirtyPos, 5000L);
+        map.markDirtyIfKnown(dirtyPos);
+        map.markRetry(dirtyPos);
+        assertEquals(5000L, map.classify(dirtyPos, true), "dirty+retry collapse into one stored-ts request");
+        map.markSent(dirtyPos);
+        assertEquals(SATISFIED, map.classify(dirtyPos, true), "one send consumes both marks");
+
+        // retry × ts==0: the bounced gen request retries once even after generation flips off.
+        long genPos = PositionUtil.packPosition(2, 2);
+        map.onNotGenerated(genPos);
+        map.markRetry(genPos);
+        assertEquals(0L, map.classify(genPos, true), "the gen rung outranks the retry mark");
+        assertEquals(0L, map.classify(genPos, false),
+                "a rate-limit-bounced gen request stays requestable once with generation disabled");
+        map.markSent(genPos);
+        assertEquals(SATISFIED, map.classify(genPos, false), "the consumed retry re-parks the gen-disabled stamp");
+
+        // retry × parked: a bounce on a parked position re-asks exactly once with the park stamp.
+        long parked = PositionUtil.packPosition(3, 3);
+        parkViaIngestFailures(parked);
+        long parkStamp = map.timestampFor(parked);
+        map.markRetry(parked);
+        assertEquals(parkStamp, map.classify(parked, true), "the retry mark re-asks the parked stamp once");
+        map.markSent(parked);
+        assertEquals(SATISFIED, map.classify(parked, true), "...and the park holds afterwards");
+    }
+
+    @Test
+    void notGeneratedAnswerAcrossDirtyRetryAndParkedPriorStates() {
+        // notGenerated × dirty: the dirty mark survives (unlike onReceived/onUpToDate),
+        // keeping the position requestable as ts=0 even with generation disabled.
+        long dirtyPos = PositionUtil.packPosition(1, 1);
+        map.onReceived(dirtyPos, 5000L);
+        map.markDirtyIfKnown(dirtyPos);
+        map.onNotGenerated(dirtyPos);
+        assertEquals(1, map.dirtyCount(), "a not-generated answer must not consume the dirty mark");
+        assertEquals(0L, map.classify(dirtyPos, true));
+        assertEquals(0L, map.classify(dirtyPos, false),
+                "dirty keeps the ts=0 stamp requestable (disk-first) without generation");
+
+        // notGenerated × retry: the pending retry also survives.
+        long retryPos = PositionUtil.packPosition(2, 2);
+        map.onReceived(retryPos, 6000L);
+        map.markRetry(retryPos);
+        map.onNotGenerated(retryPos);
+        assertTrue(map.hasRetries(), "a not-generated answer leaves the pending retry in place");
+        assertEquals(0L, map.classify(retryPos, false), "the retry keeps the stamp requestable until consumed");
+
+        // notGenerated × parked: the answer overwrites the park stamp with 0 — re-opened as
+        // a generation retry (gen on) or silently re-parked (gen off).
+        long parked = PositionUtil.packPosition(3, 3);
+        parkViaIngestFailures(parked);
+        map.onNotGenerated(parked);
+        assertEquals(0L, map.classify(parked, true), "not-generated re-opens a parked position as a gen retry");
+        assertEquals(SATISFIED, map.classify(parked, false));
+        assertEquals(3, map.emptyCount(), "all three cells ended as not-generated stamps — counts consistent");
+        assertEquals(0, map.receivedCount());
+    }
+
+    @Test
+    void lateDataOnParkedPositionRefreshesStampAndStaysSatisfied() {
+        parkViaIngestFailures(POS);
+        long parkStamp = map.timestampFor(POS);
+
+        map.onReceived(POS, parkStamp + 777); // a late response lands on the parked position
+
+        assertEquals(parkStamp + 777, map.timestampFor(POS), "late data refreshes the parked stamp");
+        assertEquals(SATISFIED, map.classify(POS, true), "still satisfied — no re-request storm");
+        assertFalse(map.hasRetries(), "no retry resurrection");
+        assertEquals(1, map.receivedCount());
+
+        map.onIngestFailed(POS);
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "the surviving failure count re-parks immediately on the next rejection");
+    }
+}

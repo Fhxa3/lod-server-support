@@ -4,6 +4,11 @@ build/
 *.iml
 *.ipr
 *.iws
+
+# Eclipse / jdtls (Java language server) project metadata
+.project
+.classpath
+.settings/
 run/
 out/
 .fabric/
@@ -19,9 +24,13 @@ bin/
 
 benchmark-results/
 benchmark-worlds/
+soak-results/
+soak-worlds/
 
 # Oracle mod (standalone, never committed to main)
 oracle/
 
 # Git worktrees
 .worktrees/
+
+__pycache__/

@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "lodDistanceChunks": 24,
+  "dirtyBroadcastIntervalSeconds": 5,
+  "diskReaderThreads": 5
+}

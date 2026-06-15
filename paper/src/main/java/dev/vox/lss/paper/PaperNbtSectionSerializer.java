@@ -5,22 +5,20 @@ import dev.vox.lss.common.LSSConstants;
 import io.netty.buffer.Unpooled;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.server.level.ChunkMap;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.biome.Biome;
-import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.PalettedContainerRO;
-import net.minecraft.world.level.chunk.Strategy;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -32,27 +30,43 @@ final class PaperNbtSectionSerializer {
 
     private static final byte[] EMPTY = new byte[0];
 
+    /** Test seam: the region-file NBT read — the only NMS call in the Paper disk-read path.
+     *  Production wires {@link ChunkMap#read}; tests inject empty / failing / timing-out
+     *  futures to pin the submit-envelope triage. */
+    @FunctionalInterface
+    interface ChunkNbtRead {
+        CompletableFuture<Optional<CompoundTag>> read(int cx, int cz);
+    }
+
     /**
      * Read chunk NBT from disk, verify FULL status, and serialize sections
      * into MC-native wire format.
      * Returns the serialized byte array, or null if the chunk is missing/not FULL/empty.
      */
-    static byte[] readAndSerializeSections(ChunkMap chunkMap, RegistryAccess registryAccess,
+    static byte[] readAndSerializeSections(ChunkNbtRead read, RegistryAccess registryAccess,
                                             int cx, int cz) throws Exception {
-        var future = chunkMap.read(new ChunkPos(cx, cz));
+        var future = read.read(cx, cz);
         var optionalTag = future.get(LSSConstants.DISK_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         if (optionalTag.isEmpty()) return null;
-        var chunkNbt = optionalTag.get();
+        return serializeChunkNbt(optionalTag.get(), registryAccess);
+    }
 
+    /**
+     * Serialize a chunk's NBT (as read from a region file) into MC-native wire format.
+     * Returns {@code null} if the chunk is not FULL or has no sections, an empty array if every
+     * section is empty, or the serialized section bytes. Package-visible for testing.
+     */
+    // LevelChunkSection.write(buf) is @Deprecated on Paper (an anti-xray overload was added),
+    // but the 1-arg form is the canonical vanilla serialization and is byte-identical to the
+    // Fabric path. The wire format must match Fabric exactly, so keep this call (do not migrate).
+    @SuppressWarnings("deprecation")
+    static byte[] serializeChunkNbt(CompoundTag chunkNbt, RegistryAccess registryAccess) {
         var statusStr = chunkNbt.getStringOr("Status", null);
         if (statusStr == null || ChunkStatus.byName(statusStr) != ChunkStatus.FULL) return null;
 
         var factory = PalettedContainerFactory.create(registryAccess);
         var blockStateCodec = factory.blockStatesContainerCodec();
         var biomeCodec = factory.biomeContainerCodec();
-        var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
-        var defaultBiome = biomeRegistry.getOrThrow(Biomes.PLAINS);
-        var biomeHolderMap = biomeRegistry.asHolderIdMap();
 
         var sectionsTag = chunkNbt.getList("sections");
         if (sectionsTag.isEmpty()) return null;
@@ -70,7 +84,7 @@ final class PaperNbtSectionSerializer {
 
             byte[] blockLightData = sectionTag.getByteArray("BlockLight").orElse(EMPTY);
             var result = parseSection(sectionTag, sectionY, blockStateCodec, biomeCodec,
-                    defaultBiome, biomeHolderMap, blockLightData);
+                    factory, blockLightData);
             if (result != null) {
                 byte[] skyLightData = sectionTag.getByteArray("SkyLight").orElse(EMPTY);
                 parsed.add(new ParsedSection(sectionY, result, blockLightData, skyLightData));
@@ -85,15 +99,19 @@ final class PaperNbtSectionSerializer {
             buf.writeVarInt(parsed.size());
             for (var p : parsed) {
                 buf.writeByte(p.sectionY);
-                p.section.write(buf, null, 0);
+                p.section.write(buf);
 
-                boolean hasBlockLight = p.blockLight.length == 2048;
+                // All-zero layers are skipped to match the live serializer exactly (mirrors
+                // Fabric's NbtSectionSerializer): "absent" means all-zero on the wire, and
+                // vanilla saves the light engine's allocated-but-zeroed arrays, which would
+                // otherwise make disk serves byte-diverge from live serves of identical content.
+                boolean hasBlockLight = p.blockLight.length == 2048 && hasNonZeroNibble(p.blockLight);
                 buf.writeBoolean(hasBlockLight);
                 if (hasBlockLight) {
                     buf.writeBytes(p.blockLight);
                 }
 
-                boolean hasSkyLight = p.skyLight.length == 2048;
+                boolean hasSkyLight = p.skyLight.length == 2048 && hasNonZeroNibble(p.skyLight);
                 buf.writeBoolean(hasSkyLight);
                 if (hasSkyLight) {
                     buf.writeBytes(p.skyLight);
@@ -116,8 +134,7 @@ final class PaperNbtSectionSerializer {
             CompoundTag sectionTag, int sectionY,
             Codec<PalettedContainer<BlockState>> blockStateCodec,
             Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec,
-            Holder<Biome> defaultBiome,
-            net.minecraft.core.IdMap<Holder<Biome>> biomeHolderMap,
+            PalettedContainerFactory factory,
             byte[] blockLightData) {
 
         var blockStatesOpt = sectionTag.getCompound("block_states");
@@ -140,23 +157,22 @@ final class PaperNbtSectionSerializer {
         if (biomes instanceof PalettedContainer<Holder<Biome>> biomeContainer) {
             section = new LevelChunkSection(blockStates, biomeContainer);
         } else {
-            var defaultBiomeContainer = new PalettedContainer<>(
-                    defaultBiome, Strategy.createForBiomes(biomeHolderMap), null);
-            section = new LevelChunkSection(blockStates, defaultBiomeContainer);
+            section = new LevelChunkSection(blockStates, factory.createForBiomes());
         }
 
         if (section.hasOnlyAir()) {
-            if (blockLightData.length != 2048) {
+            if (blockLightData.length != 2048 || !hasNonZeroNibble(blockLightData)) {
                 return null;
             }
-            // Check if block light has any non-zero nibbles
-            boolean hasLight = false;
-            for (byte b : blockLightData) {
-                if (b != 0) { hasLight = true; break; }
-            }
-            if (!hasLight) return null;
         }
 
         return section;
+    }
+
+    private static boolean hasNonZeroNibble(byte[] light) {
+        for (byte b : light) {
+            if (b != 0) return true;
+        }
+        return false;
     }
 }

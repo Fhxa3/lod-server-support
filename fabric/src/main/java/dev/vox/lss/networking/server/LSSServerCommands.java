@@ -8,7 +8,6 @@ import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.permissions.Permissions;
 
-import java.util.ArrayList;
 
 class LSSServerCommands {
     public static void init() {
@@ -40,21 +39,8 @@ class LSSServerCommands {
         }
 
         source.sendSuccess(() -> Component.literal("=== LSS LOD Request Stats ==="), false);
-        for (var entry : players.entrySet()) {
-            var state = entry.getValue();
-            var player = state.getPlayer();
-
-            String line = String.format(
-                    "%s: handshake=%s, sent=%d sections (%s), pending_sync=%d, pending_gen=%d, send_queue=%d, requests=%d",
-                    player.getName().getString(),
-                    state.hasCompletedHandshake() ? "yes" : "no",
-                    state.getTotalSectionsSent(),
-                    DiagnosticsFormatter.formatBytes(state.getTotalBytesSent()),
-                    state.getPendingSyncCount(),
-                    state.getPendingGenerationCount(),
-                    state.getSendQueueSize(),
-                    state.getTotalRequestsReceived()
-            );
+        for (var state : players.values()) {
+            String line = DiagnosticsFormatter.formatStatsLine(state);
             source.sendSuccess(() -> Component.literal(line), false);
         }
         return 1;
@@ -68,40 +54,16 @@ class LSSServerCommands {
         }
 
         var config = LSSServerConfig.CONFIG;
-        long uptimeSec = service.getUptimeSeconds();
-        var diag = service.getOffThreadProcessor().getDiagnostics();
-        var diskReader = service.getDiskReader();
-        long diskCompleted = diskReader != null ? diskReader.getDiag().getSuccessfulReadCount() : 0;
         var genService = service.getGenerationService();
-        var bwLimiter = service.getBandwidthLimiter();
-
-        long totalSent = 0;
-        long totalBytes = 0;
-        var players = new ArrayList<DiagnosticsFormatter.PlayerDiag>();
-        for (var entry : service.getPlayers().entrySet()) {
-            var state = entry.getValue();
-            totalSent += state.getTotalSectionsSent();
-            totalBytes += state.getTotalBytesSent();
-            players.add(new DiagnosticsFormatter.PlayerDiag(
-                    state.getPlayer().getName().getString(),
-                    state.getSendQueueSize(), config.sendQueueLimitPerPlayer,
-                    state.getPendingSyncCount(), state.getPendingGenerationCount(),
-                    state.getTotalSectionsSent(), state.getTotalBytesSent()
-            ));
-        }
-
-        var data = new DiagnosticsFormatter.DiagData(
+        var data = DiagnosticsFormatter.collectDiagData(
                 config.enabled, config.lodDistanceChunks,
                 config.bytesPerSecondLimitPerPlayer, config.bytesPerSecondLimitGlobal,
-                uptimeSec, totalSent, totalBytes,
-                diag.getTotalInMemory(), diag.getTotalUpToDate(), diag.getTotalGenDrained(),
-                diskCompleted,
-                service.getTickDiagnostics(),
-                diskReader != null ? diskReader.getDiagnostics() : "N/A",
-                genService != null ? genService.getDiagnostics() : null, genService != null,
-                bwLimiter.getTotalBytesSent(),
-                service.getWindowBandwidthRate(),
-                players
+                config.sendQueueLimitPerPlayer,
+                service.getUptimeSeconds(), service.getTickDiagnostics(), service.getWindowBandwidthRate(),
+                service.getOffThreadProcessor().getDiagnostics(), service.getDiskReader(),
+                service.getBandwidthLimiter(),
+                genService != null ? genService.getDiagnostics() : null,
+                service.getPlayers().values()
         );
 
         for (var line : DiagnosticsFormatter.formatDiagnostics(data)) {

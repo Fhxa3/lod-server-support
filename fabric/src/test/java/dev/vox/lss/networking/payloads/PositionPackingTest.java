@@ -56,4 +56,41 @@ class PositionPackingTest {
         long packed21 = PositionUtil.packPosition(2, 1);
         assertNotEquals(packed12, packed21);
     }
+
+    // ---- chebyshevDistance / isOutOfRange (the request distance gate) ----
+
+    @Test
+    void chebyshevDistanceBasics() {
+        assertEquals(0, PositionUtil.chebyshevDistance(5, -5, 5, -5));
+        assertEquals(4, PositionUtil.chebyshevDistance(0, 0, 3, -4));
+        assertEquals(4, PositionUtil.chebyshevDistance(3, -4, 0, 0), "distance must be symmetric");
+    }
+
+    @Test
+    void chebyshevDistanceExtremeCoordsClampInsteadOfOverflowing() {
+        // int math would wrap: MIN_VALUE - MAX_VALUE == 1, and Math.abs(MIN_VALUE) stays negative
+        assertEquals(Integer.MAX_VALUE,
+                PositionUtil.chebyshevDistance(Integer.MIN_VALUE, 0, Integer.MAX_VALUE, 0));
+        assertEquals(Integer.MAX_VALUE,
+                PositionUtil.chebyshevDistance(0, Integer.MIN_VALUE, 0, 0));
+    }
+
+    @Test
+    void isOutOfRangeBoundaryIsInclusive() {
+        assertFalse(PositionUtil.isOutOfRange(PositionUtil.packPosition(64, -64), 0, 0, 64),
+                "exactly at the distance limit is still in range");
+        assertTrue(PositionUtil.isOutOfRange(PositionUtil.packPosition(65, 0), 0, 0, 64));
+        assertTrue(PositionUtil.isOutOfRange(PositionUtil.packPosition(0, -65), 0, 0, 64));
+    }
+
+    @Test
+    void hostileExtremeCoordinatesCannotSlipUnderTheGate() {
+        // Overflowed int math reports these as near the player (negative or wrapped-small
+        // distance) and the server would serve them. 512 = MAX_LOD_DISTANCE.
+        assertTrue(PositionUtil.isOutOfRange(
+                PositionUtil.packPosition(Integer.MIN_VALUE, Integer.MIN_VALUE), 0, 0, 512));
+        // Player near the world border, request wraps around: int distance would be 21
+        assertTrue(PositionUtil.isOutOfRange(
+                PositionUtil.packPosition(Integer.MIN_VALUE + 10, 0), Integer.MAX_VALUE - 10, 0, 512));
+    }
 }

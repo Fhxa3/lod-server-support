@@ -1,8 +1,11 @@
 package dev.vox.lss.networking.client;
 
+import java.util.Arrays;
+
 /**
- * Ring buffer of chunk positions to request, populated by the scanner and
- * consumed by {@link LodRequestManager}.
+ * Single-pass buffer of chunk positions to request, written in place by the scanner and
+ * consumed by {@link LodRequestManager}. A scan that accepts nothing performs no writes
+ * and no commit, so an undrained remainder from the previous scan keeps draining.
  *
  * <p><b>Thread safety:</b> Not thread-safe. All methods must be called from
  * the main client thread (render/tick loop).
@@ -17,17 +20,25 @@ class RequestQueue {
     private int readIndex = 0;
 
     /**
-     * Replace the queue contents with the given scan result.
+     * Grow the backing arrays to at least the given capacity, preserving existing
+     * contents (an undrained remainder must survive a capacity increase).
      */
-    void populate(SpiralScanner.ScanResult result) {
-        int n = result.count();
-        if (this.positions.length < n) {
-            this.positions = new long[n];
-            this.timestamps = new long[n];
+    void ensureCapacity(int capacity) {
+        if (this.positions.length < capacity) {
+            this.positions = Arrays.copyOf(this.positions, capacity);
+            this.timestamps = Arrays.copyOf(this.timestamps, capacity);
         }
-        System.arraycopy(result.positions(), 0, this.positions, 0, n);
-        System.arraycopy(result.timestamps(), 0, this.timestamps, 0, n);
-        this.size = n;
+    }
+
+    /** Write one entry. The write is invisible to the consumer until {@link #commit}. */
+    void put(int index, long position, long timestamp) {
+        this.positions[index] = position;
+        this.timestamps[index] = timestamp;
+    }
+
+    /** Publish the first {@code count} slots as the new queue contents. */
+    void commit(int count) {
+        this.size = count;
         this.readIndex = 0;
     }
 

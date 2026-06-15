@@ -10,34 +10,18 @@ import net.minecraft.world.level.Level;
  * Per-player state tracking for the Paper plugin. Adapted from Fabric's PlayerRequestState
  * with QueuedPayload holding encoded byte[] + channel name instead of CustomPacketPayload.
  */
-public class PaperPlayerRequestState extends AbstractPlayerRequestState<PaperPlayerRequestState.QueuedPayload> {
+public class PaperPlayerRequestState extends AbstractPlayerRequestState<byte[]> {
     private volatile ServerPlayer player;
     private ResourceKey<Level> lastDimension;
 
-    public record QueuedPayload(byte[] data, int requestId,
-                                int estimatedBytes, long submissionOrder) implements Comparable<QueuedPayload> {
-        @Override
-        public int compareTo(QueuedPayload other) {
-            return Long.compare(this.submissionOrder, other.submissionOrder);
-        }
-    }
-
-    public PaperPlayerRequestState(ServerPlayer player, int syncRate, int syncConcurrency,
-                                   int genRate, int genConcurrency) {
-        super(player.getUUID(), syncRate, syncConcurrency, genRate, genConcurrency);
+    public PaperPlayerRequestState(ServerPlayer player, int syncConcurrency, int genConcurrency) {
+        super(player.getUUID(), syncConcurrency, genConcurrency);
         this.player = player;
         this.lastDimension = player.level().dimension();
     }
 
-    public void addRequest(int requestId, int cx, int cz, long clientTimestamp) {
-        enqueueIncomingRequest(new IncomingRequest(requestId, cx, cz, clientTimestamp));
-    }
-
-    /**
-     * Clear concurrent queues on dimension change (called from main thread).
-     */
-    public void onDimensionChange() {
-        onDimensionChangeBase();
+    public void addRequest(int cx, int cz, long clientTimestamp) {
+        enqueueIncomingRequest(new IncomingRequest(cx, cz, clientTimestamp));
     }
 
     public void updatePlayer(ServerPlayer newPlayer) {
@@ -45,6 +29,9 @@ public class PaperPlayerRequestState extends AbstractPlayerRequestState<PaperPla
     }
 
     public ServerPlayer getPlayer() { return this.player; }
+
+    @Override
+    public String getPlayerName() { return this.player.getName().getString(); }
     public ResourceKey<Level> getLastDimension() { return this.lastDimension; }
 
     public boolean checkDimensionChange() {
