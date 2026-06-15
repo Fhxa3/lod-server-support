@@ -603,6 +603,24 @@ class LodRequestManagerTest {
     }
 
     @Test
+    void notGeneratedResponseResetsConfirmedRingSoTheStrandedHoleIsRewalked() {
+        // CL-014 end-to-end wiring: a not-generated response must force a confirmed-ring re-walk so
+        // a stationary player does not strand an ungenerated hole below the ring. SpiralScannerTest
+        // pins resetConfirmedRing() in isolation; this pins that onColumnNotGenerated actually calls
+        // it (deleting LodRequestManager's scanner.resetConfirmedRing() leaves that suite green).
+        manager.onColumnReceived(POS, 5000L, dim("overworld")); // a known column so the scan confirms
+        advanceToOneCallBeforeScanFire();
+        assertTrue(manager.getConfirmedRing() > 0, "precondition: ring confirmed past the hole");
+
+        manager.trackerForTest().markPending(POS, System.nanoTime(), false); // in-flight -> tracked path
+
+        manager.onColumnNotGenerated(POS);
+
+        assertEquals(0, manager.getConfirmedRing(),
+                "a not-generated response must reset ring confirmation so the hole is re-walked");
+    }
+
+    @Test
     void maxSizeDirtyFrameMarksKnownPositionsOnlyAndDebouncesOnce() {
         long known1 = PositionUtil.packPosition(20, 20);
         long known2 = PositionUtil.packPosition(21, 20);

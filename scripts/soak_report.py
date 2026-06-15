@@ -67,9 +67,13 @@ CLIENT_MECHANISM = {
     "client rate-limited": "responses.rate_limited",
 }
 # Which CONCERNING names are the declared purpose of a scenario (then not counted as anomalies).
+# NOTE: client "ingest failures" is deliberately NOT mapped here. It is genuine lost work (a consumer
+# rejected a column) that the honest-re-resolution machinery exists to recover — never ordinary
+# load-shaping. Mapping it to "rate_limited" (which ~15/17 scenarios opt into) silently labeled every
+# nonzero ingest_failures "expected" and dropped it from the anomaly count. It is now always CONCERNING
+# unless a scenario explicitly lists "ingest failures" in SCENARIO_CONCERNING_OPT_IN below.
 OPT_IN_NAMES = {
     "disk pool saturated": "saturated",
-    "ingest failures": "rate_limited",  # ingest-failure scenarios opt into the same vocab
 }
 # Per-scenario opt-ins for CONCERNING counters that are the expected mechanism of THAT scenario
 # (the checker's conservation laws still account for them, so they are not lost work):
@@ -523,6 +527,18 @@ def _selftest():
     rep_sat = {"anomalies": 0}
     section_unexpected(rep_sat, d_sat)
     check(rep_sat["anomalies"] == 0, "opted-in saturated should not count as an anomaly")
+
+    # Client ingest_failures is genuine lost work: CONCERNING even on a scenario whose SERVER opts
+    # into rate_limited. Regression guard for the old OPT_IN_NAMES["ingest failures"]="rate_limited"
+    # mislabel that inherited the rate_limited opt-in on ~15/17 scenarios and dropped the anomaly.
+    cli_ing = {"snapshots": [{"wallMs": 1000, "ingest_failures": 0},
+                             {"wallMs": 6000, "ingest_failures": 5}]}
+    d_ing = {"scenario": "rate-limit-storm", "server": None,
+             "client_runs": [cli_ing], "verdict": None, "warnings": [], "unknown_keys": set()}
+    rep_ing = {"anomalies": 0}
+    un_ing = section_unexpected(rep_ing, d_ing)
+    check(rep_ing["anomalies"] == 1 and any("ingest failures" in l and "CONCERNING" in l for l in un_ing),
+          "client ingest_failures must stay concerning on a rate_limited-opted scenario")
 
     print(f"soak_report selftest OK: {n} cases")
     return 0

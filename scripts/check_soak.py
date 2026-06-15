@@ -158,8 +158,9 @@ SERVER_MONOTONIC = (
     "dirty.broadcast_positions", "dirty.suppressed_total",
     "bandwidth.total_bytes",
     # The flagship a9bee8d honest-re-resolution counter — emitted every snapshot, cumulative.
-    # Was assertable by nothing before round 2; now A6-monotonic and floor-checked in the
-    # ingest-failure / send-drop scenarios.
+    # Was assertable by nothing before round 2; now A6-monotonic and surfaced in the soak_report
+    # mechanism digest. No scenario floor-checks it yet (no ingest-failure soak scenario exists),
+    # so A6 on it is correct-but-quiescent until such a scenario is authored.
     "service.re_resolved",
 )
 CLIENT_MONOTONIC = (

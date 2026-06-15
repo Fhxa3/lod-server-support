@@ -66,6 +66,12 @@ jobs:
       - name: Build Paper
         run: ./gradlew :paper:shadowJar -Pmod_version=${GITHUB_REF_NAME#v}
 
+      # Gate the tag-versioned artifacts that actually ship (build.yml gates only the default-version
+      # CI build). GitHub Actions exports CI=true, so the build steps above produced CI-named jars
+      # that release_check's RELEASE_GLOBS match. Runs after the builds, before the irreversible publish.
+      - name: Release-jar safety gate
+        run: python3 scripts/release_check.py
+
       - uses: softprops/action-gh-release@v2
         with:
           body: ${{ steps.release_notes.outputs.notes }}
