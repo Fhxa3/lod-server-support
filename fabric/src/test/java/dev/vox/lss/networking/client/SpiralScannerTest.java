@@ -130,10 +130,11 @@ class SpiralScannerTest {
     //     SpiralScanner.scan() exclusion). LOD must cover EXACTLY what vanilla does not render;
     //     the trap is that vanilla's render boundary is a rounded disc, not a square. ───
     //
-    //  1. Euclidean-per-RING exclusion (`2*r*r <= R*R`, pre-683f67f): excluded a ring only when its
-    //     far corner was within R, so it UNDER-excluded — square edge chunks (within vanilla's view,
-    //     loaded and re-saving inhabitedTime every ~10s) stayed LOD-eligible → a permanent
-    //     re-request/re-serve LOOP on them.
+    //  1. Un-buffered per-position Euclidean exclusion (`dx^2+dz^2 <= R^2`, with a `2*r*r <= R^2`
+    //     whole-ring fast-path, pre-683f67f): an un-buffered circle excludes LESS near the axes than
+    //     vanilla's 1-chunk-buffered view, so axis-edge chunks within vanilla's view (loaded and
+    //     re-saving inhabitedTime every ~10s) stayed LOD-eligible → a permanent re-request/re-serve
+    //     LOOP on them.
     //  2. Chebyshev SQUARE exclusion (`max(|dx|,|dz|) <= R`, 683f67f): killed the loop by excluding
     //     the whole square — but vanilla's view is a rounded disc, so the square's 4 corners (which
     //     vanilla never renders) were now excluded from LOD too → 4 blank corner chunks on a
@@ -228,6 +229,36 @@ class SpiralScannerTest {
         assertEquals(0, mismatches,
                 "every chunk must be LOD-requested IFF it is OUTSIDE vanilla's buffered-Euclidean view");
         assertTrue(queued > 0, "the corner + annulus complement is non-empty");
+    }
+
+    @Test
+    void confirmationAdvancesThroughAPartiallyExcludedRingOnceCornersAreServed() {
+        // At vd=4 the buffered-Euclidean boundary STRADDLES ring 4 (the 4 corners are out of view,
+        // the edges in), so ring 4 is the one place a single ring is partially excluded. The
+        // load-bearing contract: an in-view EDGE skips without breaking ring confirmation, while an
+        // out-of-view CORNER blocks it — so the ring confirms only once the corners are SERVED, and
+        // the scan then settles (no spin re-walking the in-view edges).
+        int vd = 4, lod = 5;
+        var s = scanner(lod, 100, 100);
+        var columns = new ColumnStateMap();
+        var queue = new RequestQueue();
+
+        int queued = fireScan(s, vd, columns, queue);
+        var requested = drain(queue);
+        assertTrue(queued > 0);
+        assertEquals(4, s.getConfirmedRing(),
+                "confirmation holds at ring 4 while its out-of-view corners are unserved");
+
+        for (long packed : requested) { // serve + validate every out-of-view position
+            columns.onReceived(packed, 1000L);
+            columns.markSent(packed);
+            columns.onUpToDate(packed);
+        }
+
+        assertEquals(0, fireScan(s, vd, columns, queue),
+                "with every out-of-view chunk served, the scan settles — no spin on the in-view edges");
+        assertEquals(lod + 1, s.getConfirmedRing(),
+                "confirmation now advances THROUGH the partially-excluded ring to lodDistance+1");
     }
 
     @Test

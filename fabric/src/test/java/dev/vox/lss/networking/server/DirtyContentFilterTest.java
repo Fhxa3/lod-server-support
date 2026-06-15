@@ -113,8 +113,8 @@ class DirtyContentFilterTest {
     }
 
     /**
-     * Regression for the continuous-reload loop the coverage-aware scanner exclusion now relies on
-     * being suppressed (SpiralScannerTest#uncoveredCornerInsideExclusionRadiusIsRequested): the LOD
+     * Regression for the continuous-reload loop the buffered-Euclidean scanner exclusion now relies on
+     * being suppressed (SpiralScannerTest#renderSquareCornersBeyondVanillasRoundedViewAreRequested): the LOD
      * corners the client serves are loaded and ticking on the server, so vanilla re-saves them every
      * ~10s for inhabitedTime alone. inhabitedTime is chunk metadata, NOT in the serialized section
      * bytes, so the served LOD content is byte-identical across those re-saves — the filter must
@@ -126,7 +126,7 @@ class DirtyContentFilterTest {
         var dim = "minecraft:overworld";
         var liveContent = new java.util.concurrent.atomic.AtomicReference<byte[]>(new byte[]{1, 2, 3, 4});
         var filter = new DirtyContentFilter((level, chunk, cx, cz) -> liveContent.get());
-        int cx = 7, cz = -7; // a square-corner column the coverage-aware exclusion now serves
+        int cx = 7, cz = -7; // a square-corner column the buffered-Euclidean exclusion now serves
 
         assertTrue(filter.contentChanged(null, null, cx, cz, dim), "first serve records the baseline");
         for (int i = 0; i < 5; i++) {
