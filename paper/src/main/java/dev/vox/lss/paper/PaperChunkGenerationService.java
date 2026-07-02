@@ -57,7 +57,6 @@ public class PaperChunkGenerationService {
     // tick() swaps it out on the same thread)
     private List<TickSnapshot.GenerationReadyData> mainReady = new ArrayList<>();
 
-    private final Plugin plugin;
     private final int maxConcurrent;
     private final int maxPerPlayerActive;
     private final int timeoutTicks;
@@ -73,8 +72,7 @@ public class PaperChunkGenerationService {
         void schedule(Runnable task) throws Exception;
     }
 
-    // Wired in the constructor (default references the blank-final plugin field, which is
-    // not definitely assigned until the constructor body runs).
+    // Wired in the constructor (the default captures the constructor's plugin parameter).
     private MainThreadScheduler mainThreadScheduler;
 
     void setMainThreadScheduler(MainThreadScheduler scheduler) {
@@ -88,7 +86,6 @@ public class PaperChunkGenerationService {
     private volatile long totalRemovedInFlight = 0;
 
     public PaperChunkGenerationService(PaperConfig config, Plugin plugin) {
-        this.plugin = plugin;
         this.maxConcurrent = config.generationConcurrencyLimitGlobal;
         this.maxPerPlayerActive = config.generationConcurrencyLimitPerPlayer;
         this.timeoutTicks = config.generationTimeoutSeconds * LSSConstants.TICKS_PER_SECOND;
