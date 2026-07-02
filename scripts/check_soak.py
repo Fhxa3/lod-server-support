@@ -192,7 +192,9 @@ KNOWN_SERVER_KEYS = {
     "snapshot": {"event", "wallMs", "tick", "service", "disk", "generation", "dirty",
                  "bandwidth", "players", "dedup", "jvm", "tscache",
                  "mailbox_depth_hw", "mspt_avg_window", "probe_hashes"},
-    "command": {"event", "wallMs", "tick", "cmd", "anchor", "at", "ok"},
+    # mapped appears only on Folia runs, only when true: the driver acknowledged a timeline
+    # command Folia unregisters (save-all) as a deliberate no-op instead of executing it.
+    "command": {"event", "wallMs", "tick", "cmd", "anchor", "at", "ok", "mapped"},
     "join": {"event", "wallMs", "tick", "player", "joinIndex"},
     "end": {"event", "wallMs", "tick", "reason"},
 }
@@ -2357,6 +2359,23 @@ def selftest():
             "action segmentation: action row must be returned separately"
         cases[0] += 1
         assert not uk and not ue, f"action segmentation: unexpected unknowns {uk} {ue}"
+    finally:
+        tmp_path.unlink()
+
+    # --- Folia mapped command rows are schema-known (no unknown-key warning) ---
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        tf.write(json.dumps({"event": "command", "wallMs": 1000, "tick": 20,
+                             "cmd": "save-all flush", "anchor": 1, "at": 30,
+                             "ok": True, "mapped": True}) + "\n")
+        tmp_path = Path(tf.name)
+    try:
+        w, uk, ue = [], set(), set()
+        server = load_server(tmp_path, w, uk, ue)
+        cases[0] += 1
+        assert len(server["commands"]) == 1 and server["commands"][0].get("mapped") is True, \
+            "folia mapped command: row must load as a command"
+        cases[0] += 1
+        assert not uk, f"folia mapped command: 'mapped' must be schema-known, got unknowns {uk}"
     finally:
         tmp_path.unlink()
 
