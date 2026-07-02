@@ -4,6 +4,7 @@ import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.voxel.ColumnTimestampCache;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -385,6 +386,17 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                 this.invalidationDirty = true;
                 this.invalidationCountdown = INVALIDATE_SAVE_MAX_CYCLES;
             }
+            // A disk read in flight for an invalidated position may carry PRE-edit bytes;
+            // delivering it later in this same cycle (or a following one) must not re-stamp
+            // the cache or re-mark diskReadDone, or the client's dirty re-request draws a
+            // false up_to_date and pre-edit terrain seals against both healing ladders.
+            for (long packed : inv.positions()) {
+                if (this.dedupTracker.hasGroup(packed, inv.dimension())) {
+                    this.invalidatedInFlight
+                            .computeIfAbsent(inv.dimension(), k -> new LongOpenHashSet())
+                            .add(packed);
+                }
+            }
         }
 
         // Player removals (disconnect or dimension change): release the player's dedup groups
@@ -413,7 +425,20 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                     attachedState.removePendingByPosition(cx, cz);
                 }
             }
+            // The read backing this group will never deliver — drop its stale-guard entry.
+            consumeInvalidatedInFlight(rg.group().dimension(), rg.packed());
         }
+    }
+
+    /** Marks positions whose in-flight disk read was overtaken by a dirty invalidation
+     *  (processing-thread only; entries consumed at delivery or with their dedup group). */
+    private final Map<String, LongOpenHashSet> invalidatedInFlight = new HashMap<>();
+
+    private boolean consumeInvalidatedInFlight(String dimension, long packed) {
+        var set = this.invalidatedInFlight.get(dimension);
+        if (set == null || !set.remove(packed)) return false;
+        if (set.isEmpty()) this.invalidatedInFlight.remove(dimension);
+        return true;
     }
 
     // ---- Phase 2: Drain disk reader results (with cross-player dedup dispatch) ----
@@ -442,9 +467,16 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                 int cz = result.chunkZ();
                 long packed = PositionUtil.packPosition(cx, cz);
 
-                deliverDiskResult(playerUuid, state, result, result.submissionOrder(), dimension);
+                // A dirty invalidation overtook this read while it was in flight: the bytes
+                // may predate the edit. Deliver the column (better than nothing), but leave
+                // diskReadDone and the timestamp cache unset so the client's dirty
+                // re-request re-resolves from disk instead of drawing a false up_to_date.
+                boolean staleAgainstEdit = consumeInvalidatedInFlight(dimension, packed);
 
-                if (!result.saturated() && !result.notFound()) {
+                deliverDiskResult(playerUuid, state, result, result.submissionOrder(), dimension,
+                        staleAgainstEdit);
+
+                if (!staleAgainstEdit && !result.saturated() && !result.notFound()) {
                     // Store timestamp so reconnecting clients get up-to-date responses
                     this.timestampCache.put(result.dimension(), packed, result.columnTimestamp(), this.cycleNow);
                 }
@@ -456,7 +488,7 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                         var attachedState = this.players.get(attachment.playerUuid());
                         if (attachedState == null) continue;
                         deliverDiskResult(attachment.playerUuid(), attachedState, result,
-                                attachment.submissionOrder(), dimension);
+                                attachment.submissionOrder(), dimension, staleAgainstEdit);
                     }
                 }
             }
@@ -469,7 +501,8 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
      * Shared by the primary requester and every dedup-attached player.
      */
     private void deliverDiskResult(UUID playerUuid, PlayerState state, ChunkReadResult result,
-                                    long submissionOrder, String dimension) {
+                                    long submissionOrder, String dimension,
+                                    boolean staleAgainstEdit) {
         int cx = result.chunkX();
         int cz = result.chunkZ();
         long packed = PositionUtil.packPosition(cx, cz);
@@ -483,7 +516,9 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
         } else if (result.notFound()) {
             handleDiskNotFound(playerUuid, state, packed, cx, cz, pending, dimension);
         } else {
-            state.markDiskReadDone(cx, cz);
+            if (!staleAgainstEdit) {
+                state.markDiskReadDone(cx, cz);
+            }
             boolean allAir = result.sectionBytes() == null;
             boolean sent = !allAir
                     && buildAndEnqueueColumnPayload(state, cx, cz, result.dimension(),

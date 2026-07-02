@@ -263,6 +263,40 @@ class OffThreadProcessorDiskResultTest {
     }
 
     @Test
+    void invalidationOvertakingAnInFlightReadSuppressesTheStaleStamp() throws Exception {
+        // A disk read races a chunk edit: the read captured PRE-edit bytes, and the edit's
+        // dirty invalidation is applied while the read is still in flight. Delivering the
+        // result must not re-stamp the timestamp cache or re-mark diskReadDone, or the
+        // client's dirty re-request draws a false up_to_date and the pre-edit terrain seals
+        // against both healing ladders (full-review finding: phase ordering in processCycle).
+        var rig = new Rig(false);
+        try {
+            rig.state.enqueue(new IncomingRequest(7, 7, -1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 1, "disk submit");
+
+            long packed = PositionUtil.packPosition(7, 7);
+            rig.proc.invalidateTimestamps(DIM, new long[]{packed});
+            rig.inject(dataResult(rig.uuid, 7, 7, DIM, new byte[]{1, 2}, COLUMN_TS, 1L));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+
+            // The column is still delivered (better than nothing)...
+            waitFor(() -> !rig.proc.enqueuedColumns.isEmpty(), "stale column still delivered");
+            assertFalse(rig.state.hasDiskReadDone(7, 7),
+                    "a stale-against-edit delivery must not set the done-bit");
+            assertEquals(0, rig.state.getHeldSyncSlots(), "delivery still frees the slot");
+
+            // ...and the dirty re-request at the delivered stamp re-reads the disk (which by
+            // now holds the post-edit bytes) instead of resolving up_to_date/duplicate.
+            rig.state.enqueue(new IncomingRequest(7, 7, COLUMN_TS));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 2, "dirty re-request re-reads the disk");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
     void oversizedResultForClaimsDataAnswersUpToDateNotClear() throws Exception {
         // An enqueue REJECTION (oversized column) is not an all-air resolution: the server
         // KNOWS real content exists there, so an authoritative clear would erase the client's
