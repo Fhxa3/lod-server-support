@@ -72,6 +72,37 @@ class ColumnCacheStoreTest {
     }
 
     @Test
+    void hungIoThreadCannotFreezeASynchronousClearForever() throws Exception {
+        // clearForServer/clearAll run on the main client (render) thread via /lss clearcache.
+        // The clear contract only needs submit-side FIFO ordering (the clear task is queued
+        // behind in-flight saves, so a queued save can't resurrect cleared files) — the WAIT
+        // must be bounded, or a cache dir on a hung network/removable mount hard-freezes the
+        // whole client.
+        var gate = new java.util.concurrent.CountDownLatch(1);
+        long oldTimeout = ColumnCacheStore.ioWaitTimeoutMs;
+        ColumnCacheStore.ioWaitTimeoutMs = 250;
+        var caller = new Thread(() -> ColumnCacheStore.clearForServer("test-hung-io"), "test-hung-io-caller");
+        try {
+            ColumnCacheStore.runIoAsyncForTest(() -> {
+                try {
+                    gate.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            caller.start();
+            caller.join(5_000);
+            assertFalse(caller.isAlive(),
+                    "a hung IO thread must not block the synchronous clear past its timeout");
+        } finally {
+            gate.countDown();
+            caller.join(5_000);
+            ColumnCacheStore.ioWaitTimeoutMs = oldTimeout;
+            ColumnCacheStore.flushPendingIo(); // drain the gate task before other tests share the FIFO thread
+        }
+    }
+
+    @Test
     void flushPendingIoWaitsForQueuedAsyncSave() {
         var dim = testDimension("flush_wait");
         var map = new Long2LongOpenHashMap();

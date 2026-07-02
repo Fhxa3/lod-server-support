@@ -18,6 +18,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class ColumnCacheStore {
     private static final Pattern SANITIZE_PATTERN = Pattern.compile("[^a-zA-Z0-9._-]");
@@ -180,14 +182,34 @@ public class ColumnCacheStore {
         runIoAndWait(() -> {});
     }
 
+    /**
+     * Upper bound on how long a synchronous cache call ({@link #clearForServer},
+     * {@link #clearAll}, {@link #flushPendingIo}) blocks its caller — these run on the main
+     * client (render) thread via {@code /lss clearcache}. The clear contract only needs
+     * submit-side FIFO ordering (the task is queued behind in-flight saves on the single IO
+     * thread, so a queued save can never resurrect cleared files); an unbounded wait adds
+     * nothing but a client hard-freeze when the cache dir sits on a hung network/removable
+     * mount. Package-visible so tests can shrink it.
+     */
+    static volatile long ioWaitTimeoutMs = 30_000;
+
+    /** Test seam: occupy the single IO thread with an arbitrary task (e.g. a gate latch). */
+    static void runIoAsyncForTest(Runnable task) {
+        IO_EXECUTOR.execute(task);
+    }
+
     /** Run a cache IO task on the single IO thread and wait for it (serializes with saves/loads). */
     private static void runIoAndWait(Runnable task) {
+        var future = IO_EXECUTOR.submit(task);
         try {
-            IO_EXECUTOR.submit(task).get();
+            future.get(ioWaitTimeoutMs, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (ExecutionException e) {
             LSSLogger.warn("Column cache IO task failed", e.getCause());
+        } catch (TimeoutException e) {
+            LSSLogger.warn("Column cache IO wait exceeded " + ioWaitTimeoutMs
+                    + "ms — abandoning the wait (the task stays queued on the IO thread)");
         }
     }
 
