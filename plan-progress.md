@@ -83,6 +83,37 @@ to spec + plan (see plan §"Post-review revisions"). Highest-value catches:
    soak_report.py results-dir regex learns the `folia-` tag; CI gains `:paper:test` (was never
    in CI — all new pins would have been dev-machine-only).
 
+### Stage 4 — Implementation (2026-07-02)
+
+All plan tasks 2–12 implemented TDD on `feat/folia-support`, one commit per task:
+
+- T2: `LSSPaperPlugin.scheduleServiceTick` + soak-driver tick → `GlobalRegionScheduler.runAtFixedRate`;
+  driver `onJoin` hops to the pump (join events are region-threaded on Folia).
+- T3: generation completion hop → `GlobalRegionScheduler.execute`; dead `plugin` field removed.
+- T4: lifecycle mailbox (`enqueueRegister`/`enqueueRemove`, drained BEFORE the enabled guard);
+  5 new PP-011 tests incl. disabled-drain + 8-thread foreign-thread visibility.
+- T5: handshake registrar + quit listener route through the mailbox.
+- T5b: `FoliaWiringContractTest` — upgraded from the plan's string scan to a ~40-line
+  constant-pool parser after the naive scan false-positived on
+  `HandshakeGate.Decision#registerPlayer()` (same name, different owner); now pins
+  (owner, name) method refs precisely.
+- T6: `FoliaSupport` probe + driver `save-all`→no-op mapping (`mapped: true` row key);
+  `check_soak.py` schema + selftest (120 cases).
+- T7: `plugin.yml folia-supported: true`; flipped the pinned absence test
+  (`foliaSupportedIsAbsent` → `foliaSupportedIsDeclared`) — its reason (BukkitRunnable
+  assumptions) died with T2–T5.
+- T8: cross-thread `/lsslod` audit (all reads = CHM iteration or stale-tolerable primitives —
+  documented in place); `shuttingDown` volatile + onDisable nulls-before-shutdown +
+  PP-012 pinning test.
+- T9: `runFolia` soak task, `pluginsMode = INHERIT_NONE` (verified enum via javap on the
+  cached run-task 3.0.2 jar); task registers cleanly.
+- T10: `SOAK_PLATFORM=folia` in soak.sh (case, FOLIA_SCENARIOS, gating, build step,
+  bukkit.yml autosave-100 staging); `soak_report.py` dir-tag regex extracted to
+  `_scenario_from_dirname` + selftests (20 cases).
+- T11: `release_check.py` paper-jar `folia-supported` gate + selftests (11 cases).
+- T12: README (5 touch points, experimental label), CLAUDE.md, release.yml folia loader,
+  build.yml gains `:paper:test`.
+
 ## Major decisions
 
 - **D1 — Single jar, not a new subproject (2026-07-02).** The existing Paper plugin becomes
