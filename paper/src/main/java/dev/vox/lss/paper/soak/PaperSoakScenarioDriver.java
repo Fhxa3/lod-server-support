@@ -9,7 +9,6 @@ import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.scheduler.BukkitRunnable;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -27,7 +26,8 @@ import java.util.Map;
  * Fabric soak client and scripts/check_soak.py validate a real Paper server end to end.
  *
  * <p>Bukkit events/scheduler replace the Fabric hooks (PlayerJoinEvent for the join
- * anchors, a 1-tick repeating task for the tick clock — both main thread); commands run
+ * anchors, a 1-tick repeating GlobalRegionScheduler task for the tick clock — main thread
+ * on Paper, the global region thread on Folia); commands run
  * through the identical NMS console path Fabric uses, and the end halt is vanilla
  * {@code MinecraftServer.halt(false)} (what /stop does), so the world save-on-exit
  * semantics match. One deliberate divergence: CraftBukkit makes gamerules per-world
@@ -93,26 +93,30 @@ public final class PaperSoakScenarioDriver implements Listener {
                 + " steps, end anchor " + scenario.end.anchor + " +" + scenario.end.at + "s)");
 
         plugin.getServer().getPluginManager().registerEvents(driver, plugin);
-        new BukkitRunnable() {
-            @Override
-            public void run() {
-                driver.onTick();
-            }
-        }.runTaskTimer(plugin, 1L, 1L);
+        plugin.getServer().getGlobalRegionScheduler().runAtFixedRate(
+                plugin, scheduledTask -> driver.onTick(), 1L, 1L);
     }
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
+        // Folia fires join events on the joining player's region thread; all driver state is
+        // owned by the global-region pump, so hop (≤1 tick anchor shift — timelines are
+        // second-granular). On plain Paper this stays on the main thread either way.
+        String name = event.getPlayer().getName();
+        this.plugin.getServer().getGlobalRegionScheduler().execute(this.plugin,
+                () -> recordJoin(name));
+    }
+
+    private void recordJoin(String name) {
         if (this.ended) return;
         this.joinCount++;
         this.joinTicks.put(this.joinCount, this.tickCount);
         this.lastProgressTick = this.tickCount;
         var row = baseRow("join");
-        row.put("player", event.getPlayer().getName());
+        row.put("player", name);
         row.put("joinIndex", this.joinCount);
         PaperSoakMetricsExporter.appendJsonLine(OUTPUT, row);
-        LSSLogger.info("[Soak] Join #" + this.joinCount + " (" + event.getPlayer().getName()
-                + ") at tick " + this.tickCount);
+        LSSLogger.info("[Soak] Join #" + this.joinCount + " (" + name + ") at tick " + this.tickCount);
     }
 
     private void onTick() {

@@ -12,7 +12,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.messaging.PluginMessageListener;
-import org.bukkit.scheduler.BukkitRunnable;
 
 /**
  * Paper plugin entry point for LOD Server Support.
@@ -142,15 +141,18 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
 
             @Override
             public void scheduleServiceTick() {
-                new BukkitRunnable() {
-                    @Override
-                    public void run() {
-                        var service = requestService;
-                        if (service != null) {
-                            service.tick();
-                        }
-                    }
-                }.runTaskTimer(LSSPaperPlugin.this, 1L, 1L);
+                // GlobalRegionScheduler, not BukkitScheduler: on Folia the legacy scheduler
+                // throws UnsupportedOperationException; on plain Paper this runs on the main
+                // thread every tick, exactly like the BukkitRunnable it replaces. The
+                // global-region thread is the plugin's single pump — every single-owner
+                // structure in the pipeline hangs off this cadence (Folia design spec §3).
+                getServer().getGlobalRegionScheduler().runAtFixedRate(LSSPaperPlugin.this,
+                        scheduledTask -> {
+                            var service = requestService;
+                            if (service != null) {
+                                service.tick();
+                            }
+                        }, 1L, 1L);
             }
 
             @Override
