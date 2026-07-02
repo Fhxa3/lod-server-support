@@ -173,6 +173,33 @@ class LodRequestManagerTest {
         assertTrue(fireScan(scanner) > 0, "backoff lasts exactly one scan");
     }
 
+    // ---- dirty crossing an in-flight first serve forces a re-request (#11) ----
+
+    @Test
+    void dirtyCrossingAnInFlightFirstServeReRequestsOnUpToDate() {
+        var tracker = manager.trackerForTest();
+        tracker.markPending(POS, System.nanoTime(), false); // first serve in flight (stored == -1)
+
+        manager.onDirtyColumns(new long[]{POS});            // dirty crosses the in-flight serve
+        manager.onColumnUpToDate(POS);                      // the pre-edit (all-air) answer lands
+
+        assertNotEquals(SATISFIED, manager.columnsForTest().classify(POS, true),
+                "a dirty that crossed the in-flight first serve must force a re-request, not settle");
+    }
+
+    @Test
+    void dirtyCrossingAnInFlightFirstServeReRequestsOnReceived() {
+        manager.setLastDimensionForTest(dim("overworld"));
+        var tracker = manager.trackerForTest();
+        tracker.markPending(POS, System.nanoTime(), false);
+
+        manager.onDirtyColumns(new long[]{POS});
+        manager.onColumnReceived(POS, 5000L, dim("overworld")); // pre-edit content lands
+
+        assertNotEquals(SATISFIED, manager.columnsForTest().classify(POS, true),
+                "a crossed dirty re-requests even when real (pre-edit) data arrived");
+    }
+
     // ---- tracked status responses: apply state AND release the in-flight slot ----
 
     @Test

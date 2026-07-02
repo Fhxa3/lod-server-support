@@ -304,16 +304,35 @@ public class LodRequestManager {
         // timeout → silent-duplicate → second-timeout stall.
         this.tracker.removeByPosition(packed);
         this.columns.onReceived(packed, columnTimestamp);
+        consumeStaleCrossing(packed); // a dirty that crossed this in-flight first serve forces a re-request
         this.metrics.recordColumnReceived(packed, System.currentTimeMillis()); // RTT sample + counter
     }
 
     public void onDirtyColumns(long[] dirtyPositions) {
         boolean added = false;
         for (long packed : dirtyPositions) {
-            added |= this.columns.markDirtyIfKnown(packed);
+            if (this.columns.markDirtyIfKnown(packed)) {
+                added = true;
+            } else {
+                // Unknown position: if it is a first serve currently in flight, record the
+                // crossing so its (pre-edit) answer forces a re-request instead of settling.
+                this.columns.noteStaleIfInFlight(packed, this.tracker.isInFlight(packed));
+            }
         }
         if (added) {
             this.scanner.resetScanCounter();
+        }
+    }
+
+    /**
+     * If a dirty broadcast crossed this position's in-flight first serve, un-settle it and
+     * force a ring re-walk so the (pre-edit) answer that just arrived is superseded by a
+     * re-request. Called from every terminal first-serve outcome.
+     */
+    private void consumeStaleCrossing(long packed) {
+        if (this.columns.resolveStale(packed)) {
+            this.columns.markDirtyIfKnown(packed); // now that it has a disposition, re-mark for re-request
+            this.scanner.resetConfirmedRing();     // reach it below the confirmed ring
         }
     }
 
@@ -344,6 +363,7 @@ public class LodRequestManager {
         this.tracker.removeByPosition(packed);
         this.metrics.discardRttStamp(packed); // terminal non-column answer: the RTT stamp is dead
         this.columns.onNotGenerated(packed);
+        consumeStaleCrossing(packed); // a dirty that crossed this in-flight first serve forces a re-request
         // The scanner skips in-flight positions without breaking ring confirmation, so the ring
         // can confirm PAST this position while it was in-flight. With generation enabled the ts=0
         // stamp is gen-retry-able (classify -> 0), but a below-ring position is never rescanned
@@ -359,6 +379,7 @@ public class LodRequestManager {
         this.tracker.removeByPosition(packed);
         this.metrics.discardRttStamp(packed); // terminal non-column answer: the RTT stamp is dead
         this.columns.onUpToDate(packed);
+        consumeStaleCrossing(packed); // a dirty that crossed this in-flight first serve forces a re-request
         this.metrics.recordUpToDate();
     }
 

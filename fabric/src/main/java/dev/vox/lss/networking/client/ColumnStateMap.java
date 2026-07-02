@@ -38,6 +38,10 @@ class ColumnStateMap {
     // client-clock timestamp (which would persist and lie next session). Never persisted;
     // cleared on reconnect/dimension change and pruned by distance.
     private final LongOpenHashSet sessionSatisfied = new LongOpenHashSet();
+    // Positions dirtied WHILE their first serve was in flight (stored == -1, so
+    // markDirtyIfKnown could not record them). Resolved when that in-flight request reaches
+    // any terminal outcome, forcing a re-request because the arriving column predates the edit.
+    private final LongOpenHashSet staleInFlight = new LongOpenHashSet();
     // Per-position ingest-failure counts; bounds the reject -> re-serve loop a permanently
     // failing consumer would otherwise drive forever (see onIngestFailed).
     private final Long2IntOpenHashMap ingestFailures = new Long2IntOpenHashMap();
@@ -75,6 +79,21 @@ class ColumnStateMap {
     boolean isSessionSatisfied(long packed) { return this.sessionSatisfied.contains(packed); }
 
     int sessionSatisfiedCount() { return this.sessionSatisfied.size(); }
+
+    /**
+     * Record that a dirty broadcast crossed a position while its FIRST serve was in flight
+     * (stored == -1, so {@link #markDirtyIfKnown} could not record it). Resolved at the
+     * request's terminal outcome, forcing a re-request because the arriving column predates
+     * the edit. A no-op when the position is not in flight (the dirty is handled normally).
+     */
+    void noteStaleIfInFlight(long packed, boolean inFlight) {
+        if (inFlight) this.staleInFlight.add(packed);
+    }
+
+    /** True (and clears) if this position was dirtied mid-first-serve. */
+    boolean resolveStale(long packed) {
+        return this.staleInFlight.remove(packed);
+    }
 
     private void put(long packed, long timestamp) {
         long old = this.timestamps.put(packed, timestamp);
@@ -222,6 +241,7 @@ class ColumnStateMap {
         pruneSet(this.retry, playerCx, playerCz, pruneDistance);
         pruneSet(this.validated, playerCx, playerCz, pruneDistance);
         pruneSet(this.sessionSatisfied, playerCx, playerCz, pruneDistance);
+        pruneSet(this.staleInFlight, playerCx, playerCz, pruneDistance);
         var failIter = this.ingestFailures.long2IntEntrySet().iterator();
         while (failIter.hasNext()) {
             if (PositionUtil.isOutOfRange(failIter.next().getLongKey(), playerCx, playerCz, pruneDistance)) {
@@ -245,6 +265,7 @@ class ColumnStateMap {
         this.retry.clear();
         this.validated.clear();
         this.sessionSatisfied.clear();
+        this.staleInFlight.clear();
         this.ingestFailures.clear();
         this.receivedCount = 0;
         this.emptyCount = 0;

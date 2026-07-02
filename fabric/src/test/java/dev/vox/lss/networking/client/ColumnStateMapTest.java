@@ -83,6 +83,17 @@ class ColumnStateMapTest {
     }
 
     @Test
+    void staleInFlightRecordsAndResolvesOnce() {
+        map.noteStaleIfInFlight(POS, true);     // dirty crossed the in-flight first serve
+        assertTrue(map.resolveStale(POS), "a crossed-dirty position resolves stale exactly once");
+        assertFalse(map.resolveStale(POS), "the mark is consumed");
+
+        long other = PositionUtil.packPosition(9, 9);
+        map.noteStaleIfInFlight(other, false);  // not in flight -> no mark (dirty handled normally)
+        assertFalse(map.resolveStale(other));
+    }
+
+    @Test
     void sessionSatisfiedIsClearedAndDistancePruned() {
         long near = PositionUtil.packPosition(0, 0);
         long far = PositionUtil.packPosition(1000, 1000);
