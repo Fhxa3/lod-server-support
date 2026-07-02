@@ -87,6 +87,21 @@ class RequestMetrics {
         this.rttSendStamps.remove(packedPosition);
     }
 
+    /** Movement prune (mirrors InFlightTracker.pruneOutOfRange): a pruned request never gets
+     *  a tracked answer, so its stamp would orphan toward the sampling cap. */
+    void pruneRttStampsOutOfRange(int playerCx, int playerCz, int maxDistance) {
+        var iter = this.rttSendStamps.long2LongEntrySet().fastIterator();
+        while (iter.hasNext()) {
+            long packed = iter.next().getLongKey();
+            if (dev.vox.lss.common.PositionUtil.chebyshevDistance(
+                    dev.vox.lss.common.PositionUtil.unpackX(packed),
+                    dev.vox.lss.common.PositionUtil.unpackZ(packed),
+                    playerCx, playerCz) > maxDistance) {
+                iter.remove();
+            }
+        }
+    }
+
     void recordUpToDate() {
         this.totalUpToDate++;
     }

@@ -144,6 +144,9 @@ public class LodRequestManager {
             int pruneDistance = this.scanner.getPruneDistance();
             this.columns.pruneOutOfRange(playerCx, playerCz, pruneDistance);
             this.tracker.pruneOutOfRange(playerCx, playerCz, pruneDistance);
+            // Pruned in-flight requests will never get a tracked answer — drop their RTT
+            // stamps with them or they orphan toward the sampling cap.
+            this.metrics.pruneRttStampsOutOfRange(playerCx, playerCz, pruneDistance);
             this.lastChunkX = playerCx;
             this.lastChunkZ = playerCz;
             this.scanner.resetScanCounter();
@@ -402,7 +405,14 @@ public class LodRequestManager {
         // dimension-guarded. Gate on tracking instead: the tracker is cleared on dimension
         // change / timeout / prune, so a late status can never stamp the fresh map
         // (matches the pre-v16 requestId gate).
-        if (!this.tracker.isInFlight(packed)) { this.metrics.recordNotGenerated(); return; }
+        if (!this.tracker.isInFlight(packed)) {
+            // Untracked terminal answer (the tracker entry died to a timeout/prune): the RTT
+            // stamp is equally dead — orphans otherwise accumulate to the 4096-stamp cap and
+            // permanently silence RTT sampling for the session.
+            this.metrics.discardRttStamp(packed);
+            this.metrics.recordNotGenerated();
+            return;
+        }
         this.tracker.removeByPosition(packed);
         this.metrics.discardRttStamp(packed); // terminal non-column answer: the RTT stamp is dead
         this.columns.onNotGenerated(packed);
@@ -418,7 +428,11 @@ public class LodRequestManager {
     }
 
     public void onColumnUpToDate(long packed) {
-        if (!this.tracker.isInFlight(packed)) { this.metrics.recordUpToDate(); return; }
+        if (!this.tracker.isInFlight(packed)) {
+            this.metrics.discardRttStamp(packed); // untracked terminal answer: stamp is dead (see onColumnNotGenerated)
+            this.metrics.recordUpToDate();
+            return;
+        }
         this.tracker.removeByPosition(packed);
         this.metrics.discardRttStamp(packed); // terminal non-column answer: the RTT stamp is dead
         this.columns.onUpToDate(packed);
@@ -428,8 +442,13 @@ public class LodRequestManager {
 
     public void onRateLimited(long packed) {
         this.scanner.noteRateLimited(); // backoff regardless of tracking (pre-v16 set skipNextScan outside the gate)
-        if (!this.tracker.isInFlight(packed)) { this.metrics.recordRateLimited(); return; }
+        if (!this.tracker.isInFlight(packed)) {
+            this.metrics.discardRttStamp(packed); // untracked terminal answer: stamp is dead (see onColumnNotGenerated)
+            this.metrics.recordRateLimited();
+            return;
+        }
         this.tracker.removeByPosition(packed);
+        this.metrics.discardRttStamp(packed); // a bounce is terminal for THIS request; the retry re-stamps
         this.columns.markRetry(packed);
         this.metrics.recordRateLimited();
     }
