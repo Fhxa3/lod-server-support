@@ -476,6 +476,14 @@ public class LodRequestManager {
         return this.columns.timestampFor(PositionUtil.packPosition(cx, cz));
     }
 
+    /**
+     * True if the client already holds server data for this position (a resync). Must be
+     * queried BEFORE {@link #onColumnReceived} stamps the arriving column. Drives the decode's
+     * authoritative air-fill: a resync clears ghost terrain for absent sections, a first serve
+     * (nothing held) does not.
+     */
+    public boolean heldContentBefore(long packed) { return this.columns.timestampFor(packed) > 0; }
+
     public int getReceivedColumnCount() { return this.columns.receivedCount(); }
     public int getEmptyColumnCount() { return this.columns.emptyCount(); }
     /** Positions resolved this session with no server data (all-air up-to-date, ingest-parked). */

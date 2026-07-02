@@ -228,7 +228,7 @@ class ClientSessionGateTest {
         events.clear();
         // One column still queued for decode: the teardown must report it, not drop it —
         // its received-stamp would otherwise persist for data no consumer ever saw.
-        processor.offer(new VoxelColumnS2CPayload(3, -4, dim("overworld"), 1L, new byte[0]));
+        processor.offer(new VoxelColumnS2CPayload(3, -4, dim("overworld"), 1L, new byte[0]), false);
 
         gate.onSessionConfig(config(V, true), true);
 

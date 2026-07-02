@@ -480,11 +480,33 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                             result.columnTimestamp(), submissionOrder,
                             result.sectionBytes(), result.estimatedBytes());
             if (!sent) {
-                // All-air chunk (no visible sections) or oversized column — notify client
-                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed, state));
+                // All-air chunk (no visible sections) or oversized column. A resync client
+                // (claimsData) may hold stale content here, so send a clearing 0-section column;
+                // a client with nothing (first serve) gets a cheap up_to_date.
+                boolean claimsData = pending != null && pending.claimsData();
+                if (!(claimsData && sendEmptiedColumn(state, cx, cz, result.dimension(),
+                        result.columnTimestamp(), submissionOrder))) {
+                    this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed, state));
+                }
             }
         }
         this.ctx.diagnostics().incrementDiskDrained();
+    }
+
+    // A VoxelColumn body carrying zero sections (one varint 0). Sent to a data-claiming client
+    // for an all-air resolution so it clears ghost terrain by ingesting air for every section.
+    private static final byte[] ZERO_SECTION_COLUMN = new byte[]{0x00};
+
+    /**
+     * Authoritative all-air serve: enqueue a 0-section {@code VoxelColumn} (carrying the server
+     * columnTimestamp) so a data-claiming client clears the column. Returns false if the payload
+     * could not be enqueued (caller falls back to up_to_date).
+     */
+    boolean sendEmptiedColumn(PlayerState state, int cx, int cz, String dimension,
+                              long columnTimestamp, long submissionOrder) {
+        int est = ZERO_SECTION_COLUMN.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES;
+        return buildAndEnqueueColumnPayload(state, cx, cz, dimension, columnTimestamp,
+                submissionOrder, ZERO_SECTION_COLUMN, est);
     }
 
     /** Disk-first fallback: if the original request was GENERATION and generation is available,
@@ -492,7 +514,7 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     private void handleDiskNotFound(UUID playerUuid, PlayerState state, long packed,
                                      int cx, int cz, PendingRequest pending, String dimension) {
         if (pending != null && pending.type() == RequestType.GENERATION && this.generationAvailable) {
-            if (state.tryAdmit(new PendingRequest(cx, cz, RequestType.GENERATION, SlotType.GENERATION))) {
+            if (state.tryAdmit(new PendingRequest(cx, cz, RequestType.GENERATION, SlotType.GENERATION, pending.claimsData()))) {
                 this.ctx.generationTicketRequests().add(new GenerationTicketRequest(
                         playerUuid, cx, cz, dimension, this.ctx.sequence().next()));
             } else {
@@ -517,7 +539,7 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
             if (current == null || !current.equals(entry.dimension())) continue;
             int cx = entry.cx();
             int cz = entry.cz();
-            state.removePendingByPosition(cx, cz);
+            var pending = state.removePendingByPosition(cx, cz);
             long packed = PositionUtil.packPosition(cx, cz);
 
             if (entry.columnData() == null) {
@@ -527,7 +549,14 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                 boolean sent = this.enqueueLoadedColumn(state, entry.columnData(),
                         entry.columnTimestamp(), entry.submissionOrder(), entry.dimension());
                 if (!sent) {
-                    this.sendActions.add(new SendAction.ColumnUpToDate(entry.playerUuid(), packed, state));
+                    // Generated all-air. A sync resync escalated to generation (claimsData) may
+                    // hold stale content — send a clearing column; a pure gen request (ts=0) gets
+                    // up_to_date.
+                    boolean claimsData = pending != null && pending.claimsData();
+                    if (!(claimsData && sendEmptiedColumn(state, cx, cz, entry.dimension(),
+                            entry.columnTimestamp(), entry.submissionOrder()))) {
+                        this.sendActions.add(new SendAction.ColumnUpToDate(entry.playerUuid(), packed, state));
+                    }
                 }
             }
             this.ctx.diagnostics().incrementGenDrained();

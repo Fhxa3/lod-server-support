@@ -53,7 +53,16 @@ class ClientColumnProcessor {
     // reports). Test seam; the production default reads the live Minecraft client.
     private final Supplier<ClientLevel> levelSupplier;
 
-    private final ConcurrentLinkedQueue<VoxelColumnS2CPayload> columnQueue = new ConcurrentLinkedQueue<>();
+    /**
+     * A queued column plus whether it is a RESYNC (the client already held data for this
+     * position). On a resync the decode fills every absent section-Y with an all-air section
+     * so a consumer overwrites ghost terrain the server cleared (WorldEdit-style clears and
+     * fully-emptied columns). Captured on the main thread at offer time — the decode thread
+     * must not touch ColumnStateMap.
+     */
+    private record QueuedColumn(VoxelColumnS2CPayload payload, boolean resync) {}
+
+    private final ConcurrentLinkedQueue<QueuedColumn> columnQueue = new ConcurrentLinkedQueue<>();
     private final AtomicInteger queueSize = new AtomicInteger();
     private final AtomicLong columnsDropped = new AtomicLong();
     private volatile long lastDropWarnMs = 0;
@@ -84,9 +93,9 @@ class ClientColumnProcessor {
         return mc != null ? mc.level : null;
     }
 
-    void offer(VoxelColumnS2CPayload payload) {
+    void offer(VoxelColumnS2CPayload payload, boolean resync) {
         if (this.queueSize.get() < MAX_QUEUED_COLUMNS) {
-            this.columnQueue.add(payload);
+            this.columnQueue.add(new QueuedColumn(payload, resync));
             this.queueSize.incrementAndGet();
         } else {
             long dropped = this.columnsDropped.incrementAndGet();
@@ -142,16 +151,17 @@ class ClientColumnProcessor {
      * position as satisfied).
      */
     private void reportAndClearBacklog() {
-        VoxelColumnS2CPayload payload;
-        while ((payload = this.columnQueue.poll()) != null) {
+        QueuedColumn queued;
+        while ((queued = this.columnQueue.poll()) != null) {
             this.queueSize.decrementAndGet();
+            var payload = queued.payload();
             this.failureReporter.report(payload.dimension(),
                     payload.chunkX(), payload.chunkZ());
         }
     }
 
     private void drainColumnQueue(ClientLevel level, int epoch) {
-        drainColumnQueue(level.dimension(), level.getSectionsCount(),
+        drainColumnQueue(level.dimension(), level.getSectionsCount(), level.getMinSectionY(),
                 PalettedContainerFactory.create(level.registryAccess()),
                 (dimension, chunkX, chunkZ, columnData) ->
                         LSSApi.dispatchColumn(level, dimension, chunkX, chunkZ, columnData),
@@ -166,11 +176,12 @@ class ClientColumnProcessor {
      * exactly once and the drain continues; the loop re-checks the session epoch at every
      * poll, so a teardown mid-drain lets at most the already-polled column dispatch.
      */
-    void drainColumnQueue(ResourceKey<Level> levelDimension, int levelSectionCount,
+    void drainColumnQueue(ResourceKey<Level> levelDimension, int levelSectionCount, int minSectionY,
                           PalettedContainerFactory factory, ColumnDispatcher dispatcher, int epoch) {
-        VoxelColumnS2CPayload payload;
-        while (epoch == this.sessionEpoch && (payload = this.columnQueue.poll()) != null) {
+        QueuedColumn queued;
+        while (epoch == this.sessionEpoch && (queued = this.columnQueue.poll()) != null) {
             this.queueSize.decrementAndGet();
+            var payload = queued.payload();
             if (!levelDimension.equals(payload.dimension())) continue;
 
             byte[] decompressed = payload.decompressedSections();
@@ -184,9 +195,16 @@ class ClientColumnProcessor {
             }
 
             try {
-                var columnData = new VoxelColumnData(
-                        decodeSections(decompressed, levelSectionCount, factory),
-                        payload.columnTimestamp());
+                var sections = decodeSections(decompressed, levelSectionCount, factory);
+                if (queued.resync()) {
+                    // The client already held data here; the server sends the current column
+                    // (which OMITS air sections) authoritatively. Fill every absent section-Y
+                    // with an all-air section so the consumer overwrites terrain the server
+                    // cleared (WorldEdit clears, fully-emptied 0-section columns). Only on
+                    // resync — a first serve had nothing, so absent == air == no-op.
+                    sections = withAirFilledAbsentSections(sections, levelSectionCount, minSectionY, factory);
+                }
+                var columnData = new VoxelColumnData(sections, payload.columnTimestamp());
                 dispatcher.dispatch(payload.dimension(),
                         payload.chunkX(), payload.chunkZ(), columnData);
             } catch (Exception e) {
@@ -196,6 +214,31 @@ class ClientColumnProcessor {
                         payload.chunkX(), payload.chunkZ());
             }
         }
+    }
+
+    /**
+     * Append an all-air {@link VoxelColumnData.SectionData} for every section-Y in
+     * {@code [minSectionY, minSectionY + levelSectionCount)} that the decoded column does not
+     * already carry, so a resync overwrites ghost terrain the server cleared. A fresh all-air
+     * {@link LevelChunkSection} per absent Y — {@code new LevelChunkSection(factory)} is all-air
+     * until written — with null light layers (dark), consistent with the absent-means-all-zero
+     * light default.
+     */
+    static VoxelColumnData.SectionData[] withAirFilledAbsentSections(
+            VoxelColumnData.SectionData[] present, int levelSectionCount, int minSectionY,
+            PalettedContainerFactory factory) {
+        var seen = new java.util.HashSet<Integer>(present.length * 2);
+        for (var s : present) seen.add(s.sectionY());
+
+        var out = new java.util.ArrayList<VoxelColumnData.SectionData>(levelSectionCount);
+        java.util.Collections.addAll(out, present);
+        for (int i = 0; i < levelSectionCount; i++) {
+            int y = minSectionY + i;
+            if (!seen.contains(y)) {
+                out.add(new VoxelColumnData.SectionData(y, new LevelChunkSection(factory), null, null));
+            }
+        }
+        return out.toArray(new VoxelColumnData.SectionData[0]);
     }
 
     /**
@@ -252,9 +295,10 @@ class ClientColumnProcessor {
      */
     void reportUndispatched(LodRequestManager manager) {
         this.sessionEpoch++;
-        VoxelColumnS2CPayload payload;
-        while ((payload = this.columnQueue.poll()) != null) {
+        QueuedColumn queued;
+        while ((queued = this.columnQueue.poll()) != null) {
             this.queueSize.decrementAndGet();
+            var payload = queued.payload();
             manager.onIngestFailure(payload.dimension(),
                     PositionUtil.packPosition(payload.chunkX(), payload.chunkZ()));
         }

@@ -171,13 +171,14 @@ public class LSSClientNetworking {
 
                     context.client().execute(() -> {
                         var manager = sessionGate.getRequestManager();
+                        long packed = PositionUtil.packPosition(payload.chunkX(), payload.chunkZ());
+                        // Capture "did the client already hold data here" BEFORE onColumnReceived
+                        // stamps it — a resync must air-fill absent sections to clear ghost terrain.
+                        boolean resync = manager != null && manager.heldContentBefore(packed);
                         if (manager != null) {
-                            manager.onColumnReceived(
-                                    PositionUtil.packPosition(payload.chunkX(), payload.chunkZ()),
-                                    payload.columnTimestamp(),
-                                    payload.dimension());
+                            manager.onColumnReceived(packed, payload.columnTimestamp(), payload.dimension());
                         }
-                        columnProcessor.offer(payload);
+                        columnProcessor.offer(payload, resync);
                     });
                 }
         );

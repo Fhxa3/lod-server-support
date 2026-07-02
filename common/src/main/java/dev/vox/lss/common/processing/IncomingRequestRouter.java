@@ -133,10 +133,17 @@ class IncomingRequestRouter<PS extends AbstractPlayerRequestState<?>> {
         var probe = probes.get(packed);
         if (probe == null) return false;
 
-        boolean sent = this.processor.enqueueLoadedColumn(state, probe, this.cycleNow,
-                this.ctx.sequence().next(), dimension);
+        long order = this.ctx.sequence().next();
+        boolean sent = this.processor.enqueueLoadedColumn(state, probe, this.cycleNow, order, dimension);
         if (!sent) {
-            this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed, state));
+            // The loaded chunk is all-air. A resync client (ts>0) may hold stale content there,
+            // so send a clearing 0-section column; a client with nothing (ts<=0) gets up_to_date.
+            if (req.clientTimestamp() > 0
+                    && this.processor.sendEmptiedColumn(state, req.cx(), req.cz(), dimension, this.cycleNow, order)) {
+                // clearing column sent
+            } else {
+                this.ctx.sendActions().add(new SendAction.ColumnUpToDate(playerUuid, packed, state));
+            }
         }
         state.markDiskReadDone(req.cx(), req.cz());
         this.ctx.diagnostics().incrementInMemory();
@@ -169,7 +176,8 @@ class IncomingRequestRouter<PS extends AbstractPlayerRequestState<?>> {
                                            long packed, String dimension, RequestType type) {
         if (type == RequestType.SYNC || this.diskReadingAvailable) {
             // Route through disk reader (with cross-player dedup)
-            if (!state.tryAdmit(new PendingRequest(req.cx(), req.cz(), type, SlotType.SYNC_ON_LOAD))) {
+            boolean claimsData = req.clientTimestamp() > 0;
+            if (!state.tryAdmit(new PendingRequest(req.cx(), req.cz(), type, SlotType.SYNC_ON_LOAD, claimsData))) {
                 rateLimit(state, playerUuid, req, packed, type, dimension);
                 return;
             }
@@ -187,7 +195,7 @@ class IncomingRequestRouter<PS extends AbstractPlayerRequestState<?>> {
             this.ctx.diagnostics().incrementDiskQueued();
         } else if (this.generationAvailable) {
             // No disk reader — direct generation (type is GENERATION here by the branch above)
-            if (!state.tryAdmit(new PendingRequest(req.cx(), req.cz(), type, SlotType.GENERATION))) {
+            if (!state.tryAdmit(new PendingRequest(req.cx(), req.cz(), type, SlotType.GENERATION, req.clientTimestamp() > 0))) {
                 rateLimit(state, playerUuid, req, packed, type, dimension);
                 return;
             }
