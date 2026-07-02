@@ -42,6 +42,10 @@ ALL_SCENARIOS=(fresh-backfill warm-rejoin dimension-trip dirty-broadcast
 # cold-restart-resync restores a Fabric-layout world/cache snapshot pair, and the
 # stress/config scenarios simply haven't been validated on Paper yet.
 PAPER_SCENARIOS=(fresh-backfill warm-rejoin dimension-trip paper-dirty-falling-block)
+# Folia runs the identical Paper scenario set: same plugin jar, same timelines, same checker.
+# save-all steps are mapped to acknowledged no-ops by the driver (Folia unregisters the
+# command); an aggressive bukkit.yml autosave keeps chunks flushing mid-run instead.
+FOLIA_SCENARIOS=("${PAPER_SCENARIOS[@]}")
 # Scenarios that run on a fresh (deleted) world; everything else copies the base world.
 FRESH_WORLD_SCENARIOS="fresh-backfill rate-limit-storm generation-disabled generation-capacity-stress"
 LOG_PREFIX="soak"
@@ -68,8 +72,17 @@ case "$SOAK_PLATFORM" in
         # run-paper downloads the Paper server jar inside the gradle task on first run
         SERVER_READY_TIMEOUT=240
         ;;
+    folia)
+        SERVER_RUN_DIR="$PROJECT_ROOT/paper/build/run/folia-soak-server"
+        SERVER_GRADLE_TASK=":paper:runFolia"
+        SERVER_CONFIG_DIR="$SERVER_RUN_DIR/plugins/LodServerSupport"
+        BASE_WORLD_DIR="$WORLDS_DIR/base-folia"
+        PLATFORM_TAG="folia-"
+        # run-paper downloads the Folia server jar inside the gradle task on first run
+        SERVER_READY_TIMEOUT=240
+        ;;
     *)
-        echo "[soak] ERROR: Unknown SOAK_PLATFORM '$SOAK_PLATFORM' (want fabric or paper)"
+        echo "[soak] ERROR: Unknown SOAK_PLATFORM '$SOAK_PLATFORM' (want fabric, paper or folia)"
         exit 1
         ;;
 esac
@@ -77,9 +90,10 @@ esac
 source "$PROJECT_ROOT/scripts/lib/mc-run.sh"
 
 usage() {
-    echo "Usage: [SOAK_PLATFORM=fabric|paper] $0 <scenario>|all"
+    echo "Usage: [SOAK_PLATFORM=fabric|paper|folia] $0 <scenario>|all"
     echo "  fabric scenarios: ${ALL_SCENARIOS[*]}"
     echo "  paper scenarios:  ${PAPER_SCENARIOS[*]}"
+    echo "  folia scenarios:  ${FOLIA_SCENARIOS[*]}"
 }
 
 if [[ -z "$SCENARIO" ]]; then
@@ -92,6 +106,10 @@ fi
 if [[ "$SCENARIO" == "all" ]]; then
     if [[ "$SOAK_PLATFORM" == "paper" ]]; then
         for s in "${PAPER_SCENARIOS[@]}"; do
+            "$SELF" "$s"
+        done
+    elif [[ "$SOAK_PLATFORM" == "folia" ]]; then
+        for s in "${FOLIA_SCENARIOS[@]}"; do
             "$SELF" "$s"
         done
     else
@@ -124,8 +142,13 @@ if [[ "$SOAK_PLATFORM" == "paper" && " ${PAPER_SCENARIOS[*]} " != *" $SCENARIO "
     usage
     exit 1
 fi
+if [[ "$SOAK_PLATFORM" == "folia" && " ${FOLIA_SCENARIOS[*]} " != *" $SCENARIO "* ]]; then
+    echo "[soak] ERROR: Scenario '$SCENARIO' is not ported to SOAK_PLATFORM=folia"
+    usage
+    exit 1
+fi
 if [[ "$SOAK_PLATFORM" == "fabric" && "$SCENARIO" == paper-* ]]; then
-    echo "[soak] ERROR: Scenario '$SCENARIO' requires SOAK_PLATFORM=paper"
+    echo "[soak] ERROR: Scenario '$SCENARIO' requires SOAK_PLATFORM=paper (or folia)"
     usage
     exit 1
 fi
@@ -210,12 +233,12 @@ fi
 echo "[soak] Validating scenario..."
 python3 "$PROJECT_ROOT/scripts/check_soak.py" --validate "$SCENARIO"
 
-# Step 3: Build (the soak client is always the Fabric client; paper additionally needs
+# Step 3: Build (the soak client is always the Fabric client; paper/folia additionally need
 # the dev plugin jar that retains the soak package)
 echo "[soak] Building mod..."
 cd "$PROJECT_ROOT"
 ./gradlew :fabric:build -x test -x runGameTest -x runClientGameTest --quiet
-if [[ "$SOAK_PLATFORM" == "paper" ]]; then
+if [[ "$SOAK_PLATFORM" == "paper" || "$SOAK_PLATFORM" == "folia" ]]; then
     ./gradlew :paper:soakShadowJar --quiet
 fi
 
@@ -285,6 +308,16 @@ force-gamemode=true
 PROPS
 
 echo "eula=true" > "$SERVER_RUN_DIR/eula.txt"
+
+# Folia: save-all is unregistered (the driver maps it to an acknowledged no-op), so flush
+# chunks continuously — every 100 ticks — to keep mid-run disk state close to what the
+# shared timelines assume; the end-of-scenario halt performs a full save regardless.
+if [[ "$SOAK_PLATFORM" == "folia" ]]; then
+    cat > "$SERVER_RUN_DIR/bukkit.yml" <<'BUKKIT'
+ticks-per:
+  autosave: 100
+BUKKIT
+fi
 
 # Step 6c: Write client options.txt to bypass first-launch screens and pin render distance
 cat > "$CLIENT_RUN_DIR/options.txt" <<'OPTS'
