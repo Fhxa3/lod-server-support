@@ -82,6 +82,18 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     private int consecutiveErrors;
     private long cycleNow; // cached epochSeconds for current processing cycle
 
+    // WS4 durable invalidation: a dirty-broadcast invalidation removes cache entries in memory;
+    // without a prompt save, a crash within the ~5-min periodic window resurrects them (false
+    // up_to_date). Debounce on the processing thread: on the FIRST removal since the last save,
+    // arm a countdown; save when it elapses (coalesce, do NOT reset) so continuous churn cannot
+    // starve durability, and the countdown floor (~2s) bounds how often snapshotForSave's deep
+    // copy runs under a high edit rate. Atomic-move gives atomicity, not power-loss durability
+    // (no fsync) — the shrunk window covers graceful/process crashes; power-loss is deferred to
+    // the tombstone fallback.
+    private static final int INVALIDATE_SAVE_MAX_CYCLES = 40; // ~2s at 20 cycles/s
+    private boolean invalidationDirty = false;
+    private int invalidationCountdown = 0;
+
     // Per-instance (not static): a static executor's non-expiring daemon thread pins the
     // OffThreadProcessor class — and, on Paper, the whole plugin classloader — for the JVM's
     // life, leaking one thread + classloader on every /reload. Bounding it to the processor
@@ -345,8 +357,11 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
             }
         }
 
-        if (this.dataDir != null && ++this.saveCounter >= SAVE_INTERVAL_CYCLES) {
+        boolean periodicDue = ++this.saveCounter >= SAVE_INTERVAL_CYCLES;
+        boolean invalidationDue = this.invalidationDirty && --this.invalidationCountdown <= 0;
+        if (this.dataDir != null && (periodicDue || invalidationDue)) {
             this.saveCounter = 0;
+            this.invalidationDirty = false; // a save flushes any pending invalidation too
             var cacheSnapshot = this.timestampCache.snapshotForSave();
             this.saveExecutor.execute(() -> cacheSnapshot.save(this.dataDir));
         }
@@ -356,7 +371,11 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
 
     private void applyEvents(MailboxTake take) {
         for (var inv : take.invalidations()) {
-            this.timestampCache.invalidate(inv.dimension(), inv.positions());
+            int removed = this.timestampCache.invalidate(inv.dimension(), inv.positions());
+            if (removed > 0 && !this.invalidationDirty) {
+                this.invalidationDirty = true;
+                this.invalidationCountdown = INVALIDATE_SAVE_MAX_CYCLES;
+            }
         }
 
         // Player removals (disconnect or dimension change): release the player's dedup groups

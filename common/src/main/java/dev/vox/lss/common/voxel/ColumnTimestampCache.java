@@ -68,14 +68,20 @@ public class ColumnTimestampCache {
         return cache.timestamps.getOrDefault(packed, 0L);
     }
 
-    public void invalidate(String dimension, long[] positions) {
+    /** Removes cached timestamps for the given positions. Returns the count actually removed. */
+    public int invalidate(String dimension, long[] positions) {
         var cache = caches.get(dimension);
-        if (cache == null) return;
+        if (cache == null) return 0;
+        int removed = 0;
         for (long pos : positions) {
-            cache.timestamps.remove(pos);
-            cache.insertionTimes.remove(pos);
+            if (cache.timestamps.containsKey(pos)) {
+                cache.timestamps.remove(pos);
+                cache.insertionTimes.remove(pos);
+                removed++;
+            }
         }
-        liveSizes.put(dimension, cache.timestamps.size());
+        if (removed > 0) liveSizes.put(dimension, cache.timestamps.size());
+        return removed;
     }
 
     /**

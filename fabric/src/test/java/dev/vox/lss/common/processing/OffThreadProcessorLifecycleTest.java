@@ -207,4 +207,42 @@ class OffThreadProcessorLifecycleTest {
             proc2.shutdown();
         }
     }
+
+    @Test
+    void invalidationTriggersADebouncedSaveWellBeforeThePeriodicInterval(@TempDir Path dataDir)
+            throws Exception {
+        var u = UUID.randomUUID();
+        var s = newPlayer(u);
+        var players = new ConcurrentHashMap<UUID, TestState>();
+        players.put(u, s);
+        var reader = new StubDiskReader();
+        reader.registerPlayer(u);
+        var proc = new TestProcessor(players, reader, dataDir);
+        var cacheFile = dataDir.resolve("lss-timestamps.bin");
+        try {
+            proc.start();
+            // Serve a disk read so the timestamp cache holds an entry for (10,10).
+            s.enqueue(new IncomingRequest(10, 10, 1L));
+            proc.postSnapshot(snapshot(u), List.of());
+            waitFor(() -> proc.diskSubmits.size() == 1, "disk submit");
+            reader.getPlayerQueue(u).add(dataResult(u, 10, 10, new byte[]{1, 2}, COLUMN_TS, 1L));
+            proc.postSnapshot(snapshot(u), List.of());
+            waitFor(() -> !proc.enqueuedColumns.isEmpty(), "column served (cache stamped)");
+            assertFalse(Files.exists(cacheFile), "no periodic save yet (interval is ~5 min)");
+
+            // A dirty-broadcast invalidation of the stamped position arms the debounced save;
+            // it must land within seconds (well under SAVE_INTERVAL_CYCLES), not resurrect on a
+            // crash inside the periodic window.
+            proc.invalidateTimestamps(DIM, new long[]{PositionUtil.packPosition(10, 10)});
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            while (!Files.exists(cacheFile) && System.nanoTime() < deadline) {
+                proc.postSnapshot(snapshot(u), List.of());
+                Thread.sleep(10);
+            }
+            assertTrue(Files.exists(cacheFile),
+                    "an invalidation must trigger a debounced save within seconds, not only every ~5 min");
+        } finally {
+            proc.shutdown();
+        }
+    }
 }

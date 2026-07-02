@@ -51,6 +51,17 @@ class ColumnTimestampCacheTest {
     }
 
     @Test
+    void invalidateReturnsRemovedCount() {
+        cache.put(LSSConstants.DIM_STR_OVERWORLD, 1L, 100L, now);
+        cache.put(LSSConstants.DIM_STR_OVERWORLD, 2L, 200L, now);
+        assertEquals(2, cache.invalidate(LSSConstants.DIM_STR_OVERWORLD, new long[]{1L, 2L, 3L}),
+                "returns the count actually removed (3L was never cached)");
+        assertEquals(0, cache.invalidate(LSSConstants.DIM_STR_OVERWORLD, new long[]{1L}),
+                "already-removed positions count zero — the debounced save trips only on a real removal");
+        assertEquals(0, cache.invalidate("lss_test:absent", new long[]{1L}), "unknown dimension removes nothing");
+    }
+
+    @Test
     void invalidateCleansInsertionTimeToo() {
         cache.put(LSSConstants.DIM_STR_OVERWORLD, 1L, 100L, now);
         cache.invalidate(LSSConstants.DIM_STR_OVERWORLD, new long[]{1L});
