@@ -78,7 +78,7 @@ jobs:
       # CI build). GitHub Actions exports CI=true, so the build steps above produced CI-named jars
       # that release_check's RELEASE_GLOBS match. Runs after the builds, before the irreversible publish.
       - name: Release-jar safety gate
-        run: python3 scripts/release_check.py
+        run: python3 scripts/release_check.py --version "${GITHUB_REF_NAME#v}"
 
       - uses: softprops/action-gh-release@v2
         with:
