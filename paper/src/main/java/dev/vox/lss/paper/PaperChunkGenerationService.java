@@ -9,7 +9,6 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 
-import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.plugin.Plugin;
 
@@ -54,7 +53,8 @@ public class PaperChunkGenerationService {
 
     private final LinkedHashMap<PendingGenerationKey, ActiveGeneration> active = new LinkedHashMap<>();
     private final Map<UUID, Integer> perPlayerActiveCount = new HashMap<>();
-    // Main-thread-owned (onChunkReady is scheduled to the main thread via runTask; tick() swaps it out)
+    // Pump-thread-owned (onChunkReady is scheduled to the pump via the GlobalRegionScheduler;
+    // tick() swaps it out on the same thread)
     private List<TickSnapshot.GenerationReadyData> mainReady = new ArrayList<>();
 
     private final Plugin plugin;
@@ -62,9 +62,12 @@ public class PaperChunkGenerationService {
     private final int maxPerPlayerActive;
     private final int timeoutTicks;
 
-    /** Test seam: hands the async-load completion back to the main thread. Production
-     *  default is Bukkit's scheduler, which throws once the plugin is disabled —
-     *  tests inject throwing schedulers to pin that rejection containment. */
+    /** Test seam: hands the async-load completion back to the pump thread. Production
+     *  default is the GlobalRegionScheduler (main thread on Paper, the pump's global-region
+     *  thread on Folia), which throws {@code IllegalPluginAccessException} once the plugin is
+     *  disabled — the identical type the legacy CraftScheduler threw, so containment is exact
+     *  parity; it must keep catching broad {@code Exception}, never a named type. Tests
+     *  inject throwing schedulers to pin that rejection containment. */
     @FunctionalInterface
     interface MainThreadScheduler {
         void schedule(Runnable task) throws Exception;
@@ -89,7 +92,8 @@ public class PaperChunkGenerationService {
         this.maxConcurrent = config.generationConcurrencyLimitGlobal;
         this.maxPerPlayerActive = config.generationConcurrencyLimitPerPlayer;
         this.timeoutTicks = config.generationTimeoutSeconds * LSSConstants.TICKS_PER_SECOND;
-        this.mainThreadScheduler = task -> Bukkit.getScheduler().runTask(this.plugin, task);
+        this.mainThreadScheduler = task ->
+                plugin.getServer().getGlobalRegionScheduler().execute(plugin, task);
     }
 
     /**
@@ -149,7 +153,7 @@ public class PaperChunkGenerationService {
     }
 
     /**
-     * Called on the main thread when Paper finishes loading/generating a chunk to FULL.
+     * Called on the pump thread when Paper finishes loading/generating a chunk to FULL.
      * Package-visible so tests can fire the completion that launchAsyncLoad would schedule.
      */
     void onChunkReady(PendingGenerationKey key, ServerLevel level,
