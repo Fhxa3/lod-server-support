@@ -79,7 +79,16 @@ class VoxyCompat {
             // Register column consumer
             var bridgeDead = new java.util.concurrent.atomic.AtomicBoolean();
             VoxelColumnConsumer consumer = (level, dimension, chunkX, chunkZ, columnData) -> {
-                if (bridgeDead.get()) return;
+                if (bridgeDead.get()) {
+                    // The latch stops the churn, but the receive handler already stamped this
+                    // position received (ts>0): returning SILENTLY would keep — and persist —
+                    // a stamp for data Voxy never stored, poisoning the cache across sessions
+                    // (after a Voxy upgrade every such position resyncs up_to_date and stays
+                    // a hole). Report instead: each position parks honestly (ts=-1 +
+                    // session-satisfied) at the bounded failure cap.
+                    reportSink.report(dimension, chunkX, chunkZ);
+                    return;
+                }
                 try {
                     Object worldId = worldIdentifierOf.invoke(level);
                     if (worldId == null) {
@@ -108,12 +117,14 @@ class VoxyCompat {
                         reportSink.report(dimension, chunkX, chunkZ);
                     }
                 } catch (LinkageError e) {
-                    // Incompatible Voxy: this will never succeed for any column. Kill the
-                    // bridge instead of reporting — a report would re-serve the column and
-                    // re-fail it (capped per position, but pure waste at session scale).
+                    // Incompatible Voxy: this will never succeed for any column. Latch to
+                    // stop re-serve churn, but keep the stamps honest — this column (and every
+                    // later one, via the latch branch above) still reports so it parks at
+                    // ts=-1 instead of retaining a fabricated received-stamp.
                     bridgeDead.set(true);
                     LSSLogger.error("Voxy raw ingest is incompatible with this Voxy version — "
                             + "disabling the bridge for this session", e);
+                    reportSink.report(dimension, chunkX, chunkZ);
                 } catch (Throwable e) {
                     if (e instanceof Error && !(e instanceof AssertionError)) throw (Error) e;
                     LSSLogger.error("Voxy raw ingest failed", e);

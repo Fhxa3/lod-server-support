@@ -185,20 +185,25 @@ class VoxyCompatTest {
     }
 
     @Test
-    void linkageErrorDeadLatchesBridgeSilently() {
+    void linkageErrorDeadLatchesBridgeButKeepsStampsHonest() {
+        // The latch stops re-serve churn (no further ingest attempts), but every delivered
+        // column must still REPORT: the receive handler already stamped it received, and a
+        // silent return would persist stamps for data Voxy never stored — after a Voxy
+        // upgrade every such position resyncs up_to_date and stays a permanent hole. The
+        // report parks each position honestly (ts=-1, bounded by the per-position cap).
         var consumer = initBridge();
         VoxelIngestService.behavior = call -> { throw new LinkageError("incompatible voxy"); };
 
         assertDoesNotThrow(() -> consumer.onVoxelColumnReceived(null, DIM, 1, 2,
                 column(sectionData(0), sectionData(1))));
         assertEquals(1, VoxelIngestService.calls.size(), "LinkageError aborts the column mid-loop");
-        assertTrue(reports.isEmpty(),
-                "the latch must not report — a report would re-serve and re-fail forever");
+        assertEquals(1, reports.size(), "the latching column itself must park honestly");
 
         VoxelIngestService.reset(); // healthy again, but the latch already killed the bridge
         consumer.onVoxelColumnReceived(null, DIM, 1, 2, column(sectionData(0)));
         assertEquals(0, VoxelIngestService.calls.size(), "dead bridge must not attempt ingests");
-        assertTrue(reports.isEmpty(), "dead bridge must not report");
+        assertEquals(2, reports.size(),
+                "every column delivered to the dead bridge must report, not silently retain its stamp");
     }
 
     @Test

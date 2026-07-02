@@ -229,11 +229,19 @@ class ClientColumnProcessor {
                 var columnData = new VoxelColumnData(sections, payload.columnTimestamp());
                 dispatcher.dispatch(payload.dimension(),
                         payload.chunkX(), payload.chunkZ(), columnData);
-            } catch (Exception e) {
+            } catch (Throwable t) {
+                // Throwable, not Exception: an OOME allocating section buffers (or a
+                // LinkageError from MC internals) escaping here would consume the column —
+                // polled and decremented — with no dispatch AND no report, leaving a
+                // permanent false received-stamp that persists to the cache (the exact hole
+                // class the delivery-honesty refactor eliminated; LSSApi.dispatchColumn one
+                // frame downstream already treats Throwable this way). Report FIRST so the
+                // stamp is forgotten, then let true Errors propagate.
                 LSSLogger.error("Failed to process voxel column at "
-                        + payload.chunkX() + "," + payload.chunkZ(), e);
+                        + payload.chunkX() + "," + payload.chunkZ(), t);
                 this.failureReporter.report(payload.dimension(),
                         payload.chunkX(), payload.chunkZ());
+                if (t instanceof Error err && !(t instanceof AssertionError)) throw err;
             }
         }
     }

@@ -40,6 +40,13 @@ public class LodRequestManager {
 
     private boolean cacheLoaded = false;
     private volatile CompletableFuture<Long2LongOpenHashMap> pendingCacheLoad = null;
+    // Ingest failures reported while this dimension's cache load is still in flight: applied
+    // against the not-yet-loaded map they are absorbed (onIngestFailed no-ops on an absent
+    // entry) and loadFrom would then resurrect the stale ts>0 stamp from disk — a claim for
+    // data no consumer holds, revalidated up_to_date every session. Buffer and re-apply
+    // after the load lands. Main client thread only.
+    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet failuresDuringCacheLoad =
+            new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
 
     // Metrics tracking (counters + rolling rates)
     private final RequestMetrics metrics = new RequestMetrics();
@@ -167,6 +174,14 @@ public class LodRequestManager {
                 }
             } catch (Exception ignored) {}
             this.pendingCacheLoad = null;
+            if (!this.failuresDuringCacheLoad.isEmpty()) {
+                // Failures reported during the load: the load may have just resurrected their
+                // stale stamps — re-apply so the positions unstamp and re-request honestly.
+                for (long failed : this.failuresDuringCacheLoad) {
+                    this.columns.onIngestFailed(failed);
+                }
+                this.failuresDuringCacheLoad.clear();
+            }
         }
         return true;
     }
@@ -370,6 +385,11 @@ public class LodRequestManager {
             return;
         }
         this.tracker.removeByPosition(packed);
+        if (this.pendingCacheLoad != null) {
+            // The in-memory apply below is absorbed while the map is empty pre-load; remember
+            // the position so tickCacheGatePhase re-applies the failure over the loaded stamps.
+            this.failuresDuringCacheLoad.add(packed);
+        }
         this.columns.onIngestFailed(packed);
         this.metrics.recordIngestFailure();
         // No resetScanCounter here: it is a debounce (it can only DELAY the next scan,
@@ -437,6 +457,7 @@ public class LodRequestManager {
     }
 
     private void startAsyncCacheLoad(ResourceKey<Level> dimension) {
+        this.failuresDuringCacheLoad.clear(); // per-dimension buffer; a new load starts clean
         this.pendingCacheLoad = ColumnCacheStore.loadAsync(this.serverAddress, dimension);
     }
 
@@ -455,6 +476,7 @@ public class LodRequestManager {
             ColumnCacheStore.clearForServer(this.serverAddress);
         }
         this.pendingCacheLoad = null; // drop any in-flight load — its pre-clear result would resurrect flushed timestamps
+        this.failuresDuringCacheLoad.clear();
         resetRequestState();
         this.queue.clear();
         this.scanner.reset();

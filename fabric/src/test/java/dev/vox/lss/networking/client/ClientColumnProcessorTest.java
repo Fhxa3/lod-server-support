@@ -210,6 +210,23 @@ class ClientColumnProcessorTest {
     }
 
     @Test
+    void errorDuringDrainReportsBeforePropagating() {
+        // Throwable containment (mirrors LSSApi.dispatchColumn's policy): an Error escaping
+        // the per-column try would consume the column — polled, decremented — with no
+        // dispatch AND no report, a permanent false received-stamp persisted to the cache.
+        // The report must land BEFORE the Error propagates.
+        var wire = sectionWire(1, 1);
+        processor.offer(new VoxelColumnS2CPayload(3, 4, dim, 9L, wire), false);
+        assertThrows(LinkageError.class, () -> processor.drainColumnQueue(dim, LEVEL_SECTIONS,
+                MIN_SECTION_Y, FACTORY,
+                (d, cx, cz, data) -> { throw new LinkageError("boom"); },
+                processor.sessionEpochForTest()));
+        assertEquals(List.of(new Report(dim, 3, 4)), reports,
+                "the column must report (unstamp) before the Error surfaces");
+        assertEquals(0, processor.getQueuedCount(), "the column was consumed exactly once");
+    }
+
+    @Test
     void admissionIsBoundedByBytesAsWellAsCount() {
         // The count cap alone admits up to 8000 x 2 MiB = 16 GiB of retained payloads from a
         // hostile server before any drop fires; the byte budget closes that.

@@ -811,6 +811,29 @@ class LodRequestManagerTest {
                         + " server re-resolve honestly.");
     }
 
+    // ---- ingest failures racing a pending cache load ----
+
+    @Test
+    void ingestFailureDuringPendingCacheLoadIsNotResurrectedByTheLoad() {
+        // A consumer rejection (any-thread API, hops to the main thread) lands while the
+        // dimension's cache load is still in flight: applied against the empty map it is
+        // absorbed, and loadFrom would then resurrect the stale ts>0 stamp — a claim for
+        // data no consumer holds, revalidated up_to_date every session (the same-dimension
+        // sibling of the WS5/#36 cross-dimension hole).
+        manager.setLastDimensionForTest(dim("overworld"));
+        var pending = new CompletableFuture<Long2LongOpenHashMap>();
+        manager.setPendingCacheLoadForTest(pending);
+
+        manager.onIngestFailure(dim("overworld"), POS); // absorbed by the empty pre-load map
+
+        var loaded = new Long2LongOpenHashMap();
+        loaded.put(POS, 5000L);
+        pending.complete(loaded);
+        assertTrue(manager.tickCacheGatePhase());
+        assertEquals(-1L, manager.columnsForTest().timestampFor(POS),
+                "the loaded stale stamp must be re-unstamped for the rejected column");
+    }
+
     // ---- flushCache drops an in-flight cache load ----
 
     @Test
