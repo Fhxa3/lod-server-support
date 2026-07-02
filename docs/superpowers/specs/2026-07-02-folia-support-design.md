@@ -116,8 +116,14 @@ fire on region threads on Folia) write only to the synchronized `DirtyColumnTrac
   exact parity, provided containment keeps catching broad `Exception`, never a narrower named
   type (verified in dev bundle `26.1.2.build.69`, `FoliaGlobalRegionScheduler` lines 63-64/90-91).
   `getChunkAtAsync` itself is callable from
-  any thread on Folia (Chunky ships exactly this pattern); `onChunkReady` then serializes on the
-  pump thread — legal per §3.
+  any thread on Folia (Chunky ships exactly this pattern). **Serialization happens on the
+  completion thread, not the pump** (revised after the first live Folia soak): the completion
+  fires on the chunk's owning region thread and the load ticket dies with it — an isolated LOD
+  chunk unloads again before a hop to the next global tick, which lost ~93% of generations to
+  "chunk was null after async load" when extraction was deferred to the pump. The completion
+  callback (`completeAsyncLoad`) extracts `LoadedColumnData` in place (region-legal, tear-free —
+  and on Paper that thread is the main thread, where extraction always ran) and hops only the
+  immutable result to the pump's `onChunkReady`, which does books only.
 - **Soak driver tick** (`PaperSoakScenarioDriver.init`): same `BukkitRunnable` →
   `GlobalRegionScheduler.runAtFixedRate` swap. Driver commands via
   `server.getCommands().performPrefixedCommand` from the global thread are exactly

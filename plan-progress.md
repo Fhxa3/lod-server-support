@@ -114,6 +114,23 @@ All plan tasks 2–12 implemented TDD on `feat/folia-support`, one commit per ta
 - T12: README (5 touch points, experimental label), CLAUDE.md, release.yml folia loader,
   build.yml gains `:paper:test`.
 
+### Stage 5 — Live validation (2026-07-02, in progress)
+
+**First live Folia run caught a real design bug the plan review missed.** fresh-backfill ran
+end-to-end (server booted 12 s, plugin loaded, driver + client + checker all functional) but
+failed 3 checker laws with one root cause: 6,887/7,376 generations logged "Chunk was null after
+async load completed" — the A5 gap (6,886) equals submitted−completed exactly. On Folia,
+`getChunkAtAsync` completes on the chunk's owning REGION thread and the load ticket dies with
+the callback; an isolated LOD chunk unloads again before the hop to the next GLOBAL tick, so
+the pump's `getChunkNow` re-fetch found nothing. **Fix (D8):** serialize in the completion
+callback (owning region thread — the reads were verified legal there by gap-1) and hop only
+the immutable `LoadedColumnData` to the pump; new `completeAsyncLoad` seam preserves every
+containment pin. *Alternatives considered:* plugin chunk tickets to pin the chunk until the
+pump ran (rejected — ticket add/remove is itself region-bound, more moving parts); accepting
+disk-read-later semantics (rejected — turns every generation into a generate+unload+reread
+cycle and still fails the >500-completions floor). This is the squaremap "extract on owning
+thread, publish immutable" pattern from the research dossier.
+
 ## Major decisions
 
 - **D1 — Single jar, not a new subproject (2026-07-02).** The existing Paper plugin becomes
