@@ -164,11 +164,14 @@ public class LSSPaperPlugin extends JavaPlugin implements PluginMessageListener,
 
     @Override
     public void onDisable() {
+        // Null the field BEFORE shutting down so the next pump fire no-ops — a runtime
+        // plugin-manager disable can arrive from a region thread while the pump is mid-tick
+        // (the service's shuttingDown flag covers the one already-in-flight tick).
         var service = this.requestService;
+        this.requestService = null;
         if (service != null) {
             LSSLogger.info("Stopping LSS LOD request processing service");
             service.shutdown();
-            this.requestService = null;
         }
 
         getServer().getMessenger().unregisterIncomingPluginChannel(this);

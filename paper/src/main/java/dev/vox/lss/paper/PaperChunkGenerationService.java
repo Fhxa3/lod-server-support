@@ -286,7 +286,8 @@ public class PaperChunkGenerationService {
 
     public long getTotalRemovedInFlight() { return this.totalRemovedInFlight; }
 
-    /** Main thread only (like every other read of {@code active}). */
+    /** Pump thread for exact values; command threads read racily (stale-tolerable admin
+     *  diagnostics — never iterate {@code active} off-pump, size() is a plain field read). */
     public int getActiveCount() { return this.active.size(); }
 
     private static void incrementCount(Map<UUID, Integer> map, UUID uuid) {

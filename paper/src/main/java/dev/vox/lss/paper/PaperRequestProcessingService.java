@@ -56,6 +56,8 @@ public class PaperRequestProcessingService {
 
     private int diagLogCounter = 0;
 
+    private volatile boolean shuttingDown = false;
+
     private final TickDiagnostics diag = new TickDiagnostics();
 
 
@@ -218,7 +220,7 @@ public class PaperRequestProcessingService {
         // disabled is safe by construction: HandshakeGate never invokes the registrar when
         // disabled, and removePlayer of an unregistered UUID is a no-op.
         drainLifecycleMailbox();
-        if (!this.config.enabled)
+        if (this.shuttingDown || !this.config.enabled)
             return;
 
         this.diag.reset(this.offThreadProcessor.getDiagnostics());
@@ -455,6 +457,11 @@ public class PaperRequestProcessingService {
     }
 
     public void shutdown() {
+        // Normal stop and /reload are serialized with the pump (region shutdown thread /
+        // global tick thread), but a runtime plugin manager can disable us from a player
+        // region thread — this flag shrinks the tick-vs-shutdown overlap to at most the one
+        // in-flight tick (runtime disables are documented best-effort on Folia).
+        this.shuttingDown = true;
         try {
             this.offThreadProcessor.shutdown();
         } catch (Exception e) {

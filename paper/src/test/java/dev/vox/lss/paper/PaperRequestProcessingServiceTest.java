@@ -618,6 +618,16 @@ class PaperRequestProcessingServiceTest {
                 "post-shutdown submits are rejected before they are counted");
     }
 
+    // ---- PP-012: shutdown freezes subsequent ticks (runtime plugin-manager disable) ----
+
+    @Test
+    void shutdownStopsSubsequentTicks() {
+        service.shutdown();
+        service.tick();
+        assertEquals(0, broadcaster.ticks, "a post-shutdown tick must be a no-op");
+        assertTrue(processor.snapshots.isEmpty(), "no snapshot may be posted after shutdown");
+    }
+
     // ---- PP-011: lifecycle mailbox (Folia region-thread ingress → pump-owned apply) ----
 
     @Test
