@@ -177,8 +177,15 @@ public class PaperRequestProcessingService {
     }
 
     public PaperPlayerRequestState registerPlayer(ServerPlayer player, int capabilities) {
-        var state = this.players.computeIfAbsent(player.getUUID(), uuid -> new PaperPlayerRequestState(
-                player, this.config.syncOnLoadConcurrencyLimitPerPlayer, this.config.generationConcurrencyLimitPerPlayer));
+        var state = this.players.computeIfAbsent(player.getUUID(), uuid -> {
+            var s = new PaperPlayerRequestState(player,
+                    this.config.syncOnLoadConcurrencyLimitPerPlayer,
+                    this.config.generationConcurrencyLimitPerPlayer);
+            // Session identity for the router's stale-snapshot guard (set before the map
+            // publish so the processing thread never sees it null on a live state).
+            s.setRegisteredDimension(player.level().dimension().identifier().toString());
+            return s;
+        });
         this.diskReader.registerPlayer(player.getUUID());
         state.setCapabilities(capabilities);
         state.markHandshakeComplete();

@@ -95,8 +95,14 @@ public class RequestProcessingService {
 
     public PlayerRequestState registerPlayer(ServerPlayer player, int capabilities) {
         var config = LSSServerConfig.CONFIG;
-        var state = this.players.computeIfAbsent(player.getUUID(), uuid -> new PlayerRequestState(
-                player, config.syncOnLoadConcurrencyLimitPerPlayer, config.generationConcurrencyLimitPerPlayer));
+        var state = this.players.computeIfAbsent(player.getUUID(), uuid -> {
+            var s = new PlayerRequestState(player, config.syncOnLoadConcurrencyLimitPerPlayer,
+                    config.generationConcurrencyLimitPerPlayer);
+            // Session identity for the router's stale-snapshot guard (set before the map
+            // publish so the processing thread never sees it null on a live state).
+            s.setRegisteredDimension(player.level().dimension().identifier().toString());
+            return s;
+        });
         this.diskReader.registerPlayer(player.getUUID());
         state.setCapabilities(capabilities);
         state.markHandshakeComplete();

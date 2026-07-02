@@ -53,6 +53,13 @@ class IncomingRequestRouter<PS extends AbstractPlayerRequestState<?>> {
             var state = this.players.get(entry.getKey());
             if (state == null) continue;
             if (!state.supportsVoxelColumns()) continue;
+            // Stale-snapshot session guard: a dimension change replaced the state after this
+            // snapshot was built. Routing the NEW session's requests under the OLD dimension
+            // would submit disk reads whose results get dimension-skipped, leaking the pending
+            // slots for the whole session. Requests stay queued; the next cycle's fresh
+            // snapshot routes them under the right dimension. (Null = bare test rig.)
+            String registered = state.registeredDimension();
+            if (registered != null && !registered.equals(entry.getValue())) continue;
 
             processIncomingRequests(state, entry.getKey(), entry.getValue(), snapshot);
         }
