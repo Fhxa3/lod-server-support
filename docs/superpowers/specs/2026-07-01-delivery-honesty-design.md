@@ -292,3 +292,53 @@ ordering rule is needed.
 
 Each workstream is independently shippable and testable; WS1 first because WS2/WS3/WS5 assume an
 honest timestamp map.
+
+## 9. Post-implementation review (since-release audit, 2026-07-02)
+
+A multi-agent adversarial review of `v0.4.1..HEAD` surfaced 8 findings. Dispositions:
+
+**Fixed:**
+- **#1 dirty crossing an in-flight RESYNC** — WS2's `staleInFlight` only covered first serves
+  (`stored==-1`). `LodRequestManager.onDirtyColumns` now calls `noteStaleIfInFlight`
+  unconditionally, so a second edit crossing an in-flight resync survives `onReceived`'s
+  dirty-clear and re-requests. (`LodRequestManagerTest.dirtyCrossingAnInFlightResyncReRequests`.)
+- **#2/#3 rejected authoritative clear stranded ghost terrain (WS3 completion)** — a consumer
+  rejecting a 0-section content→air clear dropped the client stamp to `-1`; a `ts=-1` re-request
+  draws an all-air `up_to_date` (a clear is only sent for `claimsData`/`ts>0`), so the ghost
+  persisted for the session. Root cause: `onIngestFailed`'s `-1` drop is correct for lost
+  *content* (server re-serves on `ts=-1`) but wrong for a lost *clear* (server invalidated its
+  cache, so `ts>0` correctly re-draws the clear). Fix: `ColumnStateMap` tracks `clearedResync`
+  (packed → pre-clear content stamp); a rejected clear re-requests with that pre-clear stamp — a
+  real server-issued value `<` the server's cached clear stamp, so the `up_to_date` check fails
+  and the clear is re-sent. Wire form of a clear is detected by `ClientColumnProcessor.isClearColumn`
+  (leading section-count varint == 0). Bounded by the existing ingest-failure cap.
+- **#6 saveExecutor shutdown race** — a processing thread outliving the join timeout could reach
+  the periodic-save `execute()` after `saveExecutor.shutdown()` and throw
+  `RejectedExecutionException` (surfacing as a spurious shutdown ERROR). The periodic-save site
+  now swallows it at debug; the unconditional shutdown (classloader-leak guard) is unchanged.
+- **#7 Fabric/Paper dimension-context parity** — `FabricOffThreadProcessor.updateDimensionContext`
+  used `putIfAbsent` while the Paper twin used `put`; a recreated dimension (LAN re-publish /
+  dynamic-dimension mods) would keep a stale `ServerLevel`. Now `put`, matching Paper.
+
+**Documented residuals (deferred, self-healing or scope-gated):**
+- **#4 Paper `updateEvents` upgrade gap (LOW).** `EntityExplodeEvent` was added to the default
+  list, but `JsonConfig.load` overwrites defaults with an existing file, so already-run Paper
+  servers never register it (explosion-caused terrain changes aren't detected; Fabric catches
+  them via the save hook regardless). Not auto-fixed because `updateEvents` is an intentionally
+  *user-customizable* list (the defaults' comments document deliberate inclusions/omissions and
+  invite admin edits) — a union-merge would break the "admins can remove events" contract, and a
+  versioned config migration is a separate feature. **Upgrade note for admins:** add
+  `org.bukkit.event.entity.EntityExplodeEvent` to `updateEvents`, or delete the config to
+  regenerate. New installs already include it.
+- **#5 WS4 whole-cache deep-copy on invalidation (LOW, extreme scale).** The invalidation-triggered
+  save deep-copies the entire timestamp cache (`snapshotForSave`) as often as every dirty-broadcast
+  interval (~10 s) under sustained in-range edits, vs every 5 min pre-diff. The ~2 s debounce
+  bounds frequency but not per-copy cost, which scales with cache size (tens of ms near the 32 MB
+  cap). Tuning lever: raise `INVALIDATE_SAVE_MAX_CYCLES` (larger debounce, wider durability window)
+  or move to an incremental save. Only bites a near-cap cache with a redstone/world-eater workload.
+- **#8 resync air-fill vs unparseable sections (LOW), tied to deferred #16 (DataFixer).**
+  `withAirFilledAbsentSections` treats every absent section as air, but `NbtSectionSerializer`
+  omits a section whose `block_states` fails to parse (region corruption / removed-mod palette),
+  not only all-air ones — so a disk-served resync could clear a still-present but unreadable
+  section to air. The wire form doesn't distinguish "authoritatively air" from "unreadable"; fixing
+  it is a serializer/protocol change that belongs with the broader old-chunk DataFixer work (#16).

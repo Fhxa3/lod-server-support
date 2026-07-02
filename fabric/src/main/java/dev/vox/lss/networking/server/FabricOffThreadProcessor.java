@@ -41,7 +41,10 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
 
     /** Register a dimension context for disk read submission (called from main thread). */
     public void updateDimensionContext(String dimension, ServerLevel level) {
-        this.dimensionLevelMap.putIfAbsent(dimension, level);
+        // put, not putIfAbsent: refresh to the current ServerLevel so a recreated dimension
+        // (e.g. an integrated world re-published to LAN) doesn't leave a stale level cached.
+        // Matches PaperOffThreadProcessor.updateDimensionContext so the twins can't drift.
+        this.dimensionLevelMap.put(dimension, level);
     }
 
     @Override

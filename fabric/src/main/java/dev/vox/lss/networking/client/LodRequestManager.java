@@ -295,15 +295,30 @@ public class LodRequestManager {
     }
 
     public void onColumnReceived(long packed, long columnTimestamp, ResourceKey<Level> dimension) {
+        onColumnReceived(packed, columnTimestamp, dimension, false);
+    }
+
+    /**
+     * @param authoritativeClear the received column was a 0-section content-&gt;air CLEAR (see
+     *        {@link ClientColumnProcessor#isClearColumn}). If the consumer later rejects it, the
+     *        re-request must carry the pre-clear content stamp so the server re-sends the clear;
+     *        recorded via {@link ColumnStateMap#markAuthoritativeClear} inside the dimension guard.
+     */
+    public void onColumnReceived(long packed, long columnTimestamp, ResourceKey<Level> dimension,
+                                 boolean authoritativeClear) {
         // A column from another dimension is discarded by the dispatch drain
         // (ClientColumnProcessor filters on level.dimension()), so stamping it here would
         // mark the position SATISFIED in the current dimension's map with no data delivered.
         if (this.lastDimension != null && !this.lastDimension.equals(dimension)) return;
+        // Capture the pre-clear content stamp BEFORE onReceived overwrites it with the clear's
+        // timestamp — a rejected clear re-requests with this value, not ts=-1.
+        long preClearStamp = authoritativeClear ? this.columns.timestampFor(packed) : -1L;
         // Apply even if the position is no longer tracked (e.g. it timed out client-side):
         // the data is authoritative for the position, and stamping it prevents the
         // timeout → silent-duplicate → second-timeout stall.
         this.tracker.removeByPosition(packed);
         this.columns.onReceived(packed, columnTimestamp);
+        if (authoritativeClear) this.columns.markAuthoritativeClear(packed, preClearStamp);
         consumeStaleCrossing(packed); // a dirty that crossed this in-flight first serve forces a re-request
         this.metrics.recordColumnReceived(packed, System.currentTimeMillis()); // RTT sample + counter
     }
@@ -311,13 +326,14 @@ public class LodRequestManager {
     public void onDirtyColumns(long[] dirtyPositions) {
         boolean added = false;
         for (long packed : dirtyPositions) {
-            if (this.columns.markDirtyIfKnown(packed)) {
-                added = true;
-            } else {
-                // Unknown position: if it is a first serve currently in flight, record the
-                // crossing so its (pre-edit) answer forces a re-request instead of settling.
-                this.columns.noteStaleIfInFlight(packed, this.tracker.isInFlight(packed));
-            }
+            added |= this.columns.markDirtyIfKnown(packed);
+            // Record a crossing REGARDLESS of markDirtyIfKnown's result: a dirty crossing an
+            // in-flight request survives onReceived's dirty-clear only via staleInFlight. This
+            // must cover the resync case (stored>0, where markDirtyIfKnown returns true) as well
+            // as the first-serve case (stored==-1, returns false) — otherwise a second edit that
+            // arrives while the first serve is in flight has its dirty mark cleared by onReceived
+            // and is never re-requested (a permanent stale column). No-op when not in flight.
+            this.columns.noteStaleIfInFlight(packed, this.tracker.isInFlight(packed));
         }
         if (added) {
             this.scanner.resetScanCounter();

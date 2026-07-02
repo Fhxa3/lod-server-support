@@ -358,10 +358,62 @@ class ColumnStateMapTest {
                 "a stuck retry mark would pin confirmedRing at 0 for the whole session");
     }
 
+    // ---- rejected authoritative clear self-heals (WS3 completion, review #2/#3) ----
+
+    @Test
+    void rejectedClearReRequestsWithPreClearStampNotMinusOne() {
+        // Client held content at T_content=3000, then the server sent a 0-section clearing column
+        // at T_clear=5000 (content->air). The consumer rejected it. The re-request MUST carry the
+        // pre-clear stamp (3000, a real server-issued value < the server's cached clear stamp) so
+        // the up_to_date check fails and the server re-sends the clear. A ts=-1 re-request would
+        // instead draw an all-air up_to_date (the clear is only sent for claimsData/ts>0), leaving
+        // ghost terrain stranded for the whole session.
+        map.onReceived(POS, 3000L);              // pre-clear content
+        map.onReceived(POS, 5000L);              // the clearing column overwrites the stamp
+        map.markAuthoritativeClear(POS, 3000L);  // networking flags this delivery as a 0-section clear
+
+        map.onIngestFailed(POS);                 // consumer rejects the clear
+
+        assertEquals(3000L, map.classify(POS, true),
+                "a rejected clear re-requests with the pre-clear content stamp, not ts=-1");
+        assertTrue(map.hasRetries(), "retry mark forces the confirmed-ring reset so it is rescanned");
+    }
+
+    @Test
+    void contentSupersedesAPendingClearFlag() {
+        map.onReceived(POS, 5000L);
+        map.markAuthoritativeClear(POS, 3000L);
+        map.onReceived(POS, 7000L);   // real content arrives AFTER the clear flag — supersedes it
+
+        map.onIngestFailed(POS);      // now this is a plain content rejection
+
+        assertEquals(-1L, map.classify(POS, true),
+                "once real content supersedes the clear flag, a rejection re-requests as content (ts=-1)");
+    }
+
+    @Test
+    void repeatedlyRejectedClearParksAtCap() {
+        for (int i = 0; i < ColumnStateMap.MAX_INGEST_FAILURES; i++) {
+            map.onReceived(POS, 5000L + i);          // server re-sends the clear
+            map.markAuthoritativeClear(POS, 3000L);
+            map.onIngestFailed(POS);
+            assertEquals(3000L, map.classify(POS, true),
+                    "clear failure " + (i + 1) + " re-requests with the pre-clear stamp");
+        }
+        map.onReceived(POS, 9000L);
+        map.markAuthoritativeClear(POS, 3000L);
+        map.onIngestFailed(POS); // cap exceeded
+
+        assertEquals(SATISFIED, map.classify(POS, true),
+                "a permanently rejected clear must not drive an endless re-clear loop");
+        assertTrue(map.isSessionSatisfied(POS), "parked via session-satisfied");
+    }
+
     @Test
     void clearResetsEverything() {
         map.onReceived(POS, 100L);
         map.markRetry(POS);
+        map.markAuthoritativeClear(POS, 50L);
         map.clear();
         assertEquals(0, map.receivedCount());
         assertEquals(0, map.emptyCount());

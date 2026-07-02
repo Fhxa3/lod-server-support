@@ -364,6 +364,26 @@ class ClientColumnProcessorTest {
                 "a negative claimed count clamps to zero, never a negative-size allocation");
     }
 
+    // ---- isClearColumn: identify a 0-section authoritative clear ----
+
+    @Test
+    void isClearColumnTrueForZeroSectionBody() {
+        assertTrue(ClientColumnProcessor.isClearColumn(sectionWire(0, 0)),
+                "a 0-section body is the wire form of a content->air clear");
+    }
+
+    @Test
+    void isClearColumnFalseForContentBody() {
+        assertFalse(ClientColumnProcessor.isClearColumn(sectionWire(1, 1)),
+                "any body carrying sections is content, not a clear");
+    }
+
+    @Test
+    void isClearColumnFalseForEmptyOrNullBytes() {
+        assertFalse(ClientColumnProcessor.isClearColumn(new byte[0]));
+        assertFalse(ClientColumnProcessor.isClearColumn(null));
+    }
+
     // ---- CL-039: decode failures report once and the drain continues ----
 
     @Test

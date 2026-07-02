@@ -45,6 +45,12 @@ class ColumnStateMap {
     // Per-position ingest-failure counts; bounds the reject -> re-serve loop a permanently
     // failing consumer would otherwise drive forever (see onIngestFailed).
     private final Long2IntOpenHashMap ingestFailures = new Long2IntOpenHashMap();
+    // Positions whose last authoritative delivery was a 0-section CLEAR (content->air), mapped to
+    // the PRE-CLEAR content stamp. If the consumer rejects a clear, onIngestFailed must re-request
+    // with that pre-clear stamp (a real server-issued value, < the server's cached clear stamp) so
+    // the server re-sends the clearing column — a ts=-1 re-request would draw an all-air up_to_date
+    // (a clear is only sent for claimsData/ts>0), stranding ghost terrain. Content supersedes.
+    private final Long2LongOpenHashMap clearedResync = new Long2LongOpenHashMap();
 
     // Derived counts, maintained on every timestamp transition.
     private int receivedCount;
@@ -93,6 +99,17 @@ class ColumnStateMap {
     /** True (and clears) if this position was dirtied mid-first-serve. */
     boolean resolveStale(long packed) {
         return this.staleInFlight.remove(packed);
+    }
+
+    /**
+     * Flag that the column just delivered for {@code packed} was an authoritative 0-section
+     * CLEAR (content-&gt;air), recording the pre-clear content stamp so a rejected clear can
+     * re-request honestly. Called by the networking layer AFTER {@link #onReceived} (which
+     * removes any prior flag — content supersedes). A no-op unless the client actually held
+     * content before ({@code preClearStamp > 0}); a first serve had nothing to leave a ghost.
+     */
+    void markAuthoritativeClear(long packed, long preClearStamp) {
+        if (preClearStamp > 0) this.clearedResync.put(packed, preClearStamp);
     }
 
     private void put(long packed, long timestamp) {
@@ -145,6 +162,10 @@ class ColumnStateMap {
     void onReceived(long packed, long columnTimestamp) {
         this.dirty.remove(packed);
         this.sessionSatisfied.remove(packed); // real data supersedes any session-satisfied mark
+        // Content supersedes a pending clear flag. A 0-section clear delivery also lands here, so
+        // the networking layer re-flags it via markAuthoritativeClear AFTER this call; a content
+        // delivery (>=1 section) does not, so the flag stays cleared and a rejection re-asks ts=-1.
+        this.clearedResync.remove(packed);
         // An answer supersedes any pending retry. Rate-limit bounces (the original retry
         // writer) guarantee no response is coming, but the timeout sweep retries positions
         // whose response may still arrive late — leaving the mark would re-request every
@@ -215,9 +236,27 @@ class ColumnStateMap {
             this.validated.remove(packed);
             this.retry.remove(packed);
             this.dirty.remove(packed);
+            this.clearedResync.remove(packed);
             return;
         }
 
+        long clearPreStamp = this.clearedResync.getOrDefault(packed, -1L);
+        if (clearPreStamp > 0) {
+            // Lost CLEAR (the consumer rejected a 0-section content->air column). Re-request with
+            // the pre-clear content stamp — a real server-issued value that is < the server's
+            // cached clear stamp, so the up_to_date check fails and the server re-sends the
+            // clearing column. Dropping to -1 (the lost-content path below) would instead draw an
+            // all-air up_to_date (a clear is only sent for claimsData/ts>0), stranding ghost
+            // terrain for the session. Restoring the stamp, not fabricating one, keeps delivery
+            // honest. Counts net zero: put swaps one >0 stamp (T_clear) for another (T_content).
+            put(packed, clearPreStamp);
+            this.validated.remove(packed);
+            this.dirty.remove(packed);
+            this.retry.add(packed);
+            return;
+        }
+
+        // Lost CONTENT: forget the stamp (honest "I hold nothing") so the server re-serves on ts=-1.
         this.timestamps.remove(packed);
         if (old > 0) this.receivedCount--;
         else if (old == 0) this.emptyCount--;
@@ -248,6 +287,12 @@ class ColumnStateMap {
                 failIter.remove();
             }
         }
+        var clearIter = this.clearedResync.long2LongEntrySet().iterator();
+        while (clearIter.hasNext()) {
+            if (PositionUtil.isOutOfRange(clearIter.next().getLongKey(), playerCx, playerCz, pruneDistance)) {
+                clearIter.remove();
+            }
+        }
     }
 
     private static void pruneSet(LongOpenHashSet set, int playerCx, int playerCz, int pruneDistance) {
@@ -267,6 +312,7 @@ class ColumnStateMap {
         this.sessionSatisfied.clear();
         this.staleInFlight.clear();
         this.ingestFailures.clear();
+        this.clearedResync.clear();
         this.receivedCount = 0;
         this.emptyCount = 0;
     }

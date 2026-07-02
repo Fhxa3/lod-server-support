@@ -242,6 +242,22 @@ class ClientColumnProcessor {
     }
 
     /**
+     * True if these column bytes carry ZERO sections — the wire form of an authoritative
+     * content-&gt;air CLEAR (the server sends it only to a data-claiming client). Reads just the
+     * leading section-count varint. A malformed header reads as not-a-clear; the decode path
+     * reports that column's failure separately.
+     */
+    static boolean isClearColumn(byte[] decompressed) {
+        if (decompressed == null || decompressed.length == 0) return false;
+        var buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(decompressed));
+        try {
+            return buf.readVarInt() == 0;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
      * Decode one column's wire bytes into section data. The claimed section count never
      * sizes the allocation: it is clamped to {@code [0, levelSectionCount]} — supporting
      * tall/modded worlds up to the client level's height while capping what a hostile

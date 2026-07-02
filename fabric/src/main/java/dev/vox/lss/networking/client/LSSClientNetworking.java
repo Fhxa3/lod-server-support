@@ -175,8 +175,13 @@ public class LSSClientNetworking {
                         // Capture "did the client already hold data here" BEFORE onColumnReceived
                         // stamps it — a resync must air-fill absent sections to clear ghost terrain.
                         boolean resync = manager != null && manager.heldContentBefore(packed);
+                        // A 0-section resync is an authoritative content->air clear; flag it so a
+                        // consumer rejection re-requests the clear instead of stranding ghost terrain.
+                        boolean clear = resync
+                                && ClientColumnProcessor.isClearColumn(payload.decompressedSections());
                         if (manager != null) {
-                            manager.onColumnReceived(packed, payload.columnTimestamp(), payload.dimension());
+                            manager.onColumnReceived(packed, payload.columnTimestamp(),
+                                    payload.dimension(), clear);
                         }
                         columnProcessor.offer(payload, resync);
                     });

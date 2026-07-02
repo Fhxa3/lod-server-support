@@ -14,6 +14,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -363,7 +364,15 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
             this.saveCounter = 0;
             this.invalidationDirty = false; // a save flushes any pending invalidation too
             var cacheSnapshot = this.timestampCache.snapshotForSave();
-            this.saveExecutor.execute(() -> cacheSnapshot.save(this.dataDir));
+            try {
+                this.saveExecutor.execute(() -> cacheSnapshot.save(this.dataDir));
+            } catch (RejectedExecutionException e) {
+                // Shutdown already called saveExecutor.shutdown() while this processing thread
+                // was still finishing a cycle (it outlived the join timeout). The final save is
+                // handled there; swallow rather than let this surface as a spurious ERROR from
+                // the processingLoop catch — the state is already being persisted on the way out.
+                LSSLogger.debug("Skipped periodic timestamp cache save — save executor is shutting down");
+            }
         }
     }
 

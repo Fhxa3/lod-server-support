@@ -200,6 +200,44 @@ class LodRequestManagerTest {
                 "a crossed dirty re-requests even when real (pre-edit) data arrived");
     }
 
+    @Test
+    void dirtyCrossingAnInFlightResyncReRequests() {
+        // A second edit landing while the FIRST edit's resync is still in flight. markDirtyIfKnown
+        // returns true here (the column is already held, stored > 0), so the crossing is preserved
+        // only if noteStaleIfInFlight is called unconditionally — not just when the position is
+        // unknown. Without that, onColumnReceived clears the dirty mark and the second edit is lost.
+        manager.setLastDimensionForTest(dim("overworld"));
+        manager.onColumnReceived(POS, 5000L, dim("overworld")); // held from an earlier serve
+        assertEquals(SATISFIED, manager.columnsForTest().classify(POS, true));
+
+        var tracker = manager.trackerForTest();
+        tracker.markPending(POS, System.nanoTime(), false); // resync (first edit) in flight
+
+        manager.onDirtyColumns(new long[]{POS});               // second edit crosses the resync
+        manager.onColumnReceived(POS, 6000L, dim("overworld")); // first-edit content lands, clears dirty
+
+        assertNotEquals(SATISFIED, manager.columnsForTest().classify(POS, true),
+                "a dirty crossing an in-flight resync must re-request, not settle on stale content");
+    }
+
+    // ---- a rejected authoritative clear self-heals (WS3 completion, review #2/#3) ----
+
+    @Test
+    void rejectedAuthoritativeClearReRequestsWithPreClearStamp() {
+        // End-to-end through the manager: the client holds content, the server sends a 0-section
+        // clearing column (content->air), the consumer rejects it. The re-request must carry the
+        // pre-clear stamp so the server re-sends the clear, not ts=-1 (which draws an all-air
+        // up_to_date and strands ghost terrain for the session).
+        manager.setLastDimensionForTest(dim("overworld"));
+        manager.onColumnReceived(POS, 3000L, dim("overworld"));       // pre-clear content held
+        manager.onColumnReceived(POS, 5000L, dim("overworld"), true); // authoritative 0-section clear
+
+        manager.onIngestFailure(dim("overworld"), POS);               // consumer rejects the clear
+
+        assertEquals(3000L, manager.columnsForTest().classify(POS, true),
+                "a rejected clear re-requests with the pre-clear content stamp, not ts=-1");
+    }
+
     // ---- tracked status responses: apply state AND release the in-flight slot ----
 
     @Test
