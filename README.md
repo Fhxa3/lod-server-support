@@ -4,6 +4,8 @@ Distributes LOD (Level of Detail) chunk data from servers to connected clients o
 
 Supports **Fabric**, **Paper**, and **Folia** (experimental) servers. The client is always a Fabric mod.
 
+https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
+
 ### Version Compatibility
 
 | LSS Version | Minecraft | Fabric | Paper | Voxy | Java |
@@ -19,8 +21,6 @@ client-sync correctness fixes; after upgrading, clients rebuild their local LOD 
 support is built against Paper 26.1.2 and also runs on Purpur. Paper server admins on the
 older 1.21.11 line should continue using
 [v0.2.3](https://modrinth.com/plugin/lod-server-support/versions).
-
-https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 
 ## How It Works
 
