@@ -71,8 +71,10 @@ jobs:
       - name: Build Fabric
         run: ./gradlew :fabric:build -x runClientGameTest -Pmod_version=${GITHUB_REF_NAME#v}
 
-      - name: Build Paper
-        run: ./gradlew :paper:shadowJar -Pmod_version=${GITHUB_REF_NAME#v}
+      # :paper:test gates the publish — :paper:shadowJar alone has no test dependency,
+      # and this pipeline ships the Paper jar to three loaders irreversibly.
+      - name: Build Paper + Tier 1 tests
+        run: ./gradlew :paper:test :paper:shadowJar -Pmod_version=${GITHUB_REF_NAME#v}
 
       # Gate the tag-versioned artifacts that actually ship (build.yml gates only the default-version
       # CI build). GitHub Actions exports CI=true, so the build steps above produced CI-named jars
