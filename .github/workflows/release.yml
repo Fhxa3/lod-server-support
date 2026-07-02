@@ -118,6 +118,7 @@ jobs:
           loaders: |
             paper
             purpur
+            folia
           game-versions: |
             26.1.2
           changelog: ${{ steps.release_notes.outputs.notes }}

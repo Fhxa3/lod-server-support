@@ -26,6 +26,9 @@ jobs:
       - name: Build Paper plugin
         run: ./gradlew :paper:shadowJar
 
+      - name: Paper Tier 1 tests
+        run: ./gradlew :paper:test
+
       - name: Soak checker + report selftests
         run: |
           python3 scripts/check_soak.py --selftest
