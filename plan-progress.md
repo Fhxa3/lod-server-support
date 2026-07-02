@@ -131,6 +131,20 @@ disk-read-later semantics (rejected — turns every generation into a generate+u
 cycle and still fails the >500-completions floor). This is the squaremap "extract on owning
 thread, publish immutable" pattern from the research dossier.
 
+**After the fix: fresh-backfill PASS — 39 windows (39 client-laws), 39 quiescent snapshots,
+0 violations, 0 warnings, zero null-chunk errors** (before: 6 windows, 3 violations, 6,887
+errors). Server: `Folia version 26.1.2-8` (build 8 — the exact build all research facts were
+verified against). Exactly one LSS plugin loaded (`INHERIT_NONE` confirmed working; run-paper
+injects via --add-plugin, so the check is the plugin-load log line, not a jars listing).
+**Stage 5 result (2026-07-02): ALL GREEN — 8/8.** `SOAK_PLATFORM=folia ./scripts/soak.sh all`:
+fresh-backfill, warm-rejoin, dimension-trip, paper-dirty-falling-block all PASS against Folia
+26.1.2 build 8. Paper regression `SOAK_PLATFORM=paper ./scripts/soak.sh all`: same four PASS
+(the GlobalRegionScheduler swap did not regress Paper). Spot-checks: `"mapped": true` appears
+exactly on the mapped save-all command row; soak_report parses `-folia-` result dirs correctly;
+the single report anomaly is the expected fresh-backfill startup request spike (lens, not
+gate). Plus the full static suite: Fabric Tier 1+2, Paper Tier 1 (~230 tests incl. the new
+seams), release_check OK, all three selftests (120/20/11).
+
 ## Major decisions
 
 - **D1 — Single jar, not a new subproject (2026-07-02).** The existing Paper plugin becomes
