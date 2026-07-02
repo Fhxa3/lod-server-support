@@ -74,8 +74,11 @@ class PaperRequestProcessingServiceTest {
         final List<GenFailure> genFailures = new ArrayList<>();
         final ArrayDeque<OffThreadProcessor.GenerationTicketRequest> ticketQueue = new ArrayDeque<>();
         final AtomicInteger sendActionDrains = new AtomicInteger();
+        record Invalidation(String dimension, long[] positions) {}
+        final List<Invalidation> invalidations = new ArrayList<>();
         boolean throwOnShutdown = false;
         boolean shutdownCalled = false;
+        boolean invalidationsSeenBeforeShutdown = false;
 
         RecordingProcessor(Map<UUID, PaperPlayerRequestState> players, PaperChunkDiskReader diskReader) {
             // Never start()ed: the recording overrides observe the main-thread glue only.
@@ -114,8 +117,14 @@ class PaperRequestProcessingServiceTest {
         }
 
         @Override
+        public void invalidateTimestamps(String dimension, long[] positions) {
+            invalidations.add(new Invalidation(dimension, positions));
+        }
+
+        @Override
         public void shutdown() {
             shutdownCalled = true;
+            invalidationsSeenBeforeShutdown = !invalidations.isEmpty();
             if (throwOnShutdown) throw new IllegalStateException("processor shutdown boom");
         }
     }
@@ -639,6 +648,22 @@ class PaperRequestProcessingServiceTest {
         service.tick();
         assertTrue(service.getPlayers().isEmpty(),
                 "a register racing shutdown must not apply into torn-down collaborators");
+    }
+
+    // ---- PP-013: shutdown drains pending dirty marks into cache invalidations ----
+
+    @Test
+    void shutdownDrainsPendingDirtyMarksIntoInvalidationsBeforeProcessorShutdown() {
+        // Marks accumulated since the last broadcast interval would otherwise die with the
+        // tracker while the final cache save persists their pre-edit stamps — false
+        // up_to_date for edited columns across the restart.
+        service.getDirtyTracker().markDirty("minecraft:overworld", 3, 4);
+        service.getDirtyTracker().markDirty("minecraft:the_end", 7, 8);
+        service.shutdown();
+        assertEquals(2, processor.invalidations.size(), "every dirty dimension must invalidate");
+        assertTrue(processor.invalidationsSeenBeforeShutdown,
+                "invalidations must be enqueued BEFORE the processor shutdown that saves the cache");
+        assertEquals(0, service.getDirtyTracker().pendingCount(), "the tracker must be drained");
     }
 
     // ---- PP-011: lifecycle mailbox (Folia region-thread ingress → pump-owned apply) ----

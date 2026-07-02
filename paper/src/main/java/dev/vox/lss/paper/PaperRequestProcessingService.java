@@ -469,6 +469,13 @@ public class PaperRequestProcessingService {
         // in-flight tick (runtime disables are documented best-effort on Folia).
         this.shuttingDown = true;
         try {
+            // Marks accumulated since the last broadcast interval must still invalidate the
+            // timestamp cache BEFORE its final save (the invalidations ride the shutdown
+            // sentinel take) — otherwise the persisted stamps answer false up_to_date for
+            // edited columns across the restart.
+            for (var entry : this.dirtyTracker.drainAll().entrySet()) {
+                this.offThreadProcessor.invalidateTimestamps(entry.getKey(), entry.getValue());
+            }
             this.offThreadProcessor.shutdown();
         } catch (Exception e) {
             LSSLogger.error("Error shutting down off-thread processor", e);

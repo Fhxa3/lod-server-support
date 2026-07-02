@@ -298,7 +298,17 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                 this.pendingDirtyClears = new HashMap<>();
             }
 
-            if (take.snapshot().shutdown()) return;
+            if (take.snapshot().shutdown()) {
+                // The sentinel take destructively drained the lossless buffers with it. The
+                // per-session events (removals, dirty-clears, generation outcomes) die with
+                // the session, but queued INVALIDATIONS must still hit the cache — shutdown's
+                // final save otherwise persists pre-edit stamps that answer false up_to_date
+                // across the restart.
+                for (var inv : take.invalidations()) {
+                    this.timestampCache.invalidate(inv.dimension(), inv.positions());
+                }
+                return;
+            }
 
             try {
                 this.processCycle(take);
