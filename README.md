@@ -11,6 +11,8 @@ https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 | LSS Version | Minecraft | Fabric | Paper | Voxy | Java |
 |---|---|---|---|---|---|
 | **v0.5.x** | **26.1.x** | Server + Client | Server + Folia (experimental) | 0.2.16-beta+ | 25+ |
+| **v0.5.x+mc1.21.11** | **1.21.11** | Server + Client | Server + Folia (experimental) | 0.2.15-beta+ | 21+ |
+| **v0.5.x+mc1.20.1** | **1.20.1** | Server + Client | Server (no Folia) | — (no public Voxy build) | 17+ |
 | v0.4.x | 26.1.x | Server + Client | Server | 0.2.16-beta+ | 25+ |
 | v0.3.x | 26.1.x | Server + Client | — | 0.2.14-alpha+ | 25+ |
 | v0.2.x | 1.21.11 | Server + Client | Server | 0.2.13-alpha | 21+ |
@@ -18,9 +20,19 @@ https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 v0.5.0 adds **Folia** support (experimental — see the Paper Server section) and a set of
 client-sync correctness fixes; after upgrading, clients rebuild their local LOD cache once
 (the cache format changed), so the first rejoin re-syncs from the server. Paper server
-support is built against Paper 26.1.2 and also runs on Purpur. Paper server admins on the
-older 1.21.11 line should continue using
-[v0.2.3](https://modrinth.com/plugin/lod-server-support/versions).
+support is built against Paper 26.1.2 and also runs on Purpur.
+
+The full v0.5.0 feature set is also published for two older Minecraft versions from
+long-lived support branches:
+
+- **MC 1.21.11** — [`support/mc1.21.11`](https://github.com/VoX/lod-server-support/tree/support/mc1.21.11),
+  released as `v<version>+mc1.21.11` (supersedes v0.2.3 as the recommended version for this line).
+- **MC 1.20.1** — [`support/mc1.20.1`](https://github.com/VoX/lod-server-support/tree/support/mc1.20.1),
+  released as `v<version>+mc1.20.1`. **Note:** Voxy has no public 1.20.1 build, so the bundled
+  Voxy bridge stays dormant there — this line serves players using a private/self-built Voxy
+  port or another LOD renderer integrating via `LSSApi`. Folia is not supported on 1.20.1
+  (only frozen 2023 alpha Folia builds exist and their chunk-loading breaks LSS generation;
+  the plugin declines to load there rather than run degraded).
 
 ## How It Works
 
@@ -40,7 +52,9 @@ The result: players see fully rendered terrain out to hundreds of chunks on mult
 Download from [Modrinth](https://modrinth.com/plugin/lod-server-support):
 
 - **v0.5.x (MC 26.1.x):** `lod-server-support-fabric` — Fabric mod JAR (client + server) — and `lod-server-support-paper` — Paper/Purpur/Folia server plugin
-- **v0.2.x (MC 1.21.11):** `lod-server-support-fabric` + `lod-server-support-paper` — includes Paper plugin
+- **v0.5.x+mc1.21.11 (MC 1.21.11):** the same Fabric + Paper artifacts built for 1.21.11 — the full v0.5.0 feature set (incl. Folia) for the older line
+- **v0.5.x+mc1.20.1 (MC 1.20.1):** the same artifacts built for 1.20.1 (Paper/Purpur only; requires an `LSSApi` consumer — no public Voxy build exists for 1.20.1)
+- **v0.2.x (MC 1.21.11):** `lod-server-support-fabric` + `lod-server-support-paper` — the original 1.21.11 line (superseded by v0.5.x+mc1.21.11)
 
 ## Installation
 
