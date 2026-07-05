@@ -10,6 +10,7 @@ https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 
 | LSS Version | Minecraft | Fabric | Paper | Voxy | Java |
 |---|---|---|---|---|---|
+| **v0.6.x** | **26.2** | Server + Client | Server + Folia (experimental) | 0.2.16-beta+ | 25+ |
 | **v0.5.x** | **26.1.x** | Server + Client | Server + Folia (experimental) | 0.2.16-beta+ | 25+ |
 | **v0.5.x+mc1.21.11** | **1.21.11** | Server + Client | Server + Folia (experimental) | 0.2.15-beta+ | 21+ |
 | **v0.5.x+mc1.20.1** | **1.20.1** | Server + Client | Server (no Folia) | — (no public Voxy build) | 17+ |
@@ -17,10 +18,14 @@ https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
 | v0.3.x | 26.1.x | Server + Client | — | 0.2.14-alpha+ | 25+ |
 | v0.2.x | 1.21.11 | Server + Client | Server | 0.2.13-alpha | 21+ |
 
+v0.6.0 moves the primary Fabric and Paper/Folia builds to **Minecraft 26.2**, carrying the
+full v0.5.x feature set with no gameplay changes. The 26.1.x line stays available at v0.5.1.
+Some 26.2 upstreams (Sodium, C2ME) are currently in alpha/beta.
+
 v0.5.0 adds **Folia** support (experimental — see the Paper Server section) and a set of
 client-sync correctness fixes; after upgrading, clients rebuild their local LOD cache once
 (the cache format changed), so the first rejoin re-syncs from the server. Paper server
-support is built against Paper 26.1.2 and also runs on Purpur.
+support is built against Paper 26.2 and also runs on Purpur.
 
 The full v0.5.0 feature set is also published for two older Minecraft versions from
 long-lived support branches:
@@ -51,6 +56,7 @@ The result: players see fully rendered terrain out to hundreds of chunks on mult
 
 Download from [Modrinth](https://modrinth.com/plugin/lod-server-support):
 
+- **v0.6.x (MC 26.2):** `lod-server-support-fabric` — Fabric mod JAR (client + server) — and `lod-server-support-paper` — Paper/Purpur/Folia server plugin
 - **v0.5.x (MC 26.1.x):** `lod-server-support-fabric` — Fabric mod JAR (client + server) — and `lod-server-support-paper` — Paper/Purpur/Folia server plugin
 - **v0.5.x+mc1.21.11 (MC 1.21.11):** the same Fabric + Paper artifacts built for 1.21.11 — the full v0.5.0 feature set (incl. Folia) for the older line
 - **v0.5.x+mc1.20.1 (MC 1.20.1):** the same artifacts built for 1.20.1 (Paper/Purpur only; requires an `LSSApi` consumer — no public Voxy build exists for 1.20.1)
@@ -71,7 +77,7 @@ Download from [Modrinth](https://modrinth.com/plugin/lod-server-support):
 
 ### Paper Server
 
-Requires Paper, Purpur, or Folia for Minecraft 26.1.2.
+Requires Paper, Purpur, or Folia for Minecraft 26.2.
 
 1. Place `lod-server-support-paper.jar` in the server's `plugins/` directory
 2. Install the Fabric mod **and** [Voxy](https://modrinth.com/mod/voxy) on all clients
@@ -84,20 +90,20 @@ are less tested, so treat it as experimental and report issues. `/reload` is not
 Folia (restart the server instead), and runtime plugin managers (enable/disable without a
 restart) are best-effort.
 
-## Requirements (v0.5.x — MC 26.1.x)
+## Requirements (v0.6.x — MC 26.2)
 
 ### Fabric Server
-- Minecraft 26.1.x
+- Minecraft 26.2
 - Fabric Loader 0.18.4+
 - Fabric API
 - Java 25+
 
 ### Paper Server
-- Paper, Purpur, or Folia (experimental) for Minecraft 26.1.2
+- Paper, Purpur, or Folia (experimental) for Minecraft 26.2
 - Java 25+
 
 ### Client
-- Minecraft 26.1.x
+- Minecraft 26.2
 - Fabric Loader 0.18.4+
 - Fabric API
 - [Voxy](https://modrinth.com/mod/voxy) 0.2.16-beta+
