@@ -353,8 +353,14 @@ public class TwoPlayerGameTests {
                     }
                     // Both holders re-request with their stored stamps: only a delivered
                     // fan-out (done-bit cleared + timestamp invalidated, per player) re-serves.
-                    stateA.addRequest(packed, LSSConstants.epochSeconds() + 10_000);
-                    stateB.addRequest(packed, LSSConstants.epochSeconds() + 10_000);
+                    // Stamp 1L (not epochSeconds()+N): still >0 so the request claimsData and
+                    // proves the done-bit fan-out, but a fresh re-serve re-stamps the cache at
+                    // cycleNow (a large epoch second) which can never satisfy resolvedFromTimestamp's
+                    // cachedTs <= clientTimestamp(1). A future stamp made this racy on 2-core CI —
+                    // whichever holder routed first re-stamped, and the second then short-circuited
+                    // to up_to_date off cachedTs(now) <= now+10000, freezing its section count.
+                    stateA.addRequest(packed, 1L);
+                    stateB.addRequest(packed, 1L);
                     step.set(2);
                     helper.assertTrue(false, "broadcast fired, awaiting both re-serves");
                 }
