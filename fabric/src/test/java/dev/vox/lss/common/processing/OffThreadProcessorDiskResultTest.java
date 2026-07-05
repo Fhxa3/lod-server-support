@@ -297,6 +297,45 @@ class OffThreadProcessorDiskResultTest {
     }
 
     @Test
+    void invalidationOvertakingAnInFlightGenerationSuppressesTheStaleStamp() throws Exception {
+        // Generation twin of invalidationOvertakingAnInFlightRead...: a generation outcome
+        // captured PRE-edit terrain, and the edit's dirty invalidation is applied while the
+        // generation is still in flight. Delivering the outcome must not re-stamp the timestamp
+        // cache or mark diskReadDone, or the client's dirty re-request draws a false up_to_date
+        // and the pre-edit generated terrain seals. Generation tickets never create a dedup
+        // group, so they carry their own in-flight oracle (full-review finding: the gen path
+        // bypassed the disk path's invalidation-overtake guard).
+        var rig = new Rig(true);
+        try {
+            var ticket = escalateToGenTicket(rig, 7, 7); // one disk-first submit, then in-flight gen
+            long packed = PositionUtil.packPosition(7, 7);
+
+            // The edit's invalidation lands while the generation is still in flight...
+            rig.proc.invalidateTimestamps(DIM, new long[]{packed});
+            byte[] bytes = {1, 2};
+            var data = new LoadedColumnData(7, 7, bytes,
+                    bytes.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES);
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), new ArrayList<>(List.of(
+                    new TickSnapshot.GenerationReadyData(rig.uuid, 7, 7, DIM, data,
+                            COLUMN_TS, ticket.submissionOrder()))));
+
+            // ...the generated column is still delivered (better than nothing)...
+            waitFor(() -> !rig.proc.enqueuedColumns.isEmpty(), "stale generated column still delivered");
+            assertFalse(rig.state.hasDiskReadDone(7, 7),
+                    "a stale-against-edit generation must not set the done-bit");
+            assertEquals(0, rig.state.getHeldGenSlots(), "delivery still frees the gen slot");
+
+            // ...and the dirty re-request re-reads the disk (post-edit bytes) instead of
+            // resolving up_to_date/duplicate off a false stamp.
+            rig.state.enqueue(new IncomingRequest(7, 7, COLUMN_TS));
+            rig.proc.postSnapshot(snapshot(DIM, rig.uuid), List.of());
+            waitFor(() -> rig.proc.diskSubmits.size() == 2, "dirty re-request re-reads the disk");
+        } finally {
+            rig.proc.shutdown();
+        }
+    }
+
+    @Test
     void notFoundInvalidatesAStaleTimestampStamp() throws Exception {
         // Region trimmed/deleted outside Minecraft: the position was served (and stamped)
         // once, but disk now says not-found. Without invalidation the stale stamp answers

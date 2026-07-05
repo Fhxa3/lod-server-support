@@ -4,6 +4,7 @@ import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.voxel.ColumnTimestampCache;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 import java.nio.file.Path;
@@ -249,15 +250,31 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                                           long columnTimestamp,
                                           long submissionOrder,
                                           String dimension) {
+        return enqueueLoadedColumn(state, column, columnTimestamp, submissionOrder, dimension, false);
+    }
+
+    /**
+     * As {@link #enqueueLoadedColumn(PlayerState, LoadedColumnData, long, long, String)} but
+     * skips the timestamp-cache stamp when the column is stale against an in-flight edit, so a
+     * dirty re-request re-resolves instead of drawing a false up_to_date. The column is still
+     * enqueued (better than nothing) — only the stamp is withheld.
+     */
+    protected boolean enqueueLoadedColumn(PlayerState state, LoadedColumnData column,
+                                          long columnTimestamp,
+                                          long submissionOrder,
+                                          String dimension,
+                                          boolean staleAgainstEdit) {
         if (column.serializedSections() == null || column.serializedSections().length == 0) {
             return false;
         }
 
         int estimatedBytes = column.serializedSections().length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES;
 
-        // Store timestamp for up-to-date checks
+        // Store timestamp for up-to-date checks (skipped when stale so the edit re-resolves)
         long packed = PositionUtil.packPosition(column.cx(), column.cz());
-        this.timestampCache.put(dimension, packed, columnTimestamp, this.cycleNow);
+        if (!staleAgainstEdit) {
+            this.timestampCache.put(dimension, packed, columnTimestamp, this.cycleNow);
+        }
 
         return buildAndEnqueueColumnPayload(state, column.cx(), column.cz(), dimension,
                 columnTimestamp, submissionOrder,
@@ -396,13 +413,20 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                 this.invalidationDirty = true;
                 this.invalidationCountdown = INVALIDATE_SAVE_MAX_CYCLES;
             }
-            // A disk read in flight for an invalidated position may carry PRE-edit bytes;
-            // delivering it later in this same cycle (or a following one) must not re-stamp
-            // the cache or re-mark diskReadDone, or the client's dirty re-request draws a
-            // false up_to_date and pre-edit terrain seals against both healing ladders.
+            // A disk read OR a generation outcome in flight for an invalidated position may
+            // carry PRE-edit bytes; delivering it later in this same cycle (or a following one)
+            // must not re-stamp the cache or re-mark diskReadDone, or the client's dirty
+            // re-request draws a false up_to_date and pre-edit terrain seals against both
+            // healing ladders. Disk reads are tracked via their dedup group; generation does
+            // not dedup, so it has its own refcounted in-flight oracle (generationInFlight).
             for (long packed : inv.positions()) {
                 if (this.dedupTracker.hasGroup(packed, inv.dimension())) {
                     this.invalidatedInFlight
+                            .computeIfAbsent(inv.dimension(), k -> new LongOpenHashSet())
+                            .add(packed);
+                }
+                if (isGenerationInFlight(inv.dimension(), packed)) {
+                    this.generationStale
                             .computeIfAbsent(inv.dimension(), k -> new LongOpenHashSet())
                             .add(packed);
                 }
@@ -449,6 +473,51 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
         if (set == null || !set.remove(packed)) return false;
         if (set.isEmpty()) this.invalidatedInFlight.remove(dimension);
         return true;
+    }
+
+    /** Positions with a generation ticket admitted (via disk-not-found escalation) but whose
+     *  outcome has not yet drained, refcounted because generation does NOT dedup — two players
+     *  can generate the same column independently, and an overtaking edit must taint EVERY
+     *  in-flight outcome, not just the first to drain (processing-thread only). */
+    private final Map<String, Long2IntOpenHashMap> generationInFlight = new HashMap<>();
+
+    /** Subset of {@link #generationInFlight} positions overtaken by a dirty invalidation before
+     *  their outcome drained. The generation twin of {@link #invalidatedInFlight}: a tainted
+     *  outcome carries PRE-edit terrain, so it must not mark diskReadDone or re-stamp the
+     *  timestamp cache. Held until the LAST concurrent generation for the position drains. */
+    private final Map<String, LongOpenHashSet> generationStale = new HashMap<>();
+
+    private void addGenerationInFlight(String dimension, long packed) {
+        this.generationInFlight.computeIfAbsent(dimension, k -> new Long2IntOpenHashMap()).addTo(packed, 1);
+    }
+
+    private boolean isGenerationInFlight(String dimension, long packed) {
+        var counts = this.generationInFlight.get(dimension);
+        return counts != null && counts.containsKey(packed);
+    }
+
+    /** Decrement the in-flight refcount for a drained generation outcome and report whether an
+     *  edit tainted this position while it was buffered. The stale flag survives until the last
+     *  concurrent generation for the position drains. Called for EVERY drained outcome so the
+     *  refcount cannot leak; a hypothetical never-delivered outcome degrades to at most a benign
+     *  "treat the next generation here as stale" (one extra re-resolution), never a sealed
+     *  stamp. */
+    private boolean consumeGenerationInFlight(String dimension, long packed) {
+        var staleSet = this.generationStale.get(dimension);
+        boolean stale = staleSet != null && staleSet.contains(packed);
+        var counts = this.generationInFlight.get(dimension);
+        if (counts != null && counts.containsKey(packed)) {
+            int remaining = counts.addTo(packed, -1) - 1; // addTo returns the PREVIOUS value
+            if (remaining <= 0) {
+                counts.remove(packed);
+                if (counts.isEmpty()) this.generationInFlight.remove(dimension);
+                if (staleSet != null) {
+                    staleSet.remove(packed);
+                    if (staleSet.isEmpty()) this.generationStale.remove(dimension);
+                }
+            }
+        }
+        return stale;
     }
 
     // ---- Phase 2: Drain disk reader results (with cross-player dedup dispatch) ----
@@ -593,6 +662,7 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                                      int cx, int cz, PendingRequest pending, String dimension) {
         if (pending != null && pending.type() == RequestType.GENERATION && this.generationAvailable) {
             if (state.tryAdmit(new PendingRequest(cx, cz, RequestType.GENERATION, SlotType.GENERATION, pending.claimsData()))) {
+                addGenerationInFlight(dimension, packed);
                 this.ctx.generationTicketRequests().add(new GenerationTicketRequest(
                         playerUuid, cx, cz, dimension, this.ctx.sequence().next()));
             } else {
@@ -608,6 +678,14 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     private void processGenerationReady(List<TickSnapshot.GenerationReadyData> generationReady,
                                          TickSnapshot snapshot) {
         for (var entry : generationReady) {
+            int cx = entry.cx();
+            int cz = entry.cz();
+            long packed = PositionUtil.packPosition(cx, cz);
+            // Retire the in-flight generation record for EVERY drained outcome (delivered,
+            // all-air, not-generated, player gone, dimension changed) so the refcount cannot
+            // leak; capture whether a dirty edit overtook this outcome while it was buffered.
+            boolean genStale = consumeGenerationInFlight(entry.dimension(), packed);
+
             var state = this.players.get(entry.playerUuid());
             if (state == null) continue;
             // A dimension change replaces the player's state (removePlayer + registerPlayer,
@@ -615,24 +693,29 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
             // skip them instead of poisoning the fresh state (their pending died with it).
             String current = snapshot.playerDimensions().get(entry.playerUuid());
             if (current == null || !current.equals(entry.dimension())) continue;
-            int cx = entry.cx();
-            int cz = entry.cz();
             var pending = state.removePendingByPosition(cx, cz);
-            long packed = PositionUtil.packPosition(cx, cz);
 
             if (entry.columnData() == null) {
                 this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(entry.playerUuid(), packed, state));
             } else {
-                state.markDiskReadDone(cx, cz);
+                // A dirty invalidation overtook this generation while its outcome was buffered:
+                // the serialized bytes predate the edit. Deliver the column (better than
+                // nothing), but leave diskReadDone and the timestamp cache unset so the client's
+                // dirty re-request re-resolves instead of drawing a false up_to_date — the
+                // generation twin of the stale guard in drainDiskResultsForAllPlayers.
+                if (!genStale) {
+                    state.markDiskReadDone(cx, cz);
+                }
                 byte[] genSections = entry.columnData().serializedSections();
                 boolean allAir = genSections == null || genSections.length == 0;
                 boolean sent = !allAir && this.enqueueLoadedColumn(state, entry.columnData(),
-                        entry.columnTimestamp(), entry.submissionOrder(), entry.dimension());
+                        entry.columnTimestamp(), entry.submissionOrder(), entry.dimension(), genStale);
                 if (!sent) {
-                    if (allAir) {
+                    if (allAir && !genStale) {
                         // Stamp so future resyncs at this timestamp converge to a cheap
                         // up_to_date instead of re-resolving every session (the data path
-                        // stamps inside enqueueLoadedColumn; all-air skips it).
+                        // stamps inside enqueueLoadedColumn; all-air skips it). A stale outcome
+                        // skips the stamp so the edited column re-resolves.
                         this.timestampCache.put(entry.dimension(), packed,
                                 entry.columnTimestamp(), this.cycleNow);
                     }
