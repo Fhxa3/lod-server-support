@@ -369,9 +369,22 @@ for (( run=1; run<=CLIENT_RUNS; run++ )); do
         soak_check_deadline
         sleep 1
     done
-    wait "$CLIENT_PID" 2>/dev/null || true
+    # Capture the client exit status instead of discarding it. A controlled disconnect halts
+    # the client with 0 (BenchmarkHook writes its disconnect row, flushes the cache, then
+    # halt(0)); a crash exits nonzero AND skips the disconnect row. This log is diagnostic —
+    # the hard gate is the checker's per-run disconnect-row requirement, so a spurious gradle
+    # exit code never false-reds a run here.
+    if wait "$CLIENT_PID" 2>/dev/null; then
+        CLIENT_EXIT=0
+    else
+        CLIENT_EXIT=$?
+    fi
     CLIENT_PID=""
-    echo "[soak] Client run $run exited"
+    if [[ "$CLIENT_EXIT" -ne 0 ]]; then
+        echo "[soak] ERROR: Client run $run exited nonzero ($CLIENT_EXIT) — likely crashed before writing its disconnect row (the checker will flag the missing disconnect)"
+    else
+        echo "[soak] Client run $run exited cleanly"
+    fi
     if [[ -f "$CLIENT_RUN_DIR/soak-results/client.jsonl" ]]; then
         mv "$CLIENT_RUN_DIR/soak-results/client.jsonl" "$CLIENT_RUN_DIR/soak-results/client-run$run.jsonl"
     else

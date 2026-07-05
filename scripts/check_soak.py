@@ -1998,6 +1998,14 @@ def run_checker(results_dir, scenario):
         snaps, actions = load_client_run(run_path, warnings, unknown_keys, unknown_events)
         if not snaps:
             violations.append(Violation("input", run_path.name, "zero snapshot rows", {}))
+        elif not any(s.get("event") == "disconnect" for s in snaps):
+            # The client writes a disconnect row on EVERY controlled exit (kick between runs or
+            # server halt), then halt(0). Its absence means the client JVM died mid-run — the
+            # mirror of the server end-event requirement below. As a silent pass this let a
+            # crash after the main phase (which also skips the synchronous cache flush) produce
+            # a clean PASS.
+            violations.append(Violation("run-completion", run_path.name,
+                                        "no disconnect event — client died mid-run (uncontrolled exit)", {}))
         runs[n] = snaps
         run_actions[n] = actions
     for extra in sorted(results_dir.glob("client-run*.jsonl")):
@@ -2392,6 +2400,33 @@ def selftest():
             "action segmentation: action row must be returned separately"
         cases[0] += 1
         assert not uk and not ue, f"action segmentation: unexpected unknowns {uk} {ue}"
+    finally:
+        tmp_path.unlink()
+
+    # --- Client disconnect-row completion gate: present passes, absent caught ---
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        tf.write(json.dumps({"event": "snapshot", "wallMs": 1000, "dimension": "minecraft:overworld"}) + "\n")
+        tf.write(json.dumps({"event": "disconnect", "wallMs": 2000, "dimension": "minecraft:overworld",
+                             "reason": "kicked"}) + "\n")
+        tmp_path = Path(tf.name)
+    try:
+        w, uk, ue = [], set(), set()
+        snaps, _ = load_client_run(tmp_path, w, uk, ue)
+        cases[0] += 1
+        assert any(s.get("event") == "disconnect" for s in snaps), \
+            "disconnect gate: a controlled exit's disconnect row must be visible to the completion check"
+    finally:
+        tmp_path.unlink()
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        tf.write(json.dumps({"event": "snapshot", "wallMs": 1000, "dimension": "minecraft:overworld"}) + "\n")
+        tf.write(json.dumps({"event": "snapshot", "wallMs": 2000, "dimension": "minecraft:overworld"}) + "\n")
+        tmp_path = Path(tf.name)
+    try:
+        w, uk, ue = [], set(), set()
+        snaps, _ = load_client_run(tmp_path, w, uk, ue)
+        cases[0] += 1
+        assert not any(s.get("event") == "disconnect" for s in snaps), \
+            "disconnect gate: a run that crashed before its disconnect row must be caught (none present)"
     finally:
         tmp_path.unlink()
 
