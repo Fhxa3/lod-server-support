@@ -83,6 +83,14 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     private int saveCounter;
     private int consecutiveErrors;
     private long cycleNow; // cached epochSeconds for current processing cycle
+    // Per-cycle phase-completion flags (processing-thread only): a failed cycle re-queues only
+    // the lossless events whose phase did NOT complete, so an already-applied phase is never
+    // re-run. Re-running a completed phase is NOT idempotent — re-delivering a consumed
+    // generation outcome would find its stale mark already consumed and re-stamp pre-edit
+    // terrain (false up_to_date), and re-applying a removal could sweep a re-registered
+    // same-UUID player's fresh dedup/generation tracking.
+    private boolean phase1EventsApplied;
+    private boolean generationReadyApplied;
 
     // WS4 durable invalidation: a dirty-broadcast invalidation removes cache entries in memory;
     // without a prompt save, a crash within the ~5-min periodic window resurrects them (false
@@ -249,15 +257,31 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                                           long columnTimestamp,
                                           long submissionOrder,
                                           String dimension) {
+        return enqueueLoadedColumn(state, column, columnTimestamp, submissionOrder, dimension, false);
+    }
+
+    /**
+     * As {@link #enqueueLoadedColumn(PlayerState, LoadedColumnData, long, long, String)} but
+     * skips the timestamp-cache stamp when the column is stale against an in-flight edit, so a
+     * dirty re-request re-resolves instead of drawing a false up_to_date. The column is still
+     * enqueued (better than nothing) — only the stamp is withheld.
+     */
+    protected boolean enqueueLoadedColumn(PlayerState state, LoadedColumnData column,
+                                          long columnTimestamp,
+                                          long submissionOrder,
+                                          String dimension,
+                                          boolean staleAgainstEdit) {
         if (column.serializedSections() == null || column.serializedSections().length == 0) {
             return false;
         }
 
         int estimatedBytes = column.serializedSections().length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES;
 
-        // Store timestamp for up-to-date checks
+        // Store timestamp for up-to-date checks (skipped when stale so the edit re-resolves)
         long packed = PositionUtil.packPosition(column.cx(), column.cz());
-        this.timestampCache.put(dimension, packed, columnTimestamp, this.cycleNow);
+        if (!staleAgainstEdit) {
+            this.timestampCache.put(dimension, packed, columnTimestamp, this.cycleNow);
+        }
 
         return buildAndEnqueueColumnPayload(state, column.cx(), column.cz(), dimension,
                 columnTimestamp, submissionOrder,
@@ -321,9 +345,11 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                 // on a failed cycle permanently loses player removals (leaked slots/dedup
                 // groups), generation outcomes (stranded pending generations), and
                 // dirty-clears/invalidations (up_to_date answered for stale content). Re-queue
-                // them so the next cycle retries — every one of these events is idempotent, so
-                // re-applying any a partial cycle already applied is harmless (a re-sent column
-                // or up_to_date is position-idempotent on the client).
+                // only the events whose phase did NOT complete (via the phase-completion flags),
+                // so a fully-applied phase is never re-run — re-applying is NOT idempotent (a
+                // re-delivered generation outcome finds its stale mark consumed and re-stamps
+                // pre-edit terrain; a re-applied removal can sweep a re-registered player's
+                // fresh tracking).
                 requeueLosslessEvents(take);
                 if (++this.consecutiveErrors >= 10) {
                     LSSLogger.error("Processing thread hit " + this.consecutiveErrors + " consecutive errors, backing off");
@@ -334,20 +360,26 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     }
 
     /**
-     * Re-inject a failed cycle's lossless events into the mailbox so the next cycle retries
-     * them. Ordering does not matter: removals, invalidations, and dirty-clears are set/map
-     * removals (idempotent), and generation outcomes are keyed by position (a duplicate
-     * response is idempotent on the client). The snapshot is intentionally NOT restored — it
-     * is latest-wins and the next tick posts a fresh one within ~50 ms.
+     * Re-inject a failed cycle's not-yet-applied lossless events into the mailbox so the next
+     * cycle retries them, gated by the phase-completion flags so a completed phase is never
+     * re-run. A completed phase's events would NOT be idempotent on re-application: a
+     * re-delivered generation outcome finds its stale mark already consumed and re-stamps
+     * pre-edit terrain, and a re-applied removal can sweep a re-registered same-UUID player's
+     * fresh dedup/generation tracking. The snapshot is intentionally NOT restored — it is
+     * latest-wins and the next tick posts a fresh one within ~50 ms.
      */
     private void requeueLosslessEvents(MailboxTake take) {
         synchronized (this.mailboxLock) {
-            this.pendingGenerationReady.addAll(take.generationReady());
-            this.pendingRemovals.addAll(take.removals());
-            this.pendingInvalidations.addAll(take.invalidations());
-            for (var entry : take.dirtyClears().entrySet()) {
-                this.pendingDirtyClears.merge(entry.getKey(), entry.getValue(),
-                        (existing, taken) -> { existing.addAll(taken); return existing; });
+            if (!this.generationReadyApplied) {
+                this.pendingGenerationReady.addAll(take.generationReady());
+            }
+            if (!this.phase1EventsApplied) {
+                this.pendingRemovals.addAll(take.removals());
+                this.pendingInvalidations.addAll(take.invalidations());
+                for (var entry : take.dirtyClears().entrySet()) {
+                    this.pendingDirtyClears.merge(entry.getKey(), entry.getValue(),
+                            (existing, taken) -> { existing.addAll(taken); return existing; });
+                }
             }
         }
     }
@@ -355,10 +387,14 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     private void processCycle(MailboxTake take) {
         this.cycleNow = LSSConstants.epochSeconds();
         this.ctx.diagnostics().resetTickCounters();
+        this.phase1EventsApplied = false;
+        this.generationReadyApplied = false;
 
         applyEvents(take);
+        this.phase1EventsApplied = true; // invalidations, removals, dirty-clears fully applied
         drainDiskResultsForAllPlayers(take.snapshot());
         processGenerationReady(take.generationReady(), take.snapshot());
+        this.generationReadyApplied = true; // every generation outcome consumed
         routeIncomingRequests(take.snapshot());
 
         if (++this.evictionCounter >= EVICTION_INTERVAL_CYCLES) {
@@ -396,10 +432,13 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                 this.invalidationDirty = true;
                 this.invalidationCountdown = INVALIDATE_SAVE_MAX_CYCLES;
             }
-            // A disk read in flight for an invalidated position may carry PRE-edit bytes;
-            // delivering it later in this same cycle (or a following one) must not re-stamp
-            // the cache or re-mark diskReadDone, or the client's dirty re-request draws a
-            // false up_to_date and pre-edit terrain seals against both healing ladders.
+            // A disk read OR a generation outcome in flight for an invalidated position may
+            // carry PRE-edit bytes; delivering it later in this same cycle (or a following one)
+            // must not re-stamp the cache or re-mark diskReadDone, or the client's dirty
+            // re-request draws a false up_to_date and pre-edit terrain seals against both
+            // healing ladders. Disk reads are tracked via their dedup group; generation does
+            // not dedup, so it has its own per-player in-flight oracle (generationInFlight),
+            // tainted here by markGenerationStale.
             for (long packed : inv.positions()) {
                 if (this.dedupTracker.hasGroup(packed, inv.dimension())) {
                     this.invalidatedInFlight
@@ -407,13 +446,16 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                             .add(packed);
                 }
             }
+            markGenerationStale(inv.dimension(), inv.positions());
         }
 
         // Player removals (disconnect or dimension change): release the player's dedup groups
-        // and the attached players' pending entries. The removed state itself is simply dropped
-        // — its slot counts die with it, so nothing can leak.
+        // and the attached players' pending entries, and drop its generation in-flight tracking
+        // (a generation abandoned before its outcome drains would otherwise leak).
+        // The removed state itself is simply dropped — its slot counts die with it.
         for (UUID removed : take.removals()) {
             cleanupDedupGroups(this.dedupTracker.removePlayer(removed));
+            removeGenerationTracking(removed);
         }
 
         for (var entry : take.dirtyClears().entrySet()) {
@@ -449,6 +491,90 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
         if (set == null || !set.remove(packed)) return false;
         if (set.isEmpty()) this.invalidatedInFlight.remove(dimension);
         return true;
+    }
+
+    /** Positions with a generation ticket admitted (via disk-not-found escalation in
+     *  {@link #handleDiskNotFound}, or the router's direct-generation path) but whose outcome
+     *  has not yet drained, keyed by player then dimension. Generation does NOT dedup, so —
+     *  unlike the disk path, which tracks in-flight reads through their dedup group — this map
+     *  is generation's own in-flight oracle. Keyed by PLAYER so {@link #removeGenerationTracking}
+     *  can sweep it on removal (disconnect / dimension change) exactly as {@link #cleanupDedupGroups}
+     *  sweeps the disk path's {@link #invalidatedInFlight}: a generation abandoned before its
+     *  outcome drains therefore cannot leak. Processing-thread only. */
+    private final Map<UUID, Map<String, LongOpenHashSet>> generationInFlight = new HashMap<>();
+
+    /** Subset of {@link #generationInFlight} positions overtaken by a dirty invalidation before
+     *  their outcome drained, same keying. The generation twin of {@link #invalidatedInFlight}:
+     *  a tainted outcome carries PRE-edit terrain, so it must not mark diskReadDone or re-stamp
+     *  the timestamp cache. Per-player, so two players generating the same column taint
+     *  independently and neither pins the other's flag. Processing-thread only. */
+    private final Map<UUID, Map<String, LongOpenHashSet>> generationStale = new HashMap<>();
+
+    /** Record an admitted generation as in-flight. Package-private so the router's direct
+     *  generation path (no disk reader) registers it too — both gen-ticket producers must, or
+     *  an overtaking edit on the unregistered path re-stamps pre-edit terrain as up_to_date. */
+    void addGenerationInFlight(UUID player, String dimension, long packed) {
+        this.generationInFlight
+                .computeIfAbsent(player, k -> new HashMap<>())
+                .computeIfAbsent(dimension, k -> new LongOpenHashSet())
+                .add(packed);
+    }
+
+    /** Taint every in-flight generation among {@code positions}: its buffered outcome predates
+     *  the edit, so at delivery it must skip the stamp + diskReadDone and re-resolve. Iterates
+     *  only players that currently have in-flight generations (usually none), so a
+     *  no-generation invalidation batch costs a single map-empty check. */
+    private void markGenerationStale(String dimension, long[] positions) {
+        if (this.generationInFlight.isEmpty()) return;
+        LongOpenHashSet invalidated = null; // built lazily, only if some player generates here
+        for (var entry : this.generationInFlight.entrySet()) {
+            var inFlight = entry.getValue().get(dimension);
+            if (inFlight == null || inFlight.isEmpty()) continue;
+            if (invalidated == null) invalidated = new LongOpenHashSet(positions);
+            for (long packed : inFlight) {
+                if (invalidated.contains(packed)) {
+                    this.generationStale
+                            .computeIfAbsent(entry.getKey(), k -> new HashMap<>())
+                            .computeIfAbsent(dimension, k -> new LongOpenHashSet())
+                            .add(packed);
+                }
+            }
+        }
+    }
+
+    /** Retire one player's drained generation outcome and report whether an edit tainted it
+     *  while it was buffered. Called for every drained outcome; a generation abandoned before
+     *  its outcome drains (the player disconnected or changed dimension) is retired instead by
+     *  {@link #removeGenerationTracking} on the removal event, so nothing leaks. */
+    private boolean consumeGenerationInFlight(UUID player, String dimension, long packed) {
+        boolean stale = false;
+        var staleDims = this.generationStale.get(player);
+        if (staleDims != null) {
+            var staleSet = staleDims.get(dimension);
+            if (staleSet != null && staleSet.remove(packed)) {
+                stale = true;
+                if (staleSet.isEmpty()) staleDims.remove(dimension);
+                if (staleDims.isEmpty()) this.generationStale.remove(player);
+            }
+        }
+        var inFlightDims = this.generationInFlight.get(player);
+        if (inFlightDims != null) {
+            var inFlight = inFlightDims.get(dimension);
+            if (inFlight != null) {
+                inFlight.remove(packed);
+                if (inFlight.isEmpty()) inFlightDims.remove(dimension);
+                if (inFlightDims.isEmpty()) this.generationInFlight.remove(player);
+            }
+        }
+        return stale;
+    }
+
+    /** Drop a departed player's generation tracking (disconnect / dimension change) so a
+     *  generation abandoned before its outcome drained cannot leak — the generation analogue of
+     *  {@link #cleanupDedupGroups} reclaiming the disk path's {@link #invalidatedInFlight}. */
+    private void removeGenerationTracking(UUID player) {
+        this.generationInFlight.remove(player);
+        this.generationStale.remove(player);
     }
 
     // ---- Phase 2: Drain disk reader results (with cross-player dedup dispatch) ----
@@ -593,6 +719,7 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
                                      int cx, int cz, PendingRequest pending, String dimension) {
         if (pending != null && pending.type() == RequestType.GENERATION && this.generationAvailable) {
             if (state.tryAdmit(new PendingRequest(cx, cz, RequestType.GENERATION, SlotType.GENERATION, pending.claimsData()))) {
+                addGenerationInFlight(playerUuid, dimension, packed);
                 this.ctx.generationTicketRequests().add(new GenerationTicketRequest(
                         playerUuid, cx, cz, dimension, this.ctx.sequence().next()));
             } else {
@@ -608,6 +735,15 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
     private void processGenerationReady(List<TickSnapshot.GenerationReadyData> generationReady,
                                          TickSnapshot snapshot) {
         for (var entry : generationReady) {
+            int cx = entry.cx();
+            int cz = entry.cz();
+            long packed = PositionUtil.packPosition(cx, cz);
+            // Retire the in-flight generation record for EVERY drained outcome (delivered,
+            // all-air, not-generated, player gone, dimension changed); an outcome that never
+            // drains because the player left is retired by removeGenerationTracking on the
+            // removal event instead. Capture whether a dirty edit overtook this buffered outcome.
+            boolean genStale = consumeGenerationInFlight(entry.playerUuid(), entry.dimension(), packed);
+
             var state = this.players.get(entry.playerUuid());
             if (state == null) continue;
             // A dimension change replaces the player's state (removePlayer + registerPlayer,
@@ -615,24 +751,29 @@ public abstract class OffThreadProcessor<PlayerState extends AbstractPlayerReque
             // skip them instead of poisoning the fresh state (their pending died with it).
             String current = snapshot.playerDimensions().get(entry.playerUuid());
             if (current == null || !current.equals(entry.dimension())) continue;
-            int cx = entry.cx();
-            int cz = entry.cz();
             var pending = state.removePendingByPosition(cx, cz);
-            long packed = PositionUtil.packPosition(cx, cz);
 
             if (entry.columnData() == null) {
                 this.ctx.sendActions().add(new SendAction.ColumnNotGenerated(entry.playerUuid(), packed, state));
             } else {
-                state.markDiskReadDone(cx, cz);
+                // A dirty invalidation overtook this generation while its outcome was buffered:
+                // the serialized bytes predate the edit. Deliver the column (better than
+                // nothing), but leave diskReadDone and the timestamp cache unset so the client's
+                // dirty re-request re-resolves instead of drawing a false up_to_date — the
+                // generation twin of the stale guard in drainDiskResultsForAllPlayers.
+                if (!genStale) {
+                    state.markDiskReadDone(cx, cz);
+                }
                 byte[] genSections = entry.columnData().serializedSections();
                 boolean allAir = genSections == null || genSections.length == 0;
                 boolean sent = !allAir && this.enqueueLoadedColumn(state, entry.columnData(),
-                        entry.columnTimestamp(), entry.submissionOrder(), entry.dimension());
+                        entry.columnTimestamp(), entry.submissionOrder(), entry.dimension(), genStale);
                 if (!sent) {
-                    if (allAir) {
+                    if (allAir && !genStale) {
                         // Stamp so future resyncs at this timestamp converge to a cheap
                         // up_to_date instead of re-resolving every session (the data path
-                        // stamps inside enqueueLoadedColumn; all-air skips it).
+                        // stamps inside enqueueLoadedColumn; all-air skips it). A stale outcome
+                        // skips the stamp so the edited column re-resolves.
                         this.timestampCache.put(entry.dimension(), packed,
                                 entry.columnTimestamp(), this.cycleNow);
                     }
