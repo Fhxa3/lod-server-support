@@ -191,6 +191,13 @@ ok-semantics — checker-verified). 9 distinct fixes applied:
   with merged snapshots (breaks latest-wins postSnapshot, violates the bandwidth-limiter
   single-flusher invariant, big redesign for no user-visible freshness gain); disk-reads-only on
   Folia (loses loaded-chunk freshness for no reason once probes were proven safe).
+  *Revisited (2026-07-03, shipped v0.5.1):* a narrower regionized-probe design was adopted — probes
+  run on the chunk's owning region thread (`EntityScheduler` + `isOwnedByCurrentRegion`) and publish
+  into a per-player batch that the pump consumes, so the pump stays the single flusher and
+  latest-wins postSnapshot is untouched (the specific objections above do not apply). A one-tick
+  hold-release aligns each request with its probe result. Gated `regionizedProbing = IS_FOLIA`;
+  motivation is ownership-contract correctness (off-owner palette reads), not a freshness gain —
+  still experimental. See `PaperRequestProcessingService` + `RegionProbeSchedulingTest`.
 - **D3 — Lifecycle mailbox for cross-thread ingress (2026-07-02).** On Folia, handshake
   registration and PlayerQuit arrive on region threads; both now enqueue into a CLQ mailbox
   drained at the top of tick(), keeping register/remove single-owner on the pump (fixes the
