@@ -73,7 +73,7 @@ class ClientColumnProcessor {
                                 long columnTimestamp,
                                 java.util.function.Supplier<byte[]> sectionBytesSupplier,
                                 int sectionBytesLength,
-                                boolean isZstd, boolean resync) {}
+                                boolean resync) {}
 
     private final ConcurrentLinkedQueue<QueuedColumn> columnQueue = new ConcurrentLinkedQueue<>();
     private final AtomicInteger queueSize = new AtomicInteger();
@@ -119,7 +119,7 @@ class ClientColumnProcessor {
         if (admits(this.queueSize.get(), this.queuedBytes.get(), payloadBytes)) {
             this.columnQueue.add(new QueuedColumn(payload.dimension(),
                     payload.chunkX(), payload.chunkZ(), payload.columnTimestamp(),
-                    () -> sections, payloadBytes, false, resync));
+                    () -> sections, payloadBytes, resync));
             this.queueSize.incrementAndGet();
             this.queuedBytes.addAndGet(payloadBytes);
         } else {
@@ -135,7 +135,7 @@ class ClientColumnProcessor {
         if (admits(this.queueSize.get(), this.queuedBytes.get(), payloadBytes)) {
             this.columnQueue.add(new QueuedColumn(payload.dimension(),
                     payload.chunkX(), payload.chunkZ(), payload.columnTimestamp(),
-                    payload::decompressedSections, payloadBytes, true, resync));
+                    payload::decompressedSections, payloadBytes, resync));
             this.queueSize.incrementAndGet();
             this.queuedBytes.addAndGet(payloadBytes);
         } else {

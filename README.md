@@ -2,6 +2,20 @@
 
 Distributes LOD (Level of Detail) chunk data from servers to connected clients over a custom networking protocol. Built primarily as a multiplayer backend for [Voxy](https://modrinth.com/mod/voxy) — clients request distant chunks in batches, the server reads them from disk or memory and streams the data back, enabling Voxy to render terrain far beyond the vanilla render distance on multiplayer servers without the need to travel there first.
 
+通过自定义网络协议，将Voxy的LOD区块数据从服务器分发给已连接的客户端，使 Voxy 能够在多人游戏服务器上渲染远超原版渲染距离的地形。
+
+**新增Zstd 压缩**：服务端对 VoxelColumn 区块数据使用 Zstd 压缩后传输，在支持的客户端上自动启用。
+
+**Add Zstd compression**: the server compresses VoxelColumn section data with Zstd before sending, automatically enabled for clients.
+
+经过测试，平均可节省 40-80% 带宽，通过配置文件中`zstdCompressionLevel`可调整压缩级别（1-19，默认 3）；压缩在独立处理线程上运行，对服务器主线程影响极小。`/lsslod diag` 可查看实时压缩率。
+
+Saves 40-80% bandwidth on average with negligible CPU impact (compression runs on a dedicated processing thread). Adjustable via `zstdCompressionLevel` (1-19, default 3). Check `/lsslod diag` for real-time compression ratio.
+
+对于非魔改版和原版minecraft，由于未声明压缩支持，服务端自动回退到未压缩传输。
+
+Also, vanilla clients and clients without zstd capability automatically fall back to uncompressed data.
+
 Supports **Fabric** clients and **Fabric**, **Paper**, **Purpur**, **Folia** servers.
 
 https://github.com/user-attachments/assets/721fb344-890e-4e03-ab36-539444427f7b
