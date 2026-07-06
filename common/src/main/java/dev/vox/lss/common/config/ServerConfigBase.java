@@ -23,6 +23,8 @@ public abstract class ServerConfigBase extends JsonConfig {
     public int syncOnLoadConcurrencyLimitPerPlayer = 200;
     public int generationConcurrencyLimitPerPlayer = 16;
     public int perDimensionTimestampCacheSizeMB = 32;
+    public int zstdCompressionLevel = 3;
+    public int zstdMinCompressBytes = 256;
 
     @Override
     protected String getFileName() {
@@ -42,5 +44,7 @@ public abstract class ServerConfigBase extends JsonConfig {
         syncOnLoadConcurrencyLimitPerPlayer = Math.clamp(syncOnLoadConcurrencyLimitPerPlayer, LSSConstants.MIN_CONCURRENCY_LIMIT, LSSConstants.MAX_CONCURRENCY_LIMIT);
         generationConcurrencyLimitPerPlayer = Math.clamp(generationConcurrencyLimitPerPlayer, LSSConstants.MIN_CONCURRENCY_LIMIT, LSSConstants.MAX_CONCURRENCY_LIMIT);
         perDimensionTimestampCacheSizeMB = Math.clamp(perDimensionTimestampCacheSizeMB, LSSConstants.MIN_TIMESTAMP_CACHE_SIZE_MB, LSSConstants.MAX_TIMESTAMP_CACHE_SIZE_MB);
+        zstdCompressionLevel = Math.clamp(zstdCompressionLevel, 1, 19);
+        zstdMinCompressBytes = Math.clamp(zstdMinCompressBytes, 0, 1_048_576);
     }
 }

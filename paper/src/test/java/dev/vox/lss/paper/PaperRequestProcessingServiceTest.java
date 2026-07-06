@@ -339,7 +339,7 @@ class PaperRequestProcessingServiceTest {
         var old = service.registerPlayer(player, 1);
         old.addRequest(1, 1, -1L);
         long packed = PositionUtil.packPosition(1, 1);
-        old.addReadyPayload(new QueuedPayload<>(new byte[]{1}, 1, 1L, packed));
+        old.addReadyPayload(new QueuedPayload<>(new PaperOffThreadProcessor.PaperQueuedPayload(PaperPayloadHandler.ID_VOXEL_COLUMN, new byte[]{1}), 1, 1L, packed));
 
         var end = level(Level.END);  // build the mock BEFORE opening the when() stub (no nested stubbing)
         when(player.level()).thenReturn(end);
@@ -409,8 +409,8 @@ class PaperRequestProcessingServiceTest {
         var state = service.registerPlayer(player, 1);
         long p1 = PositionUtil.packPosition(10, 11);
         long p2 = PositionUtil.packPosition(12, 13);
-        state.addReadyPayload(new QueuedPayload<>(new byte[]{1}, 8, 1L, p1));
-        state.addReadyPayload(new QueuedPayload<>(new byte[]{2}, 8, 2L, p2));
+        state.addReadyPayload(new QueuedPayload<>(new PaperOffThreadProcessor.PaperQueuedPayload(PaperPayloadHandler.ID_VOXEL_COLUMN, new byte[]{1}), 8, 1L, p1));
+        state.addReadyPayload(new QueuedPayload<>(new PaperOffThreadProcessor.PaperQueuedPayload(PaperPayloadHandler.ID_VOXEL_COLUMN, new byte[]{2}), 8, 2L, p2));
         service.setColumnPayloadSender((s, data) -> { throw new IllegalStateException("wire down"); });
 
         awaitBandwidthWindow();
@@ -433,15 +433,15 @@ class PaperRequestProcessingServiceTest {
         var uuid = UUID.randomUUID();
         var player = playerIn(uuid, level(Level.OVERWORLD));
         var state = service.registerPlayer(player, 1);
-        state.addReadyPayload(new QueuedPayload<>(new byte[]{7, 7}, 8, 1L, PositionUtil.packPosition(1, 0)));
-        var sent = new ArrayList<byte[]>();
+        state.addReadyPayload(new QueuedPayload<>(new PaperOffThreadProcessor.PaperQueuedPayload(PaperPayloadHandler.ID_VOXEL_COLUMN, new byte[]{7, 7}), 8, 1L, PositionUtil.packPosition(1, 0)));
+        var sent = new ArrayList<PaperOffThreadProcessor.PaperQueuedPayload>();
         service.setColumnPayloadSender((s, data) -> sent.add(data));
 
         awaitBandwidthWindow();
         service.tick();
 
         assertEquals(1, sent.size());
-        assertArrayEquals(new byte[]{7, 7}, sent.get(0));
+        assertArrayEquals(new byte[]{7, 7}, sent.get(0).data());
         assertTrue(processor.dirtyClears.isEmpty(), "a clean flush must not clear done-bits");
     }
 

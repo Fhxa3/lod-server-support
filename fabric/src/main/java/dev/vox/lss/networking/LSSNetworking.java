@@ -6,6 +6,7 @@ import dev.vox.lss.networking.payloads.DirtyColumnsS2CPayload;
 import dev.vox.lss.networking.payloads.HandshakeC2SPayload;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
 import dev.vox.lss.networking.payloads.VoxelColumnS2CPayload;
+import dev.vox.lss.networking.payloads.VoxelColumnZstdS2CPayload;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 
 public class LSSNetworking {
@@ -37,6 +38,10 @@ public class LSSNetworking {
         PayloadTypeRegistry.clientboundPlay().register(
                 VoxelColumnS2CPayload.TYPE,
                 VoxelColumnS2CPayload.CODEC
+        );
+        PayloadTypeRegistry.clientboundPlay().register(
+                VoxelColumnZstdS2CPayload.TYPE,
+                VoxelColumnZstdS2CPayload.CODEC
         );
     }
 }

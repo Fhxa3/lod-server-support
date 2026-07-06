@@ -110,7 +110,8 @@ class DiagnosticsFormatterTest {
                 "active=1/32", true,
                 2_097_152,
                 512,
-                List.of(new DiagnosticsFormatter.PlayerDiag("Steve", 3, 4000, 2, 1, 2000, 4096)));
+                List.of(new DiagnosticsFormatter.PlayerDiag("Steve", 3, 4000, 2, 1, 2000, 4096)),
+                3, 100, 1_000_000, 200_000);
 
         assertEquals(List.of(
                 "=== LSS LOD Diagnostics ===",
@@ -121,6 +122,7 @@ class DiagnosticsFormatterTest {
                 "DiskReader: submitted=5, completed=5",
                 "Generation: active=1/32",
                 "Bandwidth: 512 B/s / 1.0 MB/s global (2.0 MB total)",
+                "Zstd: level=3, columns=100, ratio=20.0% (976.6 KB → 195.3 KB)",
                 "  Steve: sq=3/4000, psync=2, pgen=1, sent=2000 (4.0 KB), rate=20/s"
         ), DiagnosticsFormatter.formatDiagnostics(d));
     }
@@ -141,7 +143,8 @@ class DiagnosticsFormatterTest {
                 null, false,
                 0,
                 0,
-                List.of());
+                List.of(),
+                3, 0, 0, 0);
 
         assertEquals(List.of(
                 "=== LSS LOD Diagnostics ===",
@@ -151,7 +154,8 @@ class DiagnosticsFormatterTest {
                 "Sources (tick): idle",
                 "DiskReader: idle",
                 "Generation: disabled",
-                "Bandwidth: 0 B/s / 1.0 KB/s global (0 B total)"
+                "Bandwidth: 0 B/s / 1.0 KB/s global (0 B total)",
+                "Zstd: enabled (level=3), no data yet"
         ), DiagnosticsFormatter.formatDiagnostics(d));
     }
 

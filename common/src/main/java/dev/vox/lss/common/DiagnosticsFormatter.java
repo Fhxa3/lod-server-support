@@ -1,5 +1,6 @@
 package dev.vox.lss.common;
 
+import dev.vox.lss.common.compression.ZstdColumnCompressor;
 import dev.vox.lss.common.processing.AbstractPlayerRequestState;
 import dev.vox.lss.common.processing.AbstractChunkDiskReader;
 import dev.vox.lss.common.processing.ProcessingDiagnostics;
@@ -28,7 +29,8 @@ public final class DiagnosticsFormatter {
             String generationDiagnostics, boolean generationEnabled,
             long bwTotal,
             long bwWindowRate,
-            List<PlayerDiag> players
+            List<PlayerDiag> players,
+            int zstdLevel, long zstdColumns, long zstdRawBytes, long zstdCompressedBytes
     ) {}
 
     private DiagnosticsFormatter() {}
@@ -78,6 +80,19 @@ public final class DiagnosticsFormatter {
         lines.add(String.format("Bandwidth: %s/s / %s/s global (%s total)",
                 formatBytes(d.bwWindowRate), formatBytes(d.bwGlobal),
                 formatBytes(d.bwTotal)));
+
+        // Zstd compression
+        if (d.zstdColumns > 0) {
+            double ratio = d.zstdRawBytes > 0
+                    ? (double) d.zstdCompressedBytes / d.zstdRawBytes * 100.0
+                    : 0.0;
+            lines.add(String.format(
+                    "Zstd: level=%d, columns=%d, ratio=%.1f%% (%s → %s)",
+                    d.zstdLevel, d.zstdColumns, ratio,
+                    formatBytes(d.zstdRawBytes), formatBytes(d.zstdCompressedBytes)));
+        } else {
+            lines.add(String.format("Zstd: enabled (level=%d), no data yet", d.zstdLevel));
+        }
 
         // Per-player
         for (var p : d.players) {
@@ -146,7 +161,11 @@ public final class DiagnosticsFormatter {
                 generationDiagnosticsOrNull, generationDiagnosticsOrNull != null,
                 bwLimiter.getTotalBytesSent(),
                 windowBandwidthRate,
-                players
+                players,
+                ZstdColumnCompressor.getCompressionLevel(),
+                ZstdColumnCompressor.getTotalColumnsCompressed(),
+                ZstdColumnCompressor.getTotalRawBytes(),
+                ZstdColumnCompressor.getTotalCompressedBytes()
         );
     }
 

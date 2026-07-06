@@ -2,6 +2,8 @@ package dev.vox.lss.networking.payloads;
 
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.common.compression.ZstdColumnCompressor;
+import dev.vox.lss.networking.payloads.VoxelColumnZstdS2CPayload;
 import io.netty.buffer.Unpooled;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.registries.Registries;
@@ -20,6 +22,7 @@ import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 /**
  * Locks the Fabric wire format for all 6 payloads to an explicit byte reference built from raw
@@ -293,6 +296,39 @@ class WireParityTest {
         assertEquals(0, d.decompressedSections().length);
     }
 
+    @Test
+    void voxelColumnZstdRoundtrip() {
+        byte[] sections = new byte[1024];
+        for (int i = 0; i < sections.length; i++) sections[i] = (byte) (i % 47);
+        byte[] compressed = ZstdColumnCompressor.compress(sections);
+        assertNotNull(compressed, "structured data should be compressible");
+
+        var original = new VoxelColumnZstdS2CPayload(42, -7, Level.OVERWORLD, 100L,
+                sections.length, compressed);
+        var frame = encode(VoxelColumnZstdS2CPayload.CODEC, original);
+        var decoded = decode(VoxelColumnZstdS2CPayload.CODEC, frame);
+        assertEquals(original.chunkX(), decoded.chunkX());
+        assertEquals(original.chunkZ(), decoded.chunkZ());
+        assertEquals(original.dimension(), decoded.dimension());
+        assertEquals(original.columnTimestamp(), decoded.columnTimestamp());
+        assertArrayEquals(sections, decoded.decompressedSections());
+    }
+
+    @Test
+    void voxelColumnZstdVarIntBoundaries() {
+        // originalSize at the 1-byte (127) and 2-byte (128) VarInt boundaries.
+        // Use real compressed data so decompressedSections() succeeds.
+        byte[] sections = new byte[256];
+        for (int i = 0; i < sections.length; i++) sections[i] = (byte) (i % 31);
+        byte[] compressed = ZstdColumnCompressor.compress(sections);
+        assertNotNull(compressed);
+
+        var original = new VoxelColumnZstdS2CPayload(0, 0, Level.OVERWORLD, 0L, sections.length, compressed);
+        var frame = encode(VoxelColumnZstdS2CPayload.CODEC, original);
+        var decoded = decode(VoxelColumnZstdS2CPayload.CODEC, frame);
+        assertArrayEquals(sections, decoded.decompressedSections());
+    }
+
     // ---- Meta: the parity corpus must cover the whole v16 payload surface ----
 
     @Test
@@ -313,10 +349,11 @@ class WireParityTest {
                 SessionConfigS2CPayload.TYPE.id().toString(),
                 DirtyColumnsS2CPayload.TYPE.id().toString(),
                 VoxelColumnS2CPayload.TYPE.id().toString(),
-                BatchResponseS2CPayload.TYPE.id().toString());
+                BatchResponseS2CPayload.TYPE.id().toString(),
+                VoxelColumnZstdS2CPayload.TYPE.id().toString());
         assertEquals(covered, declared,
                 "every LSS channel must map to exactly one payload with a reference frame in "
                 + "this suite — a new payload requires frames in BOTH WireParityTests");
-        assertEquals(6, declared.size());
+        assertEquals(7, declared.size());
     }
 }

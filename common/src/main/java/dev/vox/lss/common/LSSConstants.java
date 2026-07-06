@@ -16,6 +16,7 @@ public final class LSSConstants {
     public static final String CHANNEL_SESSION_CONFIG = "lss:session_config";
     public static final String CHANNEL_DIRTY_COLUMNS = "lss:dirty_columns";
     public static final String CHANNEL_VOXEL_COLUMN = "lss:voxel_column";
+    public static final String CHANNEL_VOXEL_COLUMN_ZSTD = "lss:voxel_column_zstd";
     public static final String CHANNEL_BATCH_RESPONSE = "lss:batch_response";
 
     // Time conversion constants
@@ -79,6 +80,7 @@ public final class LSSConstants {
 
     // Capabilities bitmask
     public static final int CAPABILITY_VOXEL_COLUMNS = 1;
+    public static final int CAPABILITY_ZSTD_COMPRESSION = 2;
 
     // Dimension resource location strings (common/ has no MC deps, so plain strings)
     public static final String DIM_STR_OVERWORLD = "minecraft:overworld";

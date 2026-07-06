@@ -244,6 +244,21 @@ class WireParityTest {
                 "empty section bytes must encode as a single 0x00 length VarInt");
     }
 
+    @Test
+    void voxelColumnZstd() {
+        byte[] compressed = {1, 2, 3, 4};
+        byte[] expected = ref(b -> {
+            b.writeInt(42);
+            b.writeInt(-7);
+            b.writeUtf("minecraft:overworld");
+            b.writeLong(100L);
+            b.writeVarInt(256);   // originalSize
+            b.writeByteArray(compressed);
+        });
+        assertArrayEquals(expected, PaperPayloadHandler.encodeVoxelColumnZstdPreEncoded(
+                42, -7, "minecraft:overworld", 100L, 256, compressed));
+    }
+
     // ---- Constants pins (Paper-classpath twins of the Fabric ProtocolConstantsTest) ----
 
     @Test
@@ -251,7 +266,8 @@ class WireParityTest {
         String[] channels = {
                 LSSConstants.CHANNEL_HANDSHAKE, LSSConstants.CHANNEL_CHUNK_REQUEST,
                 LSSConstants.CHANNEL_SESSION_CONFIG, LSSConstants.CHANNEL_DIRTY_COLUMNS,
-                LSSConstants.CHANNEL_VOXEL_COLUMN, LSSConstants.CHANNEL_BATCH_RESPONSE};
+                LSSConstants.CHANNEL_VOXEL_COLUMN, LSSConstants.CHANNEL_BATCH_RESPONSE,
+                LSSConstants.CHANNEL_VOXEL_COLUMN_ZSTD};
         var distinct = new HashSet<String>();
         for (String channel : channels) {
             var id = Identifier.parse(channel); // throws on a typo'd channel string
@@ -259,7 +275,7 @@ class WireParityTest {
                     channel + " must live under the lss: namespace");
             distinct.add(id.toString());
         }
-        assertEquals(6, distinct.size(), "channel ids must be pairwise distinct");
+        assertEquals(7, distinct.size(), "channel ids must be pairwise distinct");
         // Bump the literal only with a deliberate wire change reviewed on both platforms.
         assertEquals(16, LSSConstants.PROTOCOL_VERSION);
     }
@@ -278,7 +294,8 @@ class WireParityTest {
             }
         }
         var covered = Set.of("lss:handshake_c2s", "lss:batch_chunk_req", "lss:session_config",
-                "lss:dirty_columns", "lss:voxel_column", "lss:batch_response");
+                "lss:dirty_columns", "lss:voxel_column", "lss:batch_response",
+                "lss:voxel_column_zstd");
         assertEquals(covered, declared,
                 "every LSS channel must have a reference frame in this suite — a new payload"
                 + " requires frames in BOTH WireParityTests");

@@ -3,9 +3,11 @@ package dev.vox.lss.networking.server;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.common.compression.ZstdColumnCompressor;
 import dev.vox.lss.common.processing.OffThreadProcessor;
 import dev.vox.lss.common.processing.QueuedPayload;
 import dev.vox.lss.networking.payloads.VoxelColumnS2CPayload;
+import dev.vox.lss.networking.payloads.VoxelColumnZstdS2CPayload;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
@@ -83,6 +85,22 @@ public class FabricOffThreadProcessor extends OffThreadProcessor<PlayerRequestSt
         }
         var dimensionKey = this.dimensionKeyCache.computeIfAbsent(dimension,
                 d -> ResourceKey.create(Registries.DIMENSION, Identifier.parse(d)));
+
+        boolean zstdCapable = (state.getCapabilities() & LSSConstants.CAPABILITY_ZSTD_COMPRESSION) != 0;
+
+        if (zstdCapable) {
+            byte[] compressed = ZstdColumnCompressor.compress(sectionBytes);
+            if (compressed != null) {
+                int compressedEstimate = compressed.length + LSSConstants.ESTIMATED_COLUMN_OVERHEAD_BYTES + 5;
+                var payload = new VoxelColumnZstdS2CPayload(cx, cz, dimensionKey, columnTimestamp,
+                        sectionBytes.length, compressed);
+                state.addReadyPayload(new QueuedPayload<>(payload, compressedEstimate, submissionOrder,
+                        PositionUtil.packPosition(cx, cz)));
+                return true;
+            }
+            // Compression didn't help — fall through to uncompressed path
+        }
+
         var payload = new VoxelColumnS2CPayload(cx, cz, dimensionKey, columnTimestamp,
                 sectionBytes);
         state.addReadyPayload(new QueuedPayload<>(payload, estimatedBytes, submissionOrder,

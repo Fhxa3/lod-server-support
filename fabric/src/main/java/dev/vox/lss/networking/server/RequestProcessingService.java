@@ -5,6 +5,7 @@ import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.SharedBandwidthLimiter;
+import dev.vox.lss.common.compression.ZstdColumnCompressor;
 import dev.vox.lss.common.processing.LoadedColumnData;
 import dev.vox.lss.common.processing.OffThreadProcessor;
 import dev.vox.lss.common.processing.TickDiagnostics;
@@ -81,6 +82,10 @@ public class RequestProcessingService {
             this.generationService = null;
         }
         this.bandwidthLimiter = new SharedBandwidthLimiter(config.bytesPerSecondLimitGlobal);
+
+        // Apply compression config to the Zstd compressor (static, shared across all threads)
+        ZstdColumnCompressor.setCompressionLevel(config.zstdCompressionLevel);
+        ZstdColumnCompressor.setMinCompressBytes(config.zstdMinCompressBytes);
 
         var dataDir = server.getWorldPath(LevelResource.ROOT).resolve("data");
         this.offThreadProcessor = new FabricOffThreadProcessor(

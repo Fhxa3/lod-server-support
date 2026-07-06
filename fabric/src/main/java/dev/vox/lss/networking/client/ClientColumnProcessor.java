@@ -6,6 +6,7 @@ import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.config.LSSClientConfig;
 import dev.vox.lss.networking.payloads.VoxelColumnS2CPayload;
+import dev.vox.lss.networking.payloads.VoxelColumnZstdS2CPayload;
 import io.netty.buffer.Unpooled;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -64,8 +65,15 @@ class ClientColumnProcessor {
      * so a consumer overwrites ghost terrain the server cleared (WorldEdit-style clears and
      * fully-emptied columns). Captured on the main thread at offer time — the decode thread
      * must not touch ColumnStateMap.
+     *
+     * <p>The section-bytes supplier is lazy: for zstd payloads decompression is deferred
+     * to the decode thread; for uncompressed payloads the bytes are already available.
      */
-    private record QueuedColumn(VoxelColumnS2CPayload payload, boolean resync) {}
+    private record QueuedColumn(ResourceKey<Level> dimension, int chunkX, int chunkZ,
+                                long columnTimestamp,
+                                java.util.function.Supplier<byte[]> sectionBytesSupplier,
+                                int sectionBytesLength,
+                                boolean isZstd, boolean resync) {}
 
     private final ConcurrentLinkedQueue<QueuedColumn> columnQueue = new ConcurrentLinkedQueue<>();
     private final AtomicInteger queueSize = new AtomicInteger();
@@ -99,10 +107,6 @@ class ClientColumnProcessor {
         return mc != null ? mc.level : null;
     }
 
-    private static int sectionBytesOf(VoxelColumnS2CPayload payload) {
-        return payload.decompressedSections() == null ? 0 : payload.decompressedSections().length;
-    }
-
     /** Queue admission: bounded by count AND bytes (either alone admits multi-GiB retention). */
     static boolean admits(int queuedCount, long queuedBytes, int payloadBytes) {
         return queuedCount < MAX_QUEUED_COLUMNS
@@ -110,26 +114,44 @@ class ClientColumnProcessor {
     }
 
     void offer(VoxelColumnS2CPayload payload, boolean resync) {
-        // Null/corrupt section bytes still traverse the queue (the drain reports them):
-        // count them as zero rather than NPE here.
-        int payloadBytes = sectionBytesOf(payload);
+        byte[] sections = payload.decompressedSections();
+        int payloadBytes = sections == null ? 0 : sections.length;
         if (admits(this.queueSize.get(), this.queuedBytes.get(), payloadBytes)) {
-            this.columnQueue.add(new QueuedColumn(payload, resync));
+            this.columnQueue.add(new QueuedColumn(payload.dimension(),
+                    payload.chunkX(), payload.chunkZ(), payload.columnTimestamp(),
+                    () -> sections, payloadBytes, false, resync));
             this.queueSize.incrementAndGet();
             this.queuedBytes.addAndGet(payloadBytes);
         } else {
-            long dropped = this.columnsDropped.incrementAndGet();
-            long now = System.currentTimeMillis();
-            if (now - this.lastDropWarnMs > DROP_WARN_INTERVAL_MS) {
-                this.lastDropWarnMs = now;
-                LSSLogger.warn("Column processing queue full (" + MAX_QUEUED_COLUMNS
-                        + "), " + dropped + " columns dropped total");
-            }
-            // The receive handler already stamped this position received — without the
-            // report the drop would never be re-requested (permanent hole).
-            this.failureReporter.report(payload.dimension(),
-                    payload.chunkX(), payload.chunkZ());
+            dropColumn(payload.dimension(), payload.chunkX(), payload.chunkZ());
         }
+    }
+
+    /** Zstd-compressed variant of {@link #offer(VoxelColumnS2CPayload, boolean)}. */
+    void offer(VoxelColumnZstdS2CPayload payload, boolean resync) {
+        // Use originalSize for admission (uncompressed) — the compressed bytes are smaller
+        // but the decode allocates originalSize bytes, so that's the real memory pressure.
+        int payloadBytes = payload.estimatedBytes();
+        if (admits(this.queueSize.get(), this.queuedBytes.get(), payloadBytes)) {
+            this.columnQueue.add(new QueuedColumn(payload.dimension(),
+                    payload.chunkX(), payload.chunkZ(), payload.columnTimestamp(),
+                    payload::decompressedSections, payloadBytes, true, resync));
+            this.queueSize.incrementAndGet();
+            this.queuedBytes.addAndGet(payloadBytes);
+        } else {
+            dropColumn(payload.dimension(), payload.chunkX(), payload.chunkZ());
+        }
+    }
+
+    private void dropColumn(ResourceKey<Level> dimension, int chunkX, int chunkZ) {
+        long dropped = this.columnsDropped.incrementAndGet();
+        long now = System.currentTimeMillis();
+        if (now - this.lastDropWarnMs > DROP_WARN_INTERVAL_MS) {
+            this.lastDropWarnMs = now;
+            LSSLogger.warn("Column processing queue full (" + MAX_QUEUED_COLUMNS
+                    + "), " + dropped + " columns dropped total");
+        }
+        this.failureReporter.report(dimension, chunkX, chunkZ);
     }
 
     void scheduleProcessing(boolean serverEnabled) {
@@ -174,10 +196,9 @@ class ClientColumnProcessor {
         QueuedColumn queued;
         while ((queued = this.columnQueue.poll()) != null) {
             this.queueSize.decrementAndGet();
-            this.queuedBytes.addAndGet(-sectionBytesOf(queued.payload()));
-            var payload = queued.payload();
-            this.failureReporter.report(payload.dimension(),
-                    payload.chunkX(), payload.chunkZ());
+            this.queuedBytes.addAndGet(-queued.sectionBytesLength());
+            this.failureReporter.report(queued.dimension(),
+                    queued.chunkX(), queued.chunkZ());
         }
     }
 
@@ -202,45 +223,29 @@ class ClientColumnProcessor {
         QueuedColumn queued;
         while (epoch == this.sessionEpoch && (queued = this.columnQueue.poll()) != null) {
             this.queueSize.decrementAndGet();
-            this.queuedBytes.addAndGet(-sectionBytesOf(queued.payload()));
-            var payload = queued.payload();
-            if (!levelDimension.equals(payload.dimension())) continue;
+            this.queuedBytes.addAndGet(-queued.sectionBytesLength());
+            if (!levelDimension.equals(queued.dimension())) continue;
 
-            byte[] decompressed = payload.decompressedSections();
+            byte[] decompressed = queued.sectionBytesSupplier().get();
             if (decompressed == null || decompressed.length == 0) {
-                // Defensive (a compliant server always writes at least the section-count
-                // varint) — but the position was stamped received at arrival, so a silent
-                // drop here would be a permanent false stamp.
-                this.failureReporter.report(payload.dimension(),
-                        payload.chunkX(), payload.chunkZ());
+                this.failureReporter.report(queued.dimension(),
+                        queued.chunkX(), queued.chunkZ());
                 continue;
             }
 
             try {
                 var sections = decodeSections(decompressed, levelSectionCount, factory);
                 if (queued.resync()) {
-                    // The client already held data here; the server sends the current column
-                    // (which OMITS air sections) authoritatively. Fill every absent section-Y
-                    // with an all-air section so the consumer overwrites terrain the server
-                    // cleared (WorldEdit clears, fully-emptied 0-section columns). Only on
-                    // resync — a first serve had nothing, so absent == air == no-op.
                     sections = withAirFilledAbsentSections(sections, levelSectionCount, minSectionY, factory);
                 }
-                var columnData = new VoxelColumnData(sections, payload.columnTimestamp());
-                dispatcher.dispatch(payload.dimension(),
-                        payload.chunkX(), payload.chunkZ(), columnData);
+                var columnData = new VoxelColumnData(sections, queued.columnTimestamp());
+                dispatcher.dispatch(queued.dimension(),
+                        queued.chunkX(), queued.chunkZ(), columnData);
             } catch (Throwable t) {
-                // Throwable, not Exception: an OOME allocating section buffers (or a
-                // LinkageError from MC internals) escaping here would consume the column —
-                // polled and decremented — with no dispatch AND no report, leaving a
-                // permanent false received-stamp that persists to the cache (the exact hole
-                // class the delivery-honesty refactor eliminated; LSSApi.dispatchColumn one
-                // frame downstream already treats Throwable this way). Report FIRST so the
-                // stamp is forgotten, then let true Errors propagate.
                 LSSLogger.error("Failed to process voxel column at "
-                        + payload.chunkX() + "," + payload.chunkZ(), t);
-                this.failureReporter.report(payload.dimension(),
-                        payload.chunkX(), payload.chunkZ());
+                        + queued.chunkX() + "," + queued.chunkZ(), t);
+                this.failureReporter.report(queued.dimension(),
+                        queued.chunkX(), queued.chunkZ());
                 if (t instanceof Error err && !(t instanceof AssertionError)) throw err;
             }
         }
@@ -344,25 +349,19 @@ class ClientColumnProcessor {
         QueuedColumn queued;
         while ((queued = this.columnQueue.poll()) != null) {
             this.queueSize.decrementAndGet();
-            this.queuedBytes.addAndGet(-sectionBytesOf(queued.payload()));
-            var payload = queued.payload();
-            manager.onIngestFailure(payload.dimension(),
-                    PositionUtil.packPosition(payload.chunkX(), payload.chunkZ()));
+            this.queuedBytes.addAndGet(-queued.sectionBytesLength());
+            manager.onIngestFailure(queued.dimension(),
+                    PositionUtil.packPosition(queued.chunkX(), queued.chunkZ()));
         }
     }
 
     /** End the current session: any in-flight drain self-terminates at its next epoch check. */
     void shutdown() {
         this.sessionEpoch++;
-        // Drain with the same poll+decrement discipline as the decode loop rather than
-        // clear()+set(0): a set(0) races a decode iteration that already polled an item but
-        // has not yet decremented, permanently driving the lifetime-singleton's queueSize to
-        // -1 (drift accumulates across sessions). Pairing every poll with one decrement keeps
-        // the counter self-consistent no matter which thread removes each item.
         QueuedColumn drained;
         while ((drained = this.columnQueue.poll()) != null) {
             this.queueSize.decrementAndGet();
-            this.queuedBytes.addAndGet(-sectionBytesOf(drained.payload()));
+            this.queuedBytes.addAndGet(-drained.sectionBytesLength());
         }
     }
 

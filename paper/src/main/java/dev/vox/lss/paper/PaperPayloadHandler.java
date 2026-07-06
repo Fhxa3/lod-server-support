@@ -29,6 +29,7 @@ public final class PaperPayloadHandler {
     private static final Identifier ID_SESSION_CONFIG = Identifier.parse(LSSConstants.CHANNEL_SESSION_CONFIG);
     private static final Identifier ID_DIRTY_COLUMNS = Identifier.parse(LSSConstants.CHANNEL_DIRTY_COLUMNS);
     static final Identifier ID_VOXEL_COLUMN = Identifier.parse(LSSConstants.CHANNEL_VOXEL_COLUMN);
+    static final Identifier ID_VOXEL_COLUMN_ZSTD = Identifier.parse(LSSConstants.CHANNEL_VOXEL_COLUMN_ZSTD);
     private static final Identifier ID_BATCH_RESPONSE = Identifier.parse(LSSConstants.CHANNEL_BATCH_RESPONSE);
 
     // ---- S2C Encoding ----
@@ -90,6 +91,25 @@ public final class PaperPayloadHandler {
             buf.writeUtf(dimensionStr, LSSConstants.MAX_DIMENSION_STRING_LENGTH);
             buf.writeLong(columnTimestamp);
             buf.writeByteArray(sectionBytes);
+        });
+    }
+
+    /**
+     * Encode a Zstd-compressed column payload.
+     * Wire format matches {@code VoxelColumnZstdS2CPayload}: chunkX, chunkZ, dimension,
+     * columnTimestamp, originalSize (varint), compressedSectionBytes (byte array).
+     */
+    public static byte[] encodeVoxelColumnZstdPreEncoded(int chunkX, int chunkZ,
+                                                           String dimensionStr, long columnTimestamp,
+                                                           int originalSize, byte[] compressedSectionBytes) {
+        int cap = (compressedSectionBytes != null ? compressedSectionBytes.length : 0) + 64;
+        return encodeToBytes(cap, buf -> {
+            buf.writeInt(chunkX);
+            buf.writeInt(chunkZ);
+            buf.writeUtf(dimensionStr, LSSConstants.MAX_DIMENSION_STRING_LENGTH);
+            buf.writeLong(columnTimestamp);
+            buf.writeVarInt(originalSize);
+            buf.writeByteArray(compressedSectionBytes);
         });
     }
 

@@ -5,6 +5,7 @@ import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
 import dev.vox.lss.common.SharedBandwidthLimiter;
+import dev.vox.lss.common.compression.ZstdColumnCompressor;
 import dev.vox.lss.common.processing.IncomingRequest;
 import dev.vox.lss.common.processing.LoadedColumnData;
 import dev.vox.lss.common.processing.OffThreadProcessor;
@@ -71,7 +72,7 @@ public class PaperRequestProcessingService {
      *  raw NMS payload send; tests inject recording/throwing senders. */
     @FunctionalInterface
     interface ColumnPayloadSender {
-        void send(PaperPlayerRequestState state, byte[] data) throws Exception;
+        void send(PaperPlayerRequestState state, PaperOffThreadProcessor.PaperQueuedPayload payload) throws Exception;
     }
 
     /** Test seam: resolves a loaded chunk into pre-serialized column data, or null when the
@@ -81,9 +82,9 @@ public class PaperRequestProcessingService {
         LoadedColumnData probe(ServerLevel level, int cx, int cz);
     }
 
-    private ColumnPayloadSender columnPayloadSender = (state, data) ->
+    private ColumnPayloadSender columnPayloadSender = (state, payload) ->
             PaperPayloadHandler.sendRawNmsPayload(state.getPlayer().getBukkitEntity(),
-                    PaperPayloadHandler.ID_VOXEL_COLUMN, data);
+                    payload.channelId(), payload.data());
 
     private LoadedColumnProbe loadedColumnProbe = (level, cx, cz) -> {
         LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
@@ -197,6 +198,9 @@ public class PaperRequestProcessingService {
         this.diskReader = wiring.diskReader();
         this.generationService = wiring.generationService();
         this.bandwidthLimiter = new SharedBandwidthLimiter(config.bytesPerSecondLimitGlobal);
+        // Apply compression config to the Zstd compressor (static, shared across all threads)
+        ZstdColumnCompressor.setCompressionLevel(config.zstdCompressionLevel);
+        ZstdColumnCompressor.setMinCompressBytes(config.zstdMinCompressBytes);
         this.offThreadProcessor = wiring.offThreadProcessor();
         this.dirtyTracker = wiring.dirtyTracker();
         this.dirtyBroadcaster = wiring.dirtyBroadcaster();

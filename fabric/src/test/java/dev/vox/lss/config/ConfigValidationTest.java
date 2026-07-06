@@ -157,7 +157,7 @@ class ConfigValidationTest {
                 .filter(f -> f.getType().isPrimitive() && f.getType() != boolean.class)
                 .toList();
         // Guard against the sweep going vacuous if fields get refactored to non-public.
-        assertTrue(fields.size() >= 11, "clamp sweep lost fields, found only: " + fields);
+        assertTrue(fields.size() >= 13, "clamp sweep lost fields, found only: " + fields);
         assertTrue(fields.stream().anyMatch(f -> f.getName().equals("perDimensionTimestampCacheSizeMB")),
                 "clamp sweep no longer sees perDimensionTimestampCacheSizeMB");
         return fields;
@@ -177,8 +177,14 @@ class ConfigValidationTest {
             var c = serverConfig();
             f.setInt(c, Integer.MIN_VALUE);
             c.validate();
-            assertTrue(f.getInt(c) >= 1,
-                    f.getName() + " not clamped up from Integer.MIN_VALUE, still " + f.getInt(c));
+            // zstdMinCompressBytes has a valid minimum of 0; every other field clamps >= 1.
+            if ("zstdMinCompressBytes".equals(f.getName())) {
+                assertTrue(f.getInt(c) >= 0,
+                        f.getName() + " not clamped up from Integer.MIN_VALUE, still " + f.getInt(c));
+            } else {
+                assertTrue(f.getInt(c) >= 1,
+                        f.getName() + " not clamped up from Integer.MIN_VALUE, still " + f.getInt(c));
+            }
 
             f.setInt(c, Integer.MAX_VALUE);
             c.validate();

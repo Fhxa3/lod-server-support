@@ -165,7 +165,8 @@ class ProtocolConstantsTest {
         String[] channels = {
                 LSSConstants.CHANNEL_HANDSHAKE, LSSConstants.CHANNEL_CHUNK_REQUEST,
                 LSSConstants.CHANNEL_SESSION_CONFIG, LSSConstants.CHANNEL_DIRTY_COLUMNS,
-                LSSConstants.CHANNEL_VOXEL_COLUMN, LSSConstants.CHANNEL_BATCH_RESPONSE};
+                LSSConstants.CHANNEL_VOXEL_COLUMN, LSSConstants.CHANNEL_BATCH_RESPONSE,
+                LSSConstants.CHANNEL_VOXEL_COLUMN_ZSTD};
         var distinct = new HashSet<String>();
         for (String channel : channels) {
             var id = Identifier.parse(channel); // throws on a typo'd channel string
@@ -173,7 +174,7 @@ class ProtocolConstantsTest {
                     channel + " must live under the lss: namespace");
             distinct.add(id.toString());
         }
-        assertEquals(6, distinct.size(), "channel ids must be pairwise distinct");
+        assertEquals(7, distinct.size(), "channel ids must be pairwise distinct");
     }
 
     @Test

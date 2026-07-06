@@ -34,3 +34,5 @@ oracle/
 .worktrees/
 
 __pycache__/
+
+.codegraph

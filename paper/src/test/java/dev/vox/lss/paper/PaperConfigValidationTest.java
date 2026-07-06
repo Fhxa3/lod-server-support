@@ -60,7 +60,11 @@ class PaperConfigValidationTest {
             Map.entry("generationConcurrencyLimitPerPlayer",
                     new Bounds(LSSConstants.MIN_CONCURRENCY_LIMIT, LSSConstants.MAX_CONCURRENCY_LIMIT)),
             Map.entry("perDimensionTimestampCacheSizeMB",
-                    new Bounds(LSSConstants.MIN_TIMESTAMP_CACHE_SIZE_MB, LSSConstants.MAX_TIMESTAMP_CACHE_SIZE_MB)));
+                    new Bounds(LSSConstants.MIN_TIMESTAMP_CACHE_SIZE_MB, LSSConstants.MAX_TIMESTAMP_CACHE_SIZE_MB)),
+            Map.entry("zstdCompressionLevel",
+                    new Bounds(1, 19)),
+            Map.entry("zstdMinCompressBytes",
+                    new Bounds(0, 1_048_576)));
 
     /**
      * Every shared numeric field must clamp to the exact shared bounds THROUGH the Paper subclass

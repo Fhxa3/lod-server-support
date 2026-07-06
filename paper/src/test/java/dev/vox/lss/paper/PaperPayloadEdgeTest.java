@@ -320,11 +320,11 @@ class PaperPayloadEdgeTest {
         sections[123] = 0x5A;
         proc.buildAndEnqueueColumnPayload(state, 1, 2, "minecraft:overworld", 42L, 7L, sections, 99);
 
-        var captor = ArgumentCaptor.forClass((Class<QueuedPayload<byte[]>>) (Class<?>) QueuedPayload.class);
+        var captor = ArgumentCaptor.forClass((Class<QueuedPayload<PaperOffThreadProcessor.PaperQueuedPayload>>) (Class<?>) QueuedPayload.class);
         verify(state).addReadyPayload(captor.capture());
         var queued = captor.getValue();
         assertArrayEquals(PaperPayloadHandler.encodeVoxelColumnPreEncoded(
-                1, 2, "minecraft:overworld", 42L, sections), queued.payload());
+                1, 2, "minecraft:overworld", 42L, sections), queued.payload().data());
         assertEquals(99, queued.estimatedBytes());
         assertEquals(7L, queued.submissionOrder());
     }

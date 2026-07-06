@@ -10,6 +10,7 @@ import dev.vox.lss.networking.payloads.DirtyColumnsS2CPayload;
 import dev.vox.lss.networking.payloads.HandshakeC2SPayload;
 import dev.vox.lss.networking.payloads.SessionConfigS2CPayload;
 import dev.vox.lss.networking.payloads.VoxelColumnS2CPayload;
+import dev.vox.lss.networking.payloads.VoxelColumnZstdS2CPayload;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
@@ -27,7 +28,8 @@ public class LSSClientNetworking {
     private static final ClientSessionGate sessionGate = new ClientSessionGate(
             columnProcessor,
             () -> ClientPlayNetworking.send(new HandshakeC2SPayload(
-                    LSSConstants.PROTOCOL_VERSION, LSSConstants.CAPABILITY_VOXEL_COLUMNS)),
+                    LSSConstants.PROTOCOL_VERSION,
+                    LSSConstants.CAPABILITY_VOXEL_COLUMNS | LSSConstants.CAPABILITY_ZSTD_COMPRESSION)),
             LSSClientNetworking::createRequestManager);
 
     public static boolean isServerEnabled() {
@@ -98,7 +100,8 @@ public class LSSClientNetworking {
             if (!LSSApi.hasVoxelConsumers()) return; // no LOD consumer -> stay silent
             try {
                 ClientPlayNetworking.send(new HandshakeC2SPayload(
-                        LSSConstants.PROTOCOL_VERSION, LSSConstants.CAPABILITY_VOXEL_COLUMNS));
+                        LSSConstants.PROTOCOL_VERSION,
+                        LSSConstants.CAPABILITY_VOXEL_COLUMNS | LSSConstants.CAPABILITY_ZSTD_COMPRESSION));
             } catch (Exception e) {
                 LSSLogger.debug("LAN host handshake send failed: " + e.getMessage());
             }
@@ -173,6 +176,16 @@ public class LSSClientNetworking {
                             handleVoxelColumn(sessionGate.getRequestManager(), columnProcessor, payload));
                 }
         );
+
+        ClientPlayNetworking.registerGlobalReceiver(
+                VoxelColumnZstdS2CPayload.TYPE,
+                (payload, context) -> {
+                    sessionGate.recordColumnFrame(payload.estimatedBytes());
+
+                    context.client().execute(() ->
+                            handleVoxelColumnZstd(sessionGate.getRequestManager(), columnProcessor, payload));
+                }
+        );
     }
 
     /**
@@ -195,8 +208,24 @@ public class LSSClientNetworking {
             manager.onColumnReceived(packed, payload.columnTimestamp(),
                     payload.dimension(), clear);
         }
-        // A clear air-fills even when the held check missed (see above) — the consumer must
-        // overwrite whatever it renders there with air.
+        processor.offer(payload, resync || clear);
+    }
+
+    /**
+     * Zstd-compressed variant of {@link #handleVoxelColumn}.
+     * Decompression happens lazily via {@link VoxelColumnZstdS2CPayload#decompressedSections()}.
+     */
+    static void handleVoxelColumnZstd(LodRequestManager manager, ClientColumnProcessor processor,
+                                       VoxelColumnZstdS2CPayload payload) {
+        long packed = PositionUtil.packPosition(payload.chunkX(), payload.chunkZ());
+        boolean resync = manager != null && manager.heldContentBefore(packed);
+        // For the clear-column check, use the payload's cached isClearColumn to avoid
+        // full decompression on the main thread — the decode thread will decompress anyway.
+        boolean clear = payload.isClearColumn();
+        if (manager != null) {
+            manager.onColumnReceived(packed, payload.columnTimestamp(),
+                    payload.dimension(), clear);
+        }
         processor.offer(payload, resync || clear);
     }
 

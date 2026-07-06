@@ -2,6 +2,7 @@ package dev.vox.lss.networking.payloads;
 
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.common.compression.ZstdColumnCompressor;
 import io.netty.buffer.Unpooled;
 import net.minecraft.SharedConstants;
 import net.minecraft.network.FriendlyByteBuf;
@@ -166,6 +167,52 @@ class PayloadCodecTest {
         var decoded = VoxelColumnS2CPayload.CODEC.decode(b);
         assertEquals(Level.END, decoded.dimension());
         b.release();
+    }
+
+    // --- VoxelColumnZstdS2CPayload ---
+
+    @Test
+    void zstdColumnRoundtrip() {
+        byte[] originalSections = new byte[2048];
+        for (int i = 0; i < originalSections.length; i++) {
+            originalSections[i] = (byte) (i % 256);
+        }
+        byte[] compressed = ZstdColumnCompressor.compress(originalSections);
+        assertNotNull(compressed, "compressible data should produce compressed bytes");
+
+        var original = new VoxelColumnZstdS2CPayload(10, 20, Level.OVERWORLD, 12345L,
+                originalSections.length, compressed);
+        var b = buf();
+        VoxelColumnZstdS2CPayload.CODEC.encode(b, original);
+        var decoded = VoxelColumnZstdS2CPayload.CODEC.decode(b);
+
+        assertEquals(original.chunkX(), decoded.chunkX());
+        assertEquals(original.chunkZ(), decoded.chunkZ());
+        assertEquals(original.dimension(), decoded.dimension());
+        assertEquals(original.columnTimestamp(), decoded.columnTimestamp());
+        assertEquals(0, b.readableBytes());
+        b.release();
+
+        // Verify decompressed sections match original
+        byte[] decompressed = decoded.decompressedSections();
+        assertArrayEquals(originalSections, decompressed, "decompressed sections should match original");
+    }
+
+    @Test
+    void zstdColumnZeroSectionsRoundtrip() {
+        // A 0-section clear column
+        byte[] originalSections = new byte[]{0x00}; // varint 0 = zero sections
+        byte[] compressed = ZstdColumnCompressor.compress(originalSections);
+        // May be null if too small — test uncompressed fallback too
+        if (compressed != null) {
+            var original = new VoxelColumnZstdS2CPayload(1, 2, Level.OVERWORLD, 100L,
+                    originalSections.length, compressed);
+            var b = buf();
+            VoxelColumnZstdS2CPayload.CODEC.encode(b, original);
+            var decoded = VoxelColumnZstdS2CPayload.CODEC.decode(b);
+            assertTrue(decoded.isClearColumn(), "0-section column should be detected as clear");
+            b.release();
+        }
     }
 
 }

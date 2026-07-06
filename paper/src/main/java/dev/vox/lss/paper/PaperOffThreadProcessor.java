@@ -3,8 +3,10 @@ package dev.vox.lss.paper;
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.PositionUtil;
+import dev.vox.lss.common.compression.ZstdColumnCompressor;
 import dev.vox.lss.common.processing.OffThreadProcessor;
 import dev.vox.lss.common.processing.QueuedPayload;
+import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 
 import java.nio.file.Path;
@@ -55,6 +57,12 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
         return true;
     }
 
+    /**
+     * A queued column payload with its target channel identifier.
+     * Bundles the channel and encoded data so the main-thread sender can route correctly.
+     */
+    record PaperQueuedPayload(Identifier channelId, byte[] data) {}
+
     @Override
     protected boolean buildAndEnqueueColumnPayload(PaperPlayerRequestState state, int cx, int cz,
                                                     String dimension,
@@ -67,17 +75,31 @@ public class PaperOffThreadProcessor extends OffThreadProcessor<PaperPlayerReque
             return false;
         }
         if (dimension.length() > LSSConstants.MAX_DIMENSION_STRING_LENGTH) {
-            // Drop just this column (like an oversized one): without the guard
-            // encodeVoxelColumnPreEncoded's writeUtf throws out of this method and aborts the
-            // WHOLE processing cycle. No real dimension id is this long; the !sent path answers
-            // the client up-to-date so it stops asking.
             LSSLogger.warn("Dropping column [" + cx + ", " + cz + "] with oversized dimension id ("
                     + dimension.length() + " chars > " + LSSConstants.MAX_DIMENSION_STRING_LENGTH + ")");
             return false;
         }
+
+        boolean zstdCapable = (state.getCapabilities() & LSSConstants.CAPABILITY_ZSTD_COMPRESSION) != 0;
+
+        if (zstdCapable) {
+            byte[] compressed = ZstdColumnCompressor.compress(sectionBytes);
+            if (compressed != null) {
+                byte[] encoded = PaperPayloadHandler.encodeVoxelColumnZstdPreEncoded(
+                        cx, cz, dimension, columnTimestamp, sectionBytes.length, compressed);
+                int compressedEstimate = encoded.length;
+                var payload = new PaperQueuedPayload(PaperPayloadHandler.ID_VOXEL_COLUMN_ZSTD, encoded);
+                state.addReadyPayload(new QueuedPayload<>(payload, compressedEstimate, submissionOrder,
+                        PositionUtil.packPosition(cx, cz)));
+                return true;
+            }
+            // Compression didn't help — fall through to uncompressed path
+        }
+
         byte[] encoded = PaperPayloadHandler.encodeVoxelColumnPreEncoded(
                 cx, cz, dimension, columnTimestamp, sectionBytes);
-        state.addReadyPayload(new QueuedPayload<>(encoded, estimatedBytes, submissionOrder,
+        var payload = new PaperQueuedPayload(PaperPayloadHandler.ID_VOXEL_COLUMN, encoded);
+        state.addReadyPayload(new QueuedPayload<>(payload, estimatedBytes, submissionOrder,
                 PositionUtil.packPosition(cx, cz)));
         return true;
     }
