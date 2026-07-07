@@ -2,18 +2,61 @@
 
 Distributes LOD (Level of Detail) chunk data from servers to connected clients over a custom networking protocol. Built primarily as a multiplayer backend for [Voxy](https://modrinth.com/mod/voxy) — clients request distant chunks in batches, the server reads them from disk or memory and streams the data back, enabling Voxy to render terrain far beyond the vanilla render distance on multiplayer servers without the need to travel there first.
 
-通过自定义网络协议，将Voxy的LOD区块数据从服务器分发给已连接的客户端，使 Voxy 能够在多人游戏服务器上渲染远超原版渲染距离的地形。
+通过自定义网络协议，将 [Voxy](https://modrinth.com/mod/voxy) 的LOD区块数据从服务器分发给已连接的客户端，使 Voxy 能够在多人游戏服务器上渲染远超原版渲染距离的地形。
 
-**新增Zstd 压缩**：服务端对 VoxelColumn 区块数据使用 Zstd 压缩后传输，在支持的客户端上自动启用。
+### 新增特性
 
+**新增Zstd 压缩**：服务端对 VoxelColumn 区块数据使用 Zstd 压缩后传输，在支持的客户端上自动启用。  
 **Add Zstd compression**: the server compresses VoxelColumn section data with Zstd before sending, automatically enabled for clients.
 
-经过测试，平均可节省 40-80% 带宽，通过配置文件中`zstdCompressionLevel`可调整压缩级别（1-19，默认 3）；压缩在独立处理线程上运行，对服务器主线程影响极小。`/lsslod diag` 可查看实时压缩率。
+### 构建方式
 
-Saves 40-80% bandwidth on average with negligible CPU impact (compression runs on a dedicated processing thread). Adjustable via `zstdCompressionLevel` (1-19, default 3). Check `/lsslod diag` for real-time compression ratio.
+从github上获取代码  
+Clone the repository:
 
-对于非魔改版和原版minecraft，由于未声明压缩支持，服务端自动回退到未压缩传输。
+```bash
+git clone https://github.com/Fhxa3/lod-server-support.git
+```
 
+使用`gradlew`命令进行构建  
+Build LOD Server Support with the `gradlew`:
+
+```bash
+gradlew build           # Build Fabric mod and Paper plugin JAR
+```
+
+### 配置
+
+可通过配置文件中的 `zstdCompressionLevel` 选项调整压缩级别，默认为 `3`，建议设置在 `6` 以下以获得最佳性能。  
+The compression level can be adjusted via the `zstdCompressionLevel` setting in the config file, defaulting to `3`; it is recommended to set it below `6` for optimal performance.
+
+在客户端，使用 `/lss clearcache` 清除本地缓存并强制重新向服务器请求 LOD 区块数据。  
+On the client, use `/lss clearcache` to clear the local cache and force re-requesting LOD chunk data from the server.
+
+在服务器控制台，使用 `/lsslod diag` 查看服务器网络传输的实时总体压缩率。  
+On the server console, use `/lsslod diag` to view the real-time overall compression ratio of server network traffic.
+
+### 性能测试
+
+经过测试，Zstd 网络压缩平均可为服务器节省 70–80% 的带宽，在末地维度节省幅度甚至超过 85%。  
+After testing, Zstd network compression saves an average of 70–90% bandwidth for the server, with savings exceeding 85% in The End. 
+
+以下数据是在 Minecraft 26.2、种子为 6991842395127996672 的主世界出生点采集的网络数据包压缩率，仅供参考。  
+The data below shows the network packet compression ratio captured over a period of time at the spawn point of a world with seed 6991842395127996672 in Minecraft 26.2, for reference only.
+
+| Compression Level | Average Ratio |
+|-------------------|---------------|
+| 1                 | ~16.7%        |
+| 3 (default)       | ~15.9%        |
+| 5                 | ~15.1%        |
+| 7                 | ~14.3%        |
+| 9                 | ~14.2%        |
+| 11                | ~14.2%        |
+| 13                | ~14.1%        |
+
+### 兼容性
+
+对于非魔改版和原版minecraft，服务端将自动回退到未压缩传输。  
 Also, vanilla clients and clients without zstd capability automatically fall back to uncompressed data.
 
 Supports **Fabric** clients and **Fabric**, **Paper**, **Purpur**, **Folia** servers.
