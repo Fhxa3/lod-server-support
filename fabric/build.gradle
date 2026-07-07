@@ -41,8 +41,8 @@ dependencies {
     implementation project(':common')
     include project(':common')
     // zstd-jni is an API dep of common; explicitly include it for jar-in-jar packaging
-    implementation 'com.github.luben:zstd-jni:1.5.6-9'
-    include 'com.github.luben:zstd-jni:1.5.6-9'
+    implementation 'com.github.luben:zstd-jni:1.5.7-11'
+    include 'com.github.luben:zstd-jni:1.5.7-11'
     compileOnly "maven.modrinth:sodium:mc26.2-0.9.1-beta.3-fabric"
     compileOnly "maven.modrinth:modmenu:20.0.0-beta.4"
 }
